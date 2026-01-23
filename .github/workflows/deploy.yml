@@ -38,9 +38,13 @@ jobs:
       - name: Prepare Distribution
         run: |
           mkdir dist
-          # sing-web 폴더 안의 index.html을 dist로 복사
+          # Static assets required by the web app
           cp sing-web/index.html dist/
-          
+          cp sing-web/index.js dist/
+          cp sing-web/worker.js dist/
+          cp sing-web/coi-serviceworker.min.js dist/
+
+          # wasm-pack output
           cp -r sing-web/pkg dist/
           
       - name: Upload artifact
