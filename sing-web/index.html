@@ -210,8 +210,6 @@
     </footer>
 
     <script type="module">
-        import { partitionedWorkflow } from './index.js';
-
         const refInput = document.getElementById('ref-file');
         const reads1Input = document.getElementById('reads1-file');
         const reads2Input = document.getElementById('reads2-file');
@@ -228,6 +226,22 @@
             statusDiv.scrollTop = statusDiv.scrollHeight;
             console.log(msg);
         }
+
+        let partitionedWorkflow = null;
+        const engineReady = (async () => {
+            try {
+                log('Loading mapper engine...');
+                const mod = await import('./index.js');
+                partitionedWorkflow = mod.partitionedWorkflow;
+                log('Mapper engine loaded.');
+                return true;
+            } catch (err) {
+                const msg = err?.message || err;
+                log(`Failed to load mapper engine: ${msg}`);
+                console.error(err);
+                return false;
+            }
+        })();
 
         function isPaired() {
             const selected = document.querySelector('input[name="mode"]:checked');
@@ -265,6 +279,14 @@
             document.getElementById('results-area').style.display = 'none';
             document.getElementById('igv-div').innerHTML = '';
             currentResultBlob = null;
+
+            const ready = await engineReady;
+            if (!ready || !partitionedWorkflow) {
+                log('Engine failed to load. Please reload and try again.');
+                runBtn.disabled = false;
+                runBtn.textContent = 'Run Mapping';
+                return;
+            }
 
             log('Starting workflow...');
             
