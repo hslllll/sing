@@ -42,7 +42,6 @@ jobs:
           cp sing-web/index.html dist/
           cp sing-web/index.js dist/
           cp sing-web/worker.js dist/
-          cp sing-web/coi-serviceworker.min.js dist/
 
           # wasm-pack output
           cp -r sing-web/pkg dist/
