@@ -24,11 +24,18 @@ elif [ "$MODE" == "a" ]; then
     REF_DECOMP="Arabidopsis_thaliana.TAIR10.dna.toplevel.fa"
     REF_URL="http://ftp.ensemblgenomes.org/pub/plants/release-57/fasta/arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz"
     INDEX_PREFIX="arabidopsis"
+elif [ "$MODE" == "m" ]; then
+    echo "Mode: Maize (Zea mays)"
+    REF="Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa.gz"
+    REF_DECOMP="Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa"
+    REF_URL="https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/fasta/zea_mays/dna/Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa.gz"
+    INDEX_PREFIX="maize"
 else
-    echo "Usage: $0 [h|y|a]"
+    echo "Usage: $0 [h|y|a|m]"
     echo "  h: Human (GRCh38)"
     echo "  y: Yeast (Saccharomyces cerevisiae)"
     echo "  a: Arabidopsis thaliana (TAIR10)"
+    echo "  m: Maize (Zea mays)"
     exit 1
 fi
 
