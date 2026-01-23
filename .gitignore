@@ -42,12 +42,3 @@ sing*
 
 *gatk*
 *.py
-
-!sing-core/
-!sing-core/**
-!sing-cli/
-!sing-cli/**
-!sing-web/
-!sing-web/**
-!sing-web/pkg/
-!sing-web/pkg/**
