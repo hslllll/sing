@@ -499,335 +499,115 @@ const CHUNK_SIZE = 1 * 1024 * 1024;
 
 
 export async function partitionedWorkflow(referenceFile, read1File, read2File, sortOutput = false, outputFormat = 'bam', chunkSize = CHUNK_SIZE, logger = console.log, onProgress = null) {
-    logger("Counting reads for progress tracking (skip with ESC)...");
     const abortCtrl = new AbortController();
-    let aborted = false;
-    const onKey = (e) => {
-        if (e.key === 'Escape') {
-            aborted = true;
-            abortCtrl.abort();
-            logger('Read counting skipped by user; using byte-based progress.');
-            window.removeEventListener('keydown', onKey);
-        }
-    };
-    window.addEventListener('keydown', onKey);
+    let totalReads = 0;
+    const formatTime = ms => !isFinite(ms) || ms < 0 ? "--:--" : `${Math.floor(ms / 60000)}:${(Math.floor(ms / 1000) % 60).toString().padStart(2, '0')}`;
 
-    let totalReadsR1 = 0;
-    let totalReadsR2 = 0;
     try {
-        totalReadsR1 = await countReads(read1File, abortCtrl.signal);
-        logger(`Total reads in R1: ${totalReadsR1}`);
-        if (read2File) {
-            totalReadsR2 = await countReads(read2File, abortCtrl.signal);
-            logger(`Total reads in R2: ${totalReadsR2}`);
-            if (totalReadsR1 !== totalReadsR2) {
-                logger(`Warning: read count mismatch between pairs (R1=${totalReadsR1}, R2=${totalReadsR2}). Progress will use the smaller value.`);
-            }
-        }
-    } catch (e) {
-        if (aborted) {
-            totalReadsR1 = 0;
-            totalReadsR2 = 0;
-        } else {
-            logger(`Read counting failed: ${e.message || e}`);
-            totalReadsR1 = 0;
-            totalReadsR2 = 0;
-        }
-    } finally {
-        window.removeEventListener('keydown', onKey);
-    }
+        logger("Counting reads...");
+        const keyHandler = e => { if (e.key === 'Escape') { abortCtrl.abort(); logger('Count skipped.'); } };
+        window.addEventListener('keydown', keyHandler);
+        
+        const r1Count = await countReads(read1File, abortCtrl.signal).catch(() => 0);
+        let r2Count = r1Count;
+        if (read2File) r2Count = await countReads(read2File, abortCtrl.signal).catch(() => 0);
+        
+        window.removeEventListener('keydown', keyHandler);
+        totalReads = Math.min(r1Count, r2Count || r1Count);
+        logger(`Approx reads: ${totalReads}`);
+    } catch(e) { logger("Count failed."); }
 
-    const baseReads = read2File ? Math.min(totalReadsR1, totalReadsR2) : totalReadsR1;
-    const readsPerIteration = baseReads * (read2File ? 2 : 1);
-    if (baseReads > 0) {
-        logger(`Detected approximately ${readsPerIteration} reads per reference chunk iteration.`);
-    }
-
-    
     const concurrency = navigator.hardwareConcurrency || 4;
-    logger(`Initializing Worker Pool with ${concurrency} workers...`);
-    
-    const workers = [];
-    for(let i=0; i<concurrency; i++) {
-        workers.push(new WorkerClient());
-    }
+    logger(`Initializing protocol with ${concurrency} workers...`);
+    const workers = Array.from({ length: concurrency }, () => new WorkerClient());
+    await Promise.all(workers.map(w => w.init()));
 
-    const workerStats = new Map();
+    const runStats = { total: 0, mapped: 0, mappedBases: 0, genomeSize: 0 };
+    const bamParts = [];
+    let processedReads = 0, processedBytes = 0;
+    const startTime = Date.now();
+    const totalBytes = read1File.size + (read2File?.size || 0);
+
+    const updateProgress = (newReads, newBytes) => {
+        processedReads += newReads;
+        processedBytes += newBytes;
+        const elapsed = Date.now() - startTime;
+        let p = 0;
+        return `Elapsed: ${formatTime(elapsed)}`; 
+    };
 
     try {
-        await Promise.all(workers.map(w => w.init()));
-        logger("Workers Initialized.");
-    
-        const bamParts = [];
-              let latestStats = null;
-        logger("Calculating total work for progress tracking...");
-        
-          const refChunkSizeBytes = 100 * 1024 * 1024; 
-        
-        const estimatedRefChunks = Math.max(1, Math.ceil(referenceFile.size / refChunkSizeBytes));
-          const totalWorkReads = readsPerIteration * estimatedRefChunks;
-          const totalReadBytes = read1File.size + (read2File ? read2File.size : 0);
-          const totalWorkBytes = totalReadBytes * estimatedRefChunks;
-          let processedReads = 0;
-          let processedBytes = 0;
-      
-          if (totalWorkReads === 0 && onProgress) {
-                  logger("Read counting failed or yielded zero; falling back to byte-based progress.");
-          }
-        
-          const startTime = Date.now();
-      
-          if (onProgress) {
-                  onProgress(0);
-          }
-      
-        function formatTime(ms) {
-            if (!isFinite(ms) || ms < 0) return "--:--";
-            const seconds = Math.floor(ms / 1000);
-            const m = Math.floor(seconds / 60);
-            const s = seconds % 60;
-            return `${m}:${s.toString().padStart(2, '0')}`;
-        }
-      
-        async function updateProgress(newlyProcessedReads, newlyProcessedBytes) {
-            processedReads += newlyProcessedReads;
-            processedBytes += newlyProcessedBytes;
-            const elapsed = Date.now() - startTime;
-      
-            let fraction = 0;
-            if (totalWorkReads > 0 && processedReads > 0) {
-                fraction = processedReads / totalWorkReads;
-            } else if (totalWorkBytes > 0 && processedBytes > 0) {
-                fraction = processedBytes / totalWorkBytes;
-            }
-      
-            if (fraction > 0) {
-                const estimatedTotalTime = elapsed / fraction;
-                const remaining = estimatedTotalTime - elapsed;
-                const percentage = Math.min(100, fraction * 100);
-      
-                if (onProgress) {
-                    onProgress(parseFloat(percentage.toFixed(1)));
-                    
-                    await flushUi();
-                }
-      
-                return `[${percentage.toFixed(1)}%] Elapsed: ${formatTime(elapsed)}, ETA: ${formatTime(remaining)}`;
-            }
-            return ``;
-        }
-      
-        
-        
-        await streamReference(referenceFile, refChunkSizeBytes, async (refChunk, refId) => {
-            logger(`Processing Reference Chunk ${refId}, size: ${(refChunk.length / 1024 / 1024).toFixed(2)} MB`);
+        const refChunkSize = 100 * 1024 * 1024;
+        await streamReference(referenceFile, refChunkSize, async (refChunk, refId) => {
+            logger(`RefChunk ${refId}: ${(refChunk.length/1e6).toFixed(2)} MB`);
             
-            
+            await workers[0].processRef(refChunk, refId);
             if (workers.length > 1) {
-                logger(`Building index in sub-worker 0...`);
-                await workers[0].processRef(refChunk, refId);
-                
-                logger(`Broadcasting index to ${workers.length - 1} workers...`);
                 const { indexData } = await workers[0].exportIndex();
-                
-                
-                
-                
-                
-                
-                
-                const promises = [];
-                for (let i = 1; i < workers.length; i++) {
-                    promises.push(workers[i].importIndex(indexData));
-                }
-                await Promise.all(promises);
-            } else {
-                await workers[0].processRef(refChunk, refId);
+                await Promise.all(workers.slice(1).map(w => w.importIndex(indexData)));
             }
             
             const activePromises = new Set();
+            const chunkParts = []; 
+            let passGenomeSize = 0;
             let readChunkCount = 0;
 
-            const chunkParts = [];
-            let maxChunkId = -1;
-
-            const handleResult = (result, chunkId, worker) => {
+            const handleResult = (result, chunkId) => {
                 const { bam, stats } = result;
+                runStats.total += stats.total; 
+                runStats.mapped += stats.mapped;
+                runStats.mappedBases += stats.mappedBases;
+                passGenomeSize = Math.max(passGenomeSize, stats.genomeSize);
                 
-                if (worker) {
-                    workerStats.set(worker, stats);
-                }
+                const cov = passGenomeSize ? (runStats.mappedBases / passGenomeSize).toFixed(2) : 0;
+                logger(`Chunk ${chunkId}: ${stats.mapped}/${stats.total} mapped. Global Mapped: ${runStats.mapped}. Cov: ${cov}`);
 
-                let aggTotal = 0;
-                let aggMapped = 0;
-                let aggMappedBases = 0;
-                let aggGenomeSize = stats.genomeSize; 
-                
-                for (const s of workerStats.values()) {
-                    aggTotal += s.total;
-                    aggMapped += s.mapped;
-                    aggMappedBases += s.mappedBases;
-                }
-
-                let aggAvgCoverage = 0;
-                if (aggGenomeSize > 0) {
-                    aggAvgCoverage = aggMappedBases / aggGenomeSize;
-                }
-
-                latestStats = {
-                    total: aggTotal,
-                    mapped: aggMapped,
-                    mappedBases: aggMappedBases,
-                    genomeSize: aggGenomeSize,
-                    avgCoverage: aggAvgCoverage
-                };
-
-                logger(`Processed Chunk ${chunkId}: ${latestStats.mapped}/${latestStats.total} reads mapped.`);
-
-                
-                
-                
-
-                if (bam.length > 0) {
-                    let part = new Uint8Array(bam);
-                    
-                    
-                    if (outputFormat === 'sam' && bamParts.length > 0) {
-                        
-                        
-                        
-                        let splitIndex = 0;
-                        const len = part.length;
-                        let inHeader = true;
-                        
-                        
-                        if (len > 0 && part[0] === 64) {
-                            
-                            for(let i=0; i<len; i++) {
-                               if (part[i] === 10) { 
-                                   if (i + 1 < len) {
-                                       if (part[i+1] !== 64) {
-                                           
-                                           splitIndex = i + 1;
-                                           inHeader = false;
-                                           break;
-                                       }
-                                   } else {
-                                       
-                                       splitIndex = len;
-                                       inHeader = false;
-                                   }
-                               }
-                            }
-                            if (inHeader) splitIndex = len;
-                        }
-                        
-                        if (splitIndex > 0) {
-                            part = part.subarray(splitIndex);
-                        }
-                    }
-                    
-                    if (part.length > 0) {
-                        chunkParts[chunkId] = part;
-                        if (chunkId > maxChunkId) maxChunkId = chunkId;
-                    }
+                if (bam.length) {
+                    chunkParts[chunkId] = new Uint8Array(bam);
                 }
             };
             
-            if (read2File) {
-                logger(`Mapping Paired-End reads against Reference Chunk ${refId}...`);
+            const processChunk = async (r1, r2, cId, recs) => {
+                readChunkCount++;
+                while (activePromises.size >= workers.length) await Promise.race(activePromises);
                 
-                await streamReadsPaired(read1File, read2File, chunkSize, async (r1, r2, chunkId, records) => {
-                     readChunkCount++;
-                     const currentChunkReads = records * 2;
-                     const currentChunkBytes = r1.byteLength + r2.byteLength;
-                     
-                     
-                     while (activePromises.size >= workers.length) {
-                         await Promise.race(activePromises);
-                     }
-                     
-                     const worker = workers.find(w => !w.busy);
-                     if (!worker) throw new Error("Worker pool logic error");
-                     
-                     const writeHeader = (readChunkCount === 1) && (refId === 0);
-                     const promise = worker.mapChunk(r1, r2, outputFormat, sortOutput, writeHeader);
-                     activePromises.add(promise);
-                     
-                     const p = promise.then(result => {
-                         activePromises.delete(promise);
-                         handleResult(result, chunkId, worker);
-                         return updateProgress(currentChunkReads, currentChunkBytes);
-                     }).then(timeLog => {
-                         
-                     });
-                     
-                });
-            } else {
-                logger(`Mapping Single-End reads against Reference Chunk ${refId}...`);
+                const w = workers.find(x => !x.busy);
+                const writeHead = (readChunkCount === 1 && refId === 0);
                 
-                await streamReadsSingle(read1File, chunkSize, async (r1, chunkId, records) => {
-                     readChunkCount++;
-                     const currentChunkReads = records;
-                     const currentChunkBytes = r1.byteLength;
-                     
-                     while (activePromises.size >= workers.length) {
-                         await Promise.race(activePromises);
-                     }
-                     
-                     const worker = workers.find(w => !w.busy);
-                     const writeHeader = (readChunkCount === 1) && (refId === 0);
-                     const promise = worker.mapChunk(r1, undefined, outputFormat, sortOutput, writeHeader);
-                     activePromises.add(promise);
-                     
-                     const p = promise.then(result => {
-                         activePromises.delete(promise);
-                         handleResult(result, chunkId, worker);
-                         return updateProgress(currentChunkReads, currentChunkBytes);
-                     }).then(timeLog => {
-                         
-                     });
-                });
-            }
-            
+                const p = w.mapChunk(r1, r2, outputFormat, sortOutput, writeHead)
+                    .then(res => {
+                        handleResult(res, cId);
+                        const msg = updateProgress(recs * (r2?2:1), r1.byteLength + (r2?r2.byteLength:0));
+                        if(onProgress) onProgress(((processedReads / (totalReads || 1))*10).toFixed(1));
+                    });
+                
+                activePromises.add(p);
+                p.finally(() => activePromises.delete(p));
+            };
+
+            if (read2File) await streamReadsPaired(read1File, read2File, chunkSize, processChunk);
+            else await streamReadsSingle(read1File, chunkSize, (r1, cId, recs) => processChunk(r1, undefined, cId, recs));
             
             await Promise.all(activePromises);
-            logger(`Completed mapping all reads against Reference Chunk ${refId}. Total Read Chunks: ${readChunkCount}`);
+            runStats.genomeSize += passGenomeSize; 
 
-            
-            for (let i = 0; i <= maxChunkId; i++) {
-                const part = chunkParts[i];
-                if (part && part.length > 0) {
-                    bamParts.push(part);
-                    chunkParts[i] = null; // release chunk memory early
-                }
-            }
+            chunkParts.forEach(p => { if (p) bamParts.push(p); });
         });
-      
-        logger("Merging BAM parts...");
-        
+
+        logger("Merging...");
         if (outputFormat === 'bam') {
-            
-            const BAM_EOF = new Uint8Array([
-                0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 
-                0x06, 0x00, 0x42, 0x43, 0x02, 0x00, 0x1b, 0x00, 0x03, 0x00, 
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-            ]);
-            bamParts.push(BAM_EOF);
+            bamParts.push(new Uint8Array([0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00, 0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])); 
         }
 
-        const blob = new Blob(bamParts, { type: 'application/octet-stream' });
-        
         const totalTime = Date.now() - startTime;
-        logger(`Total Mapping Time: ${formatTime(totalTime)} ( ${(totalTime/1000).toFixed(2)} seconds)`);
+        logger(`Done in ${formatTime(totalTime)}.`);
+        if (onProgress) onProgress(100);
 
-        if (onProgress) {
-            onProgress(100);
-        }
-
-        return { blob, stats: latestStats };
+        return { 
+            blob: new Blob(bamParts, { type: 'application/octet-stream' }), 
+            stats: { ...runStats, avgCoverage: runStats.genomeSize ? runStats.mappedBases / runStats.genomeSize : 0 } 
+        };
     } finally {
-        
         workers.forEach(w => w.terminate());
     }
 }
