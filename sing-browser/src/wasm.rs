@@ -128,7 +128,7 @@ impl SingWebEngine {
                         let mut res2 = None;
                         
                         if !skip {
-                            let seq1 = rec1.seq(); // No copy for alignment
+                            let seq1 = rec1.seq();
                             let seq2 = rec2.seq();
                             res1 = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
                             res2 = align(&seq2, idx, &mut self.state, &mut self.rev_buf);

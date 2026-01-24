@@ -524,16 +524,14 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
     await Promise.all(workers.map(w => w.init()));
 
     const runStats = { mapped: 0, mappedBases: 0, genomeSize: 0 };
-    // Bitset for mapped reads. 1 bit per read if possible, but JS Uint8Array is 1 byte per entry easier access or use bit manipulation.
-    // WASM implementation uses 1 bit per read.
-    // Size = ceil(finalTotalReads / 8)
+    const finalTotalReads = totalReads * (read2File ? 2 : 1);
+    
     const mappedMaskSize = Math.ceil((finalTotalReads || 1) / 8);
     const globalMappedMask = new Uint8Array(mappedMaskSize);
     
     const bamParts = [];
     let processedReads = 0, processedBytes = 0;
     const startTime = Date.now();
-    const finalTotalReads = totalReads * (read2File ? 2 : 1);
 
     const updateProgress = (newReads, newBytes) => {
         processedReads += newReads;
@@ -557,30 +555,13 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
             const chunkParts = []; 
             let passGenomeSize = 0;
             let readChunkCount = 0;
-            let currentReadOffset = 0; // Track read index in the stream for this pass
+            let currentReadOffset = 0;
 
             const handleResult = (result, chunkId, chunkStartReadIdx) => {
                 const { bam, stats, mappedMask } = result;
-                // Accumulate stats: mapped and bases are deltas from worker for this chunk.
                 runStats.mapped += stats.mapped; 
                 runStats.mappedBases += stats.mappedBases;
                 passGenomeSize = Math.max(passGenomeSize, stats.genomeSize);
-                
-                // Merge mappedMask into globalMappedMask
-                // mappedMask corresponds to reads starting at chunkStartReadIdx
-                // mappedMask is a Uint8Array where bit 0 of byte 0 corresponds to chunkStartReadIdx
-                // We need to merge this into globalMappedMask which starts at 0.
-                // This "merge" operation is a bit complex because of bit alignment.
-                // Simplified approach: WASM returns a mask relative to the chunk.
-                // Actually, WASM assumes 0-based index for the chunk.
-                // We need to shift bits?
-                
-                // Let's look at WASM again. 
-                // `current_read_idx = total_reads` (which is 0 at start of chunk in WASM).
-                // So WASM returns a mask where bit 0 is the first read of the chunk.
-                
-                // We need to OR these bits into globalMappedMask at bit offset chunkStartReadIdx.
-                // This requires bit shifting in JS.
                 
                 const startBit = chunkStartReadIdx;
                 for(let i=0; i<mappedMask.length; i++) {
@@ -616,17 +597,9 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
                 const w = workers.find(x => !x.busy);
                 const writeHead = (readChunkCount === 1 && refId === 0);
                 
-                // Prepare filter mask slice for this chunk
-                // We need `ceil(nReads/8)` bytes but aligned to `thisChunkStartIdx`.
-                // Extracting exact bits is hard.
-                // But we can just pass a simplified byte array or...
-                // Wait, if we want to pass a mask to WASM, WASM expects `is_mapped` using `current_read_idx` (0-based in chunk).
-                // So we need to extract bits [thisChunkStartIdx .. thisChunkStartIdx + nReads] and pack them into a new Uint8Array (start at bit 0).
-                
                 const chunkMaskSize = Math.ceil(nReads / 8);
                 const chunkFilterMask = new Uint8Array(chunkMaskSize);
                 
-                // Copy bits from global to chunk mask
                 for(let i=0; i<nReads; i++) {
                     const globalBit = thisChunkStartIdx + i;
                     const globalByte = Math.floor(globalBit / 8);
