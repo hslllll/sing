@@ -1,4 +1,4 @@
-import init, { SingWebEngine } from './pkg/sing_web.js';
+import init, { SingWebEngine } from './pkg/sing_browser.js';
 
 
 class WorkerClient {

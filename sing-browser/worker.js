@@ -1,4 +1,4 @@
-import init, { SingWebEngine } from './pkg/sing_web.js';
+import init, { SingWebEngine } from './pkg/sing_browser.js';
 
 let engine = null;
 
@@ -10,7 +10,7 @@ self.onmessage = async (e) => {
         switch (type) {
             case 'INIT':
                 
-                await init(new URL(`./pkg/sing_web_bg.wasm?t=${Date.now()}`, import.meta.url));
+                await init(new URL(`./pkg/sing_browser_bg.wasm?t=${Date.now()}`, import.meta.url));
                 engine = new SingWebEngine();
                 result = { success: true };
                 break;
