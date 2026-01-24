@@ -170,6 +170,11 @@ where
         ref_seqs.push(seq);
     }
 
+    let total_bases: usize = ref_seqs.iter().map(|s| s.len()).sum();
+    let freq_filter = ((total_bases as f64 / 100_000_000.0) * 1000.0) as usize;
+    let freq_filter = std::cmp::max(1000, freq_filter);
+    eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
+
     seeds_tmp.sort_unstable_by_key(|k| k.0);
 
     let mut global_counts = vec![0u32; 1 << RADIX];
@@ -184,7 +189,7 @@ where
             j += 1;
         }
         uniq_hashes += 1;
-        if j - i <= CONFIG.freq_filter {
+        if j - i <= freq_filter {
             kept_hashes += 1;
             for k in i..j {
                 let (h, packed) = seeds_tmp[k];
