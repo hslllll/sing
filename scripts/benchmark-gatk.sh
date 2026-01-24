@@ -44,7 +44,7 @@ case $MODE in
     m) SPECIES="maize"; GENOME_SIZE=250000000
        REF_NAME="Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa"
        REF_DECOMP="Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa"
-       REF_URL=""
+       REF_URL="https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/fasta/zea_mays/dna/Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa.gz"
        INDEX_PREFIX="maize" ;;
     h) SPECIES="human"; GENOME_SIZE=3.2e9
        REF_NAME="GRCh38_latest_genomic.fna.gz"
