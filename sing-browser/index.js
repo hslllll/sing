@@ -552,6 +552,8 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
         workers.push(new WorkerClient());
     }
 
+    const workerStats = new Map();
+
     try {
         await Promise.all(workers.map(w => w.init()));
         logger("Workers Initialized.");
@@ -649,10 +651,38 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
             const chunkParts = [];
             let maxChunkId = -1;
 
-            const handleResult = (result, chunkId) => {
+            const handleResult = (result, chunkId, worker) => {
                 const { bam, stats } = result;
-                latestStats = stats;
-                logger(`Processed Chunk ${chunkId}: ${stats.mapped}/${stats.total} reads mapped.`);
+                
+                if (worker) {
+                    workerStats.set(worker, stats);
+                }
+
+                let aggTotal = 0;
+                let aggMapped = 0;
+                let aggMappedBases = 0;
+                let aggGenomeSize = stats.genomeSize; 
+                
+                for (const s of workerStats.values()) {
+                    aggTotal += s.total;
+                    aggMapped += s.mapped;
+                    aggMappedBases += s.mappedBases;
+                }
+
+                let aggAvgCoverage = 0;
+                if (aggGenomeSize > 0) {
+                    aggAvgCoverage = aggMappedBases / aggGenomeSize;
+                }
+
+                latestStats = {
+                    total: aggTotal,
+                    mapped: aggMapped,
+                    mappedBases: aggMappedBases,
+                    genomeSize: aggGenomeSize,
+                    avgCoverage: aggAvgCoverage
+                };
+
+                logger(`Processed Chunk ${chunkId}: ${latestStats.mapped}/${latestStats.total} reads mapped.`);
 
                 
                 
@@ -726,7 +756,7 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
                      
                      const p = promise.then(result => {
                          activePromises.delete(promise);
-                         handleResult(result, chunkId);
+                         handleResult(result, chunkId, worker);
                          return updateProgress(currentChunkReads, currentChunkBytes);
                      }).then(timeLog => {
                          
@@ -752,7 +782,7 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
                      
                      const p = promise.then(result => {
                          activePromises.delete(promise);
-                         handleResult(result, chunkId);
+                         handleResult(result, chunkId, worker);
                          return updateProgress(currentChunkReads, currentChunkBytes);
                      }).then(timeLog => {
                          
