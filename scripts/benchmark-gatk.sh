@@ -4,9 +4,11 @@ eval "$(micromamba shell hook --shell=bash)"
 micromamba activate tools
 
 if [ -z "$1" ]; then
-    echo "Usage: ./gatk-sim.sh [y|a]"
+    echo "Usage: ./gatk-sim.sh [y|a|m|h]"
     echo "  y : Yeast"
     echo "  a : Arabidopsis"
+    echo "  m : Maize"
+    echo "  h : Human"
     exit 1
 fi
 
@@ -39,11 +41,20 @@ case $MODE in
     a) SPECIES="arabidopsis"; GENOME_SIZE=135000000
        REF_NAME="arabidopsis.fa"
        REF_URL="http://ftp.ensemblgenomes.org/pub/plants/release-57/fasta/arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz" ;;
+    m) SPECIES="maize"; GENOME_SIZE=250000000
+       REF_NAME="Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa"
+       REF_DECOMP="Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa"
+       REF_URL=""
+       INDEX_PREFIX="maize" ;;
+    h) SPECIES="human"; GENOME_SIZE=3.2e9
+       REF_NAME="GRCh38_latest_genomic.fna.gz"
+       REF_DECOMP="GRCh38_latest_genomic.fna"
+       REF_URL="https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers/GRCh38_latest_genomic.fna.gz"
+       INDEX_PREFIX="human" ;;
     *) echo "Error: Unknown mode"; exit 1 ;;
 esac
 
 REF="$OUT_DIR/$REF_NAME"
-N_READS=$(echo "$GENOME_SIZE * $COVERAGE / (2 * $READ_LEN)" | bc)
 SIM_PREFIX="$OUT_DIR/sim_reads"
 
 # ==============================================================================
@@ -61,7 +72,7 @@ fi
 
 # Simulate
 echo "Running dwgsim..."
-dwgsim -z 1 -N $N_READS -1 $READ_LEN -2 $READ_LEN \
+dwgsim -C $COVERAGE -1 $READ_LEN -2 $READ_LEN \
        -r $MUT_RATE -R $INDEL_FRAC -e $ERR_RATE -E $ERR_RATE -y 0 \
        "$REF" "$SIM_PREFIX" > /dev/null
 
