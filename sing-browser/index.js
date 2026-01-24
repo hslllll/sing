@@ -562,7 +562,7 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
               let latestStats = null;
         logger("Calculating total work for progress tracking...");
         
-          const refChunkSizeBytes = 20 * 1024 * 1024; 
+          const refChunkSizeBytes = 100 * 1024 * 1024; 
         
         const estimatedRefChunks = Math.max(1, Math.ceil(referenceFile.size / refChunkSizeBytes));
           const totalWorkReads = readsPerIteration * estimatedRefChunks;
