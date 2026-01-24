@@ -215,7 +215,10 @@ echo "------------------------------------------------------------------"
 BWA_TIME=${SECONDS_MAP["bwa"]}
 for tool in "${TOOLS[@]}"; do
     TIME=${SECONDS_MAP[$tool]}
-    if [ $(echo "$TIME == 0" | bc) -eq 1 ]; then RATIO="err"; else RATIO=$(echo "scale=2; $BWA_TIME / $TIME" | bc); fi
+    RATIO=$(awk -v bwa="$BWA_TIME" -v tool="$TIME" 'BEGIN {
+        if (tool == 0) print "err"
+        else printf "%.2f", bwa / tool
+    }')
     printf "%-10s | %-12s | %-12s | %-15sx\n" $tool ${SECONDS_MAP[$tool]} ${MEM_MAP[$tool]} $RATIO
 done
 echo "------------------------------------------------------------------"
