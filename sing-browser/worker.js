@@ -31,22 +31,25 @@ self.onmessage = async (e) => {
                 break;
             case 'MAP_CHUNK':
                 if (!engine) throw new Error("Engine not initialized");
-                const { r1, r2, format, sort, writeHeader } = payload;
-                const mappingResult = engine.run_mapping_chunk(0, r1, r2, format, sort, writeHeader);
+                const { r1, r2, format, sort, writeHeader, filterMask } = payload;
+                const mappingResult = engine.run_mapping_chunk(0, r1, r2, format, sort, writeHeader, filterMask);
 
                 const bamBytes = mappingResult.bam_data;
-                const transfer = [bamBytes.buffer];
-
+                const mappedMask = mappingResult.mapped_mask;
                 
-                const total = engine.get_total_reads();
-                const mapped = engine.get_mapped_reads();
-                const mappedBases = engine.get_mapped_bases();
+                const transfer = [bamBytes.buffer, mappedMask.buffer];
+                
                 const genomeSize = engine.get_genome_size();
-                const avgCoverage = engine.get_avg_coverage();
                 
                 result = { 
                     bam: bamBytes,
-                    stats: { total, mapped, mappedBases, genomeSize, avgCoverage },
+                    mappedMask,
+                    stats: { 
+                        total: mappingResult.total_reads, 
+                        mapped: mappingResult.mapped_reads, 
+                        mappedBases: mappingResult.mapped_bases, 
+                        genomeSize 
+                    },
                     transfer 
                 };
                 break;

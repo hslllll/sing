@@ -13,6 +13,10 @@ use std::io::{BufRead, BufReader, Cursor, Write};
 #[wasm_bindgen(getter_with_clone)]
 pub struct MappingResult {
     pub bam_data: Vec<u8>,
+    pub total_reads: usize,
+    pub mapped_reads: usize,
+    pub mapped_bases: usize,
+    pub mapped_mask: Vec<u8>,
 }
 
 #[wasm_bindgen]
@@ -20,9 +24,6 @@ pub struct SingWebEngine {
     index: Option<Index>,
     state: State,
     rev_buf: Vec<u8>,
-    total_reads: usize,
-    mapped_reads: usize,
-    mapped_bases: usize,
     genome_size: usize,
 }
 
@@ -34,9 +35,6 @@ impl SingWebEngine {
             index: None,
             state: State::new(),
             rev_buf: Vec::new(),
-            total_reads: 0,
-            mapped_reads: 0,
-            mapped_bases: 0,
             genome_size: 0,
         }
     }
@@ -78,6 +76,7 @@ impl SingWebEngine {
         output_format: String,
         sort_output: bool,
         write_header: bool,
+        filter_mask: Option<Vec<u8>>,
     ) -> Result<MappingResult, JsValue> {
         let idx = resolve_index(ref_index_ptr, self.index.as_ref()).map_err(to_js)?;
         let header = header_from_index(idx, sort_output).map_err(to_js)?;
@@ -89,6 +88,28 @@ impl SingWebEngine {
             Box::new(StreamWriter::new(format, header.clone(), write_header).map_err(to_js)?)
         };
 
+        let mut total_reads = 0;
+        let mut mapped_reads = 0;
+        let mut mapped_bases = 0;
+        let mut mapped_mask = Vec::new();
+
+        fn is_mapped(mask: &Option<Vec<u8>>, idx: usize) -> bool {
+            if let Some(m) = mask {
+                if idx / 8 < m.len() {
+                    return (m[idx / 8] & (1 << (idx % 8))) != 0;
+                }
+            }
+            false
+        }
+
+        fn set_mapped(mask: &mut Vec<u8>, idx: usize) {
+            let byte_idx = idx / 8;
+            if byte_idx >= mask.len() {
+                mask.resize(byte_idx + 1, 0);
+            }
+            mask[byte_idx] |= 1 << (idx % 8);
+        }
+
         if let Some(read2) = read2_chunk {
             let mut r1_iter = parse_fastx_reader(get_smart_reader(read1_chunk)).map_err(to_js)?;
             let mut r2_iter = parse_fastx_reader(get_smart_reader(&read2)).map_err(to_js)?;
@@ -99,6 +120,19 @@ impl SingWebEngine {
                     (Some(r1), Some(r2)) => {
                         let rec1 = r1.map_err(to_js)?;
                         let rec2 = r2.map_err(to_js)?;
+                        
+                        let current_read_idx = total_reads;
+                        let skip = is_mapped(&filter_mask, current_read_idx) || is_mapped(&filter_mask, current_read_idx + 1);
+
+                        let mut res1 = None;
+                        let mut res2 = None;
+                        
+                        if !skip {
+                            let seq1 = rec1.seq(); // No copy for alignment
+                            let seq2 = rec2.seq();
+                            res1 = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
+                            res2 = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
+                        }
 
                         let name1 = String::from_utf8_lossy(rec1.id())
                             .split_whitespace()
@@ -122,18 +156,25 @@ impl SingWebEngine {
                             .map(|q| q.to_vec())
                             .unwrap_or_else(|| vec![b'*'; seq2.len().max(1)]);
 
-                        let res1 = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
-                        let res2 = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
+                        if res1.is_some() { 
+                            mapped_reads += 1; 
+                            mapped_bases += seq1.len(); 
+                            set_mapped(&mut mapped_mask, current_read_idx);
+                        }
+                        if res2.is_some() { 
+                            mapped_reads += 1; 
+                            mapped_bases += seq2.len();
+                            set_mapped(&mut mapped_mask, current_read_idx + 1);
+                        }
+                        total_reads += 2;
 
-                        self.total_reads += 2;
-                        if res1.is_some() { self.mapped_reads += 1; self.mapped_bases += seq1.len(); }
-                        if res2.is_some() { self.mapped_reads += 1; self.mapped_bases += seq2.len(); }
+                        if !skip {
+                            let sam1 = sam_record(&name1, &seq1, &qual1, &res1, Some(&res2), true, idx).map_err(to_js)?;
+                            let sam2 = sam_record(&name2, &seq2, &qual2, &res2, Some(&res1), false, idx).map_err(to_js)?;
 
-                        let sam1 = sam_record(&name1, &seq1, &qual1, &res1, Some(&res2), true, idx).map_err(to_js)?;
-                        let sam2 = sam_record(&name2, &seq2, &qual2, &res2, Some(&res1), false, idx).map_err(to_js)?;
-
-                        strategy.write(&sam1).map_err(to_js)?;
-                        strategy.write(&sam2).map_err(to_js)?;
+                            strategy.write(&sam1).map_err(to_js)?;
+                            strategy.write(&sam2).map_err(to_js)?;
+                        }
                     }
                     _ => return Err(JsValue::from_str("paired-end inputs have mismatched read counts")),
                 }
@@ -142,6 +183,16 @@ impl SingWebEngine {
             let mut r1_iter = parse_fastx_reader(get_smart_reader(read1_chunk)).map_err(to_js)?;
             while let Some(rec) = r1_iter.next() {
                 let rec = rec.map_err(to_js)?;
+                
+                let current_read_idx = total_reads;
+                let skip = is_mapped(&filter_mask, current_read_idx);
+                
+                let mut res = None;
+                if !skip {
+                    let seq_ref = rec.seq();
+                    res = align(&seq_ref, idx, &mut self.state, &mut self.rev_buf);
+                }
+
                 let name = String::from_utf8_lossy(rec.id())
                     .split_whitespace()
                     .next()
@@ -152,31 +203,29 @@ impl SingWebEngine {
                     .qual()
                     .map(|q| q.to_vec())
                     .unwrap_or_else(|| vec![b'*'; seq.len().max(1)]);
-                let res = align(&seq, idx, &mut self.state, &mut self.rev_buf);
-                self.total_reads += 1;
-                if res.is_some() { self.mapped_reads += 1; self.mapped_bases += seq.len(); }
+                
+                if res.is_some() { 
+                    mapped_reads += 1; 
+                    mapped_bases += seq.len(); 
+                    set_mapped(&mut mapped_mask, current_read_idx);
+                }
+                total_reads += 1;
 
-                let sam_rec = sam_record(&name, &seq, &qual, &res, None, true, idx).map_err(to_js)?;
-                strategy.write(&sam_rec).map_err(to_js)?;
+                if !skip {
+                    let sam_rec = sam_record(&name, &seq, &qual, &res, None, true, idx).map_err(to_js)?;
+                    strategy.write(&sam_rec).map_err(to_js)?;
+                }
             }
         }
 
-        Ok(strategy.finalize().map_err(to_js)?)
-    }
-
-    #[wasm_bindgen]
-    pub fn get_total_reads(&self) -> usize {
-        self.total_reads
-    }
-
-    #[wasm_bindgen]
-    pub fn get_mapped_reads(&self) -> usize {
-        self.mapped_reads
-    }
-
-    #[wasm_bindgen]
-    pub fn get_mapped_bases(&self) -> usize {
-        self.mapped_bases
+        let bam_data = strategy.finalize().map_err(to_js)?;
+        Ok(MappingResult {
+            bam_data,
+            total_reads,
+            mapped_reads,
+            mapped_bases,
+            mapped_mask,
+        })
     }
 
     #[wasm_bindgen]
@@ -185,17 +234,8 @@ impl SingWebEngine {
     }
 
     #[wasm_bindgen]
-    pub fn get_avg_coverage(&self) -> f64 {
-        if self.genome_size == 0 {
-            0.0
-        } else {
-            self.mapped_bases as f64 / self.genome_size as f64
-        }
-    }
-
-    #[wasm_bindgen]
     pub fn map_reads_chunk(&mut self, reads_chunk: &[u8]) -> Result<MappingResult, JsValue> {
-        self.run_mapping_chunk(std::ptr::null(), reads_chunk, None, "bam".to_string(), false, true)
+        self.run_mapping_chunk(std::ptr::null(), reads_chunk, None, "bam".to_string(), false, true, None)
     }
 }
 
@@ -373,7 +413,7 @@ impl OutputFormat {
 
 trait OutputStrategy {
     fn write(&mut self, record: &sam::Record) -> Result<()>;
-    fn finalize(self: Box<Self>) -> Result<MappingResult>;
+    fn finalize(self: Box<Self>) -> Result<Vec<u8>>;
 }
 
 type BamWriter = bam::io::Writer<bgzf::io::writer::Writer<Cursor<Vec<u8>>>>;
@@ -420,12 +460,12 @@ impl OutputStrategy for StreamWriter {
         Ok(())
     }
 
-    fn finalize(self: Box<Self>) -> Result<MappingResult> {
+    fn finalize(self: Box<Self>) -> Result<Vec<u8>> {
         let bam_data = match self.writer {
             StreamWriterKind::Bam(w) => w.into_inner().finish()?.into_inner(),
             StreamWriterKind::Sam(w) => w.into_inner().into_inner(),
         };
-        Ok(MappingResult { bam_data })
+        Ok(bam_data)
     }
 }
 
@@ -448,7 +488,7 @@ impl OutputStrategy for SortWriter {
         Ok(())
     }
 
-    fn finalize(mut self: Box<Self>) -> Result<MappingResult> {
+    fn finalize(mut self: Box<Self>) -> Result<Vec<u8>> {
         self.records.sort_by(|a, b| {
             let refs = self.header.reference_sequences();
 
@@ -490,8 +530,7 @@ impl OutputStrategy for SortWriter {
                 }
 
                 let bam_data = writer.into_inner().finish()?.into_inner();
-
-                     Ok(MappingResult { bam_data })
+                Ok(bam_data)
              },
              OutputFormat::Sam => {
                 let cursor = Cursor::new(Vec::new());
@@ -502,7 +541,7 @@ impl OutputStrategy for SortWriter {
                 for record in &self.records {
                      writer.write_record(&self.header, record)?;
                 }
-                Ok(MappingResult { bam_data: writer.into_inner().into_inner() })
+                Ok(writer.into_inner().into_inner())
              }
         }
     }
