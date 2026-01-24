@@ -2,7 +2,7 @@ use wasm_bindgen::prelude::*;
 
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
-use needletail::{parse_fastx_reader, parser::FastxRecord};
+use needletail::parse_fastx_reader;
 use noodles::{bam, sam, bgzf};
 use noodles::sam::alignment::io::Write as _;
 use sing_core::{
@@ -97,8 +97,30 @@ impl SingWebEngine {
                 match (r1_iter.next(), r2_iter.next()) {
                     (None, None) => break,
                     (Some(r1), Some(r2)) => {
-                        let (name1, seq1, qual1) = fastx_record_to_owned(r1.map_err(to_js)?);
-                        let (name2, seq2, qual2) = fastx_record_to_owned(r2.map_err(to_js)?);
+                        let rec1 = r1.map_err(to_js)?;
+                        let rec2 = r2.map_err(to_js)?;
+
+                        let name1 = String::from_utf8_lossy(rec1.id())
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        let seq1 = rec1.seq().to_vec();
+                        let qual1 = rec1
+                            .qual()
+                            .map(|q| q.to_vec())
+                            .unwrap_or_else(|| vec![b'*'; seq1.len().max(1)]);
+
+                        let name2 = String::from_utf8_lossy(rec2.id())
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        let seq2 = rec2.seq().to_vec();
+                        let qual2 = rec2
+                            .qual()
+                            .map(|q| q.to_vec())
+                            .unwrap_or_else(|| vec![b'*'; seq2.len().max(1)]);
 
                         let res1 = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
                         let res2 = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
@@ -119,7 +141,17 @@ impl SingWebEngine {
         } else {
             let mut r1_iter = parse_fastx_reader(get_smart_reader(read1_chunk)).map_err(to_js)?;
             while let Some(rec) = r1_iter.next() {
-                let (name, seq, qual) = fastx_record_to_owned(rec.map_err(to_js)?);
+                let rec = rec.map_err(to_js)?;
+                let name = String::from_utf8_lossy(rec.id())
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let seq = rec.seq().to_vec();
+                let qual = rec
+                    .qual()
+                    .map(|q| q.to_vec())
+                    .unwrap_or_else(|| vec![b'*'; seq.len().max(1)]);
                 let res = align(&seq, idx, &mut self.state, &mut self.rev_buf);
                 self.total_reads += 1;
                 if res.is_some() { self.mapped_reads += 1; self.mapped_bases += seq.len(); }
@@ -185,20 +217,6 @@ fn parse_reference_chunk(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         out.push((name, rec.seq().to_vec()));
     }
     Ok(out)
-}
-
-fn fastx_record_to_owned(rec: FastxRecord<'_>) -> (String, Vec<u8>, Vec<u8>) {
-    let name = String::from_utf8_lossy(rec.id())
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let seq = rec.seq().to_vec();
-    let qual = rec
-        .qual()
-        .map(|q| q.to_vec())
-        .unwrap_or_else(|| vec![b'*'; seq.len().max(1)]);
-    (name, seq, qual)
 }
 
 fn header_from_index(idx: &Index, sorted: bool) -> Result<sam::Header> {
