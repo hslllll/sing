@@ -769,6 +769,7 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
                 const part = chunkParts[i];
                 if (part && part.length > 0) {
                     bamParts.push(part);
+                    chunkParts[i] = null; // release chunk memory early
                 }
             }
         });

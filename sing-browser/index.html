@@ -360,7 +360,7 @@
                     const url = URL.createObjectURL(currentResultBlob);
                     const a = document.createElement('a');
                     a.href = url;
-                    a.download = `sing-web-output.${effectiveFormat}`;
+                    a.download = `sing-browser-output.${effectiveFormat}`;
                     a.click();
                     setTimeout(() => URL.revokeObjectURL(url), 10000);
                 };

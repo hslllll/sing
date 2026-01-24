@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "sing-core",
     "sing-cli",
-    "sing-web",
+    "sing-browser",
 ]
 
 [workspace.package]

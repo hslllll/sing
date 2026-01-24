@@ -21,8 +21,6 @@ ref.fa*
 Sacc*
 SRR*
 *.idx
-truth.txt
-columba*
 *.fastq.gz
 *.fna.gz
 *.fastq
@@ -30,15 +28,9 @@ columba*
 *.bt2
 
 *.log
-benchmarking_logs/
-matrix_results/
 Arabidopsis*
 GRCh*
-bwa*
-mini*
-sing*
 *.tsv
 *vcf*
 
-*gatk
 *.py

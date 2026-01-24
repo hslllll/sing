@@ -2,7 +2,7 @@ use wasm_bindgen::prelude::*;
 
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
-use needletail::parse_fastx_reader;
+use needletail::{parse_fastx_reader, parser::FastxRecord};
 use noodles::{bam, sam, bgzf};
 use noodles::sam::alignment::io::Write as _;
 use sing_core::{
@@ -89,30 +89,37 @@ impl SingWebEngine {
             Box::new(StreamWriter::new(format, header.clone(), write_header).map_err(to_js)?)
         };
 
-        let reads1 = parse_reads_chunk(read1_chunk).map_err(to_js)?;
-
         if let Some(read2) = read2_chunk {
-            let reads2 = parse_reads_chunk(&read2).map_err(to_js)?;
-            if reads1.len() != reads2.len() {
-                return Err(JsValue::from_str("paired-end inputs have mismatched read counts"));
-            }
+            let mut r1_iter = parse_fastx_reader(get_smart_reader(read1_chunk)).map_err(to_js)?;
+            let mut r2_iter = parse_fastx_reader(get_smart_reader(&read2)).map_err(to_js)?;
 
-            for ((name1, seq1, qual1), (name2, seq2, qual2)) in reads1.into_iter().zip(reads2.into_iter()) {
-                let res1 = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
-                let res2 = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
+            loop {
+                match (r1_iter.next(), r2_iter.next()) {
+                    (None, None) => break,
+                    (Some(r1), Some(r2)) => {
+                        let (name1, seq1, qual1) = fastx_record_to_owned(r1.map_err(to_js)?);
+                        let (name2, seq2, qual2) = fastx_record_to_owned(r2.map_err(to_js)?);
 
-                self.total_reads += 2;
-                if res1.is_some() { self.mapped_reads += 1; self.mapped_bases += seq1.len(); }
-                if res2.is_some() { self.mapped_reads += 1; self.mapped_bases += seq2.len(); }
+                        let res1 = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
+                        let res2 = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
 
-                let sam1 = sam_record(&name1, &seq1, &qual1, &res1, Some(&res2), true, idx).map_err(to_js)?;
-                let sam2 = sam_record(&name2, &seq2, &qual2, &res2, Some(&res1), false, idx).map_err(to_js)?;
+                        self.total_reads += 2;
+                        if res1.is_some() { self.mapped_reads += 1; self.mapped_bases += seq1.len(); }
+                        if res2.is_some() { self.mapped_reads += 1; self.mapped_bases += seq2.len(); }
 
-                strategy.write(&sam1).map_err(to_js)?;
-                strategy.write(&sam2).map_err(to_js)?;
+                        let sam1 = sam_record(&name1, &seq1, &qual1, &res1, Some(&res2), true, idx).map_err(to_js)?;
+                        let sam2 = sam_record(&name2, &seq2, &qual2, &res2, Some(&res1), false, idx).map_err(to_js)?;
+
+                        strategy.write(&sam1).map_err(to_js)?;
+                        strategy.write(&sam2).map_err(to_js)?;
+                    }
+                    _ => return Err(JsValue::from_str("paired-end inputs have mismatched read counts")),
+                }
             }
         } else {
-            for (name, seq, qual) in reads1 {
+            let mut r1_iter = parse_fastx_reader(get_smart_reader(read1_chunk)).map_err(to_js)?;
+            while let Some(rec) = r1_iter.next() {
+                let (name, seq, qual) = fastx_record_to_owned(rec.map_err(to_js)?);
                 let res = align(&seq, idx, &mut self.state, &mut self.rev_buf);
                 self.total_reads += 1;
                 if res.is_some() { self.mapped_reads += 1; self.mapped_bases += seq.len(); }
@@ -180,25 +187,18 @@ fn parse_reference_chunk(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
-fn parse_reads_chunk(data: &[u8]) -> Result<Vec<(String, Vec<u8>, Vec<u8>)>> {
-    let reader = get_smart_reader(data);
-    let mut parser = parse_fastx_reader(reader)?;
-    let mut out = Vec::new();
-    while let Some(rec) = parser.next() {
-        let rec = rec?;
-        let name = String::from_utf8_lossy(rec.id())
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_string();
-        let seq = rec.seq().to_vec();
-        let qual = rec
-            .qual()
-            .map(|q| q.to_vec())
-            .unwrap_or_else(|| vec![b'*'; seq.len().max(1)]);
-        out.push((name, seq, qual));
-    }
-    Ok(out)
+fn fastx_record_to_owned(rec: FastxRecord<'_>) -> (String, Vec<u8>, Vec<u8>) {
+    let name = String::from_utf8_lossy(rec.id())
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let seq = rec.seq().to_vec();
+    let qual = rec
+        .qual()
+        .map(|q| q.to_vec())
+        .unwrap_or_else(|| vec![b'*'; seq.len().max(1)]);
+    (name, seq, qual)
 }
 
 fn header_from_index(idx: &Index, sorted: bool) -> Result<sam::Header> {
