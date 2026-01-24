@@ -559,8 +559,7 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
                 runStats.mappedBases += stats.mappedBases;
                 passGenomeSize = Math.max(passGenomeSize, stats.genomeSize);
                 
-                const cov = passGenomeSize ? (runStats.mappedBases / passGenomeSize).toFixed(2) : 0;
-                logger(`Chunk ${chunkId}: ${stats.mapped}/${stats.total} mapped. Global Mapped: ${runStats.mapped}. Cov: ${cov}`);
+                logger(`Chunk ${chunkId}: ${stats.mapped}/${stats.total} mapped. Global Mapped: ${runStats.mapped}.`);
 
                 if (bam.length) {
                     chunkParts[chunkId] = new Uint8Array(bam);
