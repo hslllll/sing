@@ -126,7 +126,7 @@ samtools index -@ $THREADS "$OUT_DIR/mini.bam"
 # ==============================================================================
 # 3. Variant Calling (NO FILTERING)
 # ==============================================================================
-echo ">>> [3/5] Calling Variants (No Hard Filtering)..."
+echo ">>> [3/5] Calling Variants"
 
 # GATK Reference Files
 DICT="${REF%.fa}.dict"
