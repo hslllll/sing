@@ -532,6 +532,9 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
     const bamParts = [];
     let processedReads = 0, processedBytes = 0;
     const startTime = Date.now();
+    const refChunkSize = 100 * 1024 * 1024;
+    const estimatedRefChunks = Math.max(1, Math.ceil(referenceFile.size / refChunkSize));
+    const totalProgressWork = Math.max(finalTotalReads, 1) * estimatedRefChunks;
 
     const updateProgress = (newReads, newBytes) => {
         processedReads += newReads;
@@ -541,7 +544,6 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
     };
 
     try {
-        const refChunkSize = 100 * 1024 * 1024;
         await streamReference(referenceFile, refChunkSize, async (refChunk, refId) => {
             logger(`RefChunk ${refId}: ${(refChunk.length/1e6).toFixed(2)} MB`);
             
@@ -617,7 +619,7 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
                     .then(res => {
                         handleResult(res, cId, thisChunkStartIdx);
                         const msg = updateProgress(nReads, r1.byteLength + (r2?r2.byteLength:0));
-                        if(onProgress) onProgress(((processedReads / (Math.max(finalTotalReads, 1) * (referenceFile.size / refChunkSize)))*100).toFixed(1));
+                        if(onProgress) onProgress(((processedReads / totalProgressWork)*100).toFixed(1));
                     });
                 
                 activePromises.add(p);
