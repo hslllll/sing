@@ -97,7 +97,7 @@ declare -A MEM_MAP
 run_timed() {
     TOOL=$1; CMD=$2; LOG="$OUT_DIR/${TOOL}.time_log"
     echo "  > Running $TOOL..."
-    /usr/bin/time -f "%e %M" -o "$LOG" bash -c "$CMD"
+    ./time -f "%e %M" -o "$LOG" bash -c "$CMD"
     read REAL_SEC MAX_KB < "$LOG"
     SECONDS_MAP[$TOOL]=$REAL_SEC
     MEM_MAP[$TOOL]=$MAX_KB
