@@ -124,7 +124,7 @@ samtools sort -@ $THREADS -O BAM -o "$OUT_DIR/mini.bam" "$OUT_DIR/mini.sam"
 samtools index -@ $THREADS "$OUT_DIR/mini.bam"
 
 # ==============================================================================
-# 3. Variant Calling (NO FILTERING)
+# 3. Variant Calling
 # ==============================================================================
 echo ">>> [3/5] Calling Variants"
 
