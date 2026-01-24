@@ -40,5 +40,5 @@ sing*
 *.tsv
 *vcf*
 
-*gatk*
+*gatk
 *.py
