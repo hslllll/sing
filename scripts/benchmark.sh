@@ -246,7 +246,7 @@ fi
 
 for COVERAGE in "${COVERAGE_LIST[@]}"; do
     for MUT_RATE in "${MUT_RATES[@]}"; do
-        EXP_ID="Cov_${COVERAGE}_Mut_${MUT_RATE}_${MODE}"
+        EXP_ID="Cov_${COVERAGE}_Mut_${MUT_RATE}.${MODE}"
         echo "================================================="
         echo "Running: $EXP_ID (Cov: $COVERAGE, Mut: $MUT_RATE)"
         echo "================================================="
