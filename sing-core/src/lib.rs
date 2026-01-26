@@ -27,6 +27,16 @@ const REMOVE: [u64; 4] = [
     rot(BASES[3], (WINDOW as u32 * ROT) % 64),
 ];
 
+const SYNC_S: usize = 10;
+const SYNC_T: usize = 0;
+
+const REMOVE_S: [u64; 4] = [
+    rot(BASES[0], (SYNC_S as u32 * ROT) % 64),
+    rot(BASES[1], (SYNC_S as u32 * ROT) % 64),
+    rot(BASES[2], (SYNC_S as u32 * ROT) % 64),
+    rot(BASES[3], (SYNC_S as u32 * ROT) % 64),
+];
+
 pub const RADIX: usize = 24;
 pub const SHIFT: usize = 32 - RADIX;
 
@@ -268,17 +278,18 @@ fn base_to_index(b: u8) -> Option<usize> {
 
 pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     out.clear();
-    if seq.len() < WINDOW {
+    if seq.len() < WINDOW || WINDOW < SYNC_S {
         return;
     }
 
-    const Q_SIZE: usize = 16;
+    const Q_SIZE: usize = 32;
     let mut q_pos = [0u32; Q_SIZE];
     let mut q_hash = [u64::MAX; Q_SIZE];
     let mut head = 0;
     let mut tail = 0;
 
-    let mut h = 0u64;
+    let mut h_k = 0u64;
+    let mut h_s = 0u64;
     let mut valid_run = 0usize;
 
     for i in 0..seq.len() {
@@ -286,7 +297,8 @@ pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
             Some(idx) => idx,
             None => {
                 valid_run = 0;
-                h = 0;
+                h_k = 0;
+                h_s = 0;
                 head = 0;
                 tail = 0;
                 continue;
@@ -294,42 +306,58 @@ pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
         };
 
         if valid_run < WINDOW {
-            h = h.rotate_left(ROT) ^ BASES[base_idx];
-            valid_run += 1;
-            if valid_run < WINDOW {
-                continue;
-            }
+            h_k = h_k.rotate_left(ROT) ^ BASES[base_idx];
         } else {
             let prev_idx = unsafe { to_base(*seq.get_unchecked(i - WINDOW)) };
-            h = h.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx];
+            h_k = h_k.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx];
         }
 
-        let k_pos = i + 1 - WINDOW;
-        let val = h.wrapping_mul(0x517cc1b727220a95);
-        let pos = k_pos as u32;
+        if valid_run < SYNC_S {
+            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx];
+        } else {
+            let prev_idx = unsafe { to_base(*seq.get_unchecked(i - SYNC_S)) };
+            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE_S[prev_idx];
+        }
+
+        valid_run += 1;
+
+        if valid_run < SYNC_S {
+            continue;
+        }
+
+        let s_pos = i + 1 - SYNC_S;
+        let s_hash = h_s.wrapping_mul(0x517cc1b727220a95);
+        let s_pos_u32 = s_pos as u32;
 
         while tail > head {
-            if q_hash[(tail - 1) % Q_SIZE] > val {
+            if q_hash[(tail - 1) % Q_SIZE] > s_hash {
                 tail -= 1;
             } else {
                 break;
             }
         }
 
-        q_hash[tail % Q_SIZE] = val;
-        q_pos[tail % Q_SIZE] = pos;
+        q_hash[tail % Q_SIZE] = s_hash;
+        q_pos[tail % Q_SIZE] = s_pos_u32;
         tail += 1;
 
-        while head < tail && q_pos[head % Q_SIZE] <= pos.saturating_sub(MIN_W as u32) {
-            head += 1;
-        }
+        if valid_run >= WINDOW {
+            let k_pos = i + 1 - WINDOW;
+            let min_pos = k_pos as u32;
+            let max_pos = (k_pos + WINDOW - SYNC_S) as u32;
 
-        if k_pos >= MIN_W - 1 {
-            let m_pos = q_pos[head % Q_SIZE];
-            let m_hash = q_hash[head % Q_SIZE];
+            while head < tail && q_pos[head % Q_SIZE] < min_pos {
+                head += 1;
+            }
 
-            if out.last().map(|&(_, p)| p) != Some(m_pos) {
-                out.push((m_hash as u32, m_pos));
+            if head < tail {
+                let m_pos = q_pos[head % Q_SIZE];
+                if m_pos <= max_pos && m_pos == (k_pos + SYNC_T) as u32 {
+                    let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
+                    if out.last().map(|&(_, p)| p) != Some(k_pos as u32) {
+                        out.push((k_hash as u32, k_pos as u32));
+                    }
+                }
             }
         }
     }
