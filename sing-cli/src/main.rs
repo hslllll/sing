@@ -5,12 +5,13 @@ static GLOBAL: MiMalloc = MiMalloc;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{bounded, Receiver, Sender};
+use memmap2::MmapOptions;
 use needletail::parse_fastx_file;
 use sing_core::{
     align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index, State,
 };
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -66,8 +67,8 @@ impl ReadBatch {
 
 fn load_index(path: &PathBuf) -> Result<Index> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    Index::from_reader(reader)
+    let mmap = unsafe { MmapOptions::new().map(&file)? };
+    Index::from_bytes(&mmap)
 }
 
 fn save_index(index: &Index, path: &PathBuf) -> Result<()> {
