@@ -480,6 +480,9 @@ fn select_top_mins(
 
     for &(h, p) in mins {
         let freq = seed_genome_freq(idx, h);
+        if freq == 0 {
+            continue;
+        }
         tmp.push((freq, p, h));
     }
 
@@ -490,6 +493,11 @@ fn select_top_mins(
     for i in 0..limit {
         let (_, p, h) = tmp[i];
         out.push((h, p));
+    }
+
+    if out.is_empty() {
+        let limit = top_n.min(mins.len());
+        out.extend(mins.iter().take(limit).copied());
     }
 }
 
