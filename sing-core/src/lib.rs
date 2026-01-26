@@ -191,7 +191,7 @@ where
     }
 
     let total_bases: u64 = ref_seqs.iter().map(|s| s.len() as u64).sum();
-    let freq_filter = (10.0_f64.powf((total_bases as f64).log10() / 2.0)) as usize;
+    let freq_filter = (total_bases as f64).powf(1.0 / 3.0) as usize;
     let freq_filter = std::cmp::max(1, freq_filter);
     eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
 
