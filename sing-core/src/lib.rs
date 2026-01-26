@@ -176,7 +176,7 @@ where
         ref_names.push(name.into());
 
         let mut mins = Vec::new();
-        get_minimizers(&seq, &mut mins);
+        get_syncmers(&seq, &mut mins);
         for (h, p) in mins {
             let hash64 = h as u64;
             let hash16 = (hash64 & 0xFFFF) as u64;
@@ -218,7 +218,7 @@ where
     }
 
     eprintln!("Indexing statistics:");
-    eprintln!("  Total minimizers: {}", seeds_tmp.len());
+    eprintln!("  Total hashes: {}", seeds_tmp.len());
     eprintln!("  Unique hashes: {}", uniq_hashes);
     eprintln!("  Unique hashes kept: {}", kept_hashes);
     eprintln!("  Total seeds kept: {}", seeds.len());
@@ -261,11 +261,6 @@ impl State {
 }
 
 #[inline(always)]
-fn to_base(b: u8) -> usize {
-    (b as usize >> 1) & 0x3
-}
-
-#[inline(always)]
 fn base_to_index(b: u8) -> Option<usize> {
     match b {
         b'A' | b'a' => Some(0),
@@ -276,7 +271,7 @@ fn base_to_index(b: u8) -> Option<usize> {
     }
 }
 
-pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
+pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     out.clear();
     if seq.len() < WINDOW || WINDOW < SYNC_S {
         return;
@@ -290,58 +285,68 @@ pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
 
     let mut h_k = 0u64;
     let mut h_s = 0u64;
-    let mut valid_run = 0usize;
+    let mut base_buf_k = [0usize; WINDOW];
+    let mut base_buf_s = [0usize; SYNC_S];
+    let mut ambig_buf_k = [0u8; WINDOW];
+    let mut ambig_buf_s = [0u8; SYNC_S];
+    let mut ambig_k = 0i32;
+    let mut ambig_s = 0i32;
 
     for i in 0..seq.len() {
-        let base_idx = match base_to_index(seq[i]) {
-            Some(idx) => idx,
-            None => {
-                valid_run = 0;
-                h_k = 0;
-                h_s = 0;
-                head = 0;
-                tail = 0;
-                continue;
-            }
+        let (base_idx, ambig) = match base_to_index(seq[i]) {
+            Some(idx) => (idx, 0u8),
+            None => (0usize, 1u8),
         };
 
-        if valid_run < WINDOW {
+        let k_slot = i % WINDOW;
+        let prev_idx_k = base_buf_k[k_slot];
+        let prev_ambig_k = ambig_buf_k[k_slot];
+        base_buf_k[k_slot] = base_idx;
+        ambig_buf_k[k_slot] = ambig;
+        ambig_k += ambig as i32 - prev_ambig_k as i32;
+
+        let s_slot = i % SYNC_S;
+        let prev_idx_s = base_buf_s[s_slot];
+        let prev_ambig_s = ambig_buf_s[s_slot];
+        base_buf_s[s_slot] = base_idx;
+        ambig_buf_s[s_slot] = ambig;
+        ambig_s += ambig as i32 - prev_ambig_s as i32;
+
+        if i + 1 <= WINDOW {
             h_k = h_k.rotate_left(ROT) ^ BASES[base_idx];
         } else {
-            let prev_idx = unsafe { to_base(*seq.get_unchecked(i - WINDOW)) };
-            h_k = h_k.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx];
+            h_k = h_k.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx_k];
         }
 
-        if valid_run < SYNC_S {
+        if i + 1 <= SYNC_S {
             h_s = h_s.rotate_left(ROT) ^ BASES[base_idx];
         } else {
-            let prev_idx = unsafe { to_base(*seq.get_unchecked(i - SYNC_S)) };
-            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE_S[prev_idx];
+            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE_S[prev_idx_s];
         }
 
-        valid_run += 1;
-
-        if valid_run < SYNC_S {
+        if i + 1 < SYNC_S {
             continue;
         }
 
         let s_pos = i + 1 - SYNC_S;
-        let s_hash = h_s.wrapping_mul(0x517cc1b727220a95);
-        let s_pos_u32 = s_pos as u32;
+        if ambig_s == 0 {
+            let s_hash = h_s.wrapping_mul(0x517cc1b727220a95);
+            let s_pos_u32 = s_pos as u32;
 
-        while tail > head {
-            if q_hash[(tail - 1) % Q_SIZE] > s_hash {
-                tail -= 1;
-            } else {
-                break;
+            while tail > head {
+                if q_hash[(tail - 1) % Q_SIZE] >= s_hash {
+                    tail -= 1;
+                } else {
+                    break;
+                }
             }
+
+            q_hash[tail % Q_SIZE] = s_hash;
+            q_pos[tail % Q_SIZE] = s_pos_u32;
+            tail += 1;
         }
 
-        q_hash[tail % Q_SIZE] = s_hash;
-        q_pos[tail % Q_SIZE] = s_pos_u32;
-        tail += 1;
-
-        if valid_run >= WINDOW {
+        if i + 1 >= WINDOW && ambig_k == 0 {
             let k_pos = i + 1 - WINDOW;
             let min_pos = k_pos as u32;
             let max_pos = (k_pos + WINDOW - SYNC_S) as u32;
@@ -696,7 +701,7 @@ fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32
 pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> Option<AlignmentResult> {
     state.candidates.clear();
 
-    get_minimizers(seq, &mut state.mins);
+    get_syncmers(seq, &mut state.mins);
     collect_candidates(idx, &state.mins, false, &mut state.candidates);
 
     rev.clear();
@@ -711,7 +716,7 @@ pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> O
         b't' => b'a',
         _ => b'N',
     }));
-    get_minimizers(rev, &mut state.mins);
+    get_syncmers(rev, &mut state.mins);
     collect_candidates(idx, &state.mins, true, &mut state.candidates);
 
     if state.candidates.is_empty() {
