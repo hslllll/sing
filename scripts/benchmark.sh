@@ -251,8 +251,8 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         echo "Running: $EXP_ID (Cov: $COVERAGE, Mut: $MUT_RATE)"
         echo "================================================="
 
-        R1="sim_${EXP_ID}.${MODE}.bwa.read1.fastq.gz"
-        R2="sim_${EXP_ID}.${MODE}.bwa.read2.fastq.gz"
+        R1="sim_${EXP_ID}.bwa.read1.fastq.gz"
+        R2="sim_${EXP_ID}.bwa.read2.fastq.gz"
 
         if [ -f "$R1" ] && [ -f "$R2" ]; then
             echo "Simulated reads exist. Skipping dwgsim."
