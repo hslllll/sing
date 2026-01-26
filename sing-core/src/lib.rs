@@ -177,7 +177,7 @@ where
     }
 
     let total_bases: usize = ref_seqs.iter().map(|s| s.len()).sum();
-    let freq_filter = ((total_bases as f64 / 500_000_000.0) * 1000.0) as usize;
+    let freq_filter = ((total_bases as f64 / 100_000_000.0) * 1000.0) as usize;
     let freq_filter = std::cmp::max(1000, freq_filter);
     eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
 
@@ -255,17 +255,21 @@ fn to_base(b: u8) -> usize {
     (b as usize >> 1) & 0x3
 }
 
+#[inline(always)]
+fn base_to_index(b: u8) -> Option<usize> {
+    match b {
+        b'A' | b'a' => Some(0),
+        b'C' | b'c' => Some(1),
+        b'G' | b'g' => Some(2),
+        b'T' | b't' => Some(3),
+        _ => None,
+    }
+}
+
 pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     out.clear();
     if seq.len() < WINDOW {
         return;
-    }
-
-    let mut h = 0u64;
-    for i in 0..WINDOW {
-        unsafe {
-            h = h.rotate_left(ROT) ^ *BASES.get_unchecked(to_base(*seq.get_unchecked(i)));
-        }
     }
 
     const Q_SIZE: usize = 16;
@@ -274,17 +278,35 @@ pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     let mut head = 0;
     let mut tail = 0;
 
-    for i in 0..=seq.len() - WINDOW {
-        if i > 0 {
-            unsafe {
-                h = h.rotate_left(ROT)
-                    ^ *BASES.get_unchecked(to_base(*seq.get_unchecked(i + WINDOW - 1)))
-                    ^ *REMOVE.get_unchecked(to_base(*seq.get_unchecked(i - 1)));
+    let mut h = 0u64;
+    let mut valid_run = 0usize;
+
+    for i in 0..seq.len() {
+        let base_idx = match base_to_index(seq[i]) {
+            Some(idx) => idx,
+            None => {
+                valid_run = 0;
+                h = 0;
+                head = 0;
+                tail = 0;
+                continue;
             }
+        };
+
+        if valid_run < WINDOW {
+            h = h.rotate_left(ROT) ^ BASES[base_idx];
+            valid_run += 1;
+            if valid_run < WINDOW {
+                continue;
+            }
+        } else {
+            let prev_idx = unsafe { to_base(*seq.get_unchecked(i - WINDOW)) };
+            h = h.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx];
         }
 
+        let k_pos = i + 1 - WINDOW;
         let val = h.wrapping_mul(0x517cc1b727220a95);
-        let pos = i as u32;
+        let pos = k_pos as u32;
 
         while tail > head {
             if q_hash[(tail - 1) % Q_SIZE] > val {
@@ -302,7 +324,7 @@ pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
             head += 1;
         }
 
-        if i >= MIN_W - 1 {
+        if k_pos >= MIN_W - 1 {
             let m_pos = q_pos[head % Q_SIZE];
             let m_hash = q_hash[head % Q_SIZE];
 
