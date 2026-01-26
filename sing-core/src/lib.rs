@@ -28,7 +28,7 @@ const REMOVE: [u64; 4] = [
 ];
 
 const SYNC_S: usize = 10;
-const SYNC_T: usize = 0;
+const SYNC_T: usize = (WINDOW - SYNC_S) / 2;
 
 const REMOVE_S: [u64; 4] = [
     rot(BASES[0], (SYNC_S as u32 * ROT) % 64),
@@ -352,10 +352,14 @@ pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
 
             if head < tail {
                 let m_pos = q_pos[head % Q_SIZE];
-                if m_pos <= max_pos && m_pos == (k_pos + SYNC_T) as u32 {
-                    let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
-                    if out.last().map(|&(_, p)| p) != Some(k_pos as u32) {
-                        out.push((k_hash as u32, k_pos as u32));
+                if m_pos <= max_pos {
+                    let t1 = (k_pos + SYNC_T) as u32;
+                    let t2 = (k_pos + (WINDOW - SYNC_S - SYNC_T)) as u32;
+                    if m_pos == t1 || m_pos == t2 {
+                        let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
+                        if out.last().map(|&(_, p)| p) != Some(k_pos as u32) {
+                            out.push((k_hash as u32, k_pos as u32));
+                        }
                     }
                 }
             }
