@@ -1,11 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
 
-pub const WINDOW: usize = 16;
-pub const MIN_W: usize = WINDOW;
-pub const BATCH_SIZE: usize = 10_000;
-pub const BATCH_CAP: usize = 64;
+const WINDOW: usize = 16;
+const SYNC_S: usize = 8;
 
 const BASES: [u64; 4] = [
     0x243f_6a88_85a3_08d3,
@@ -27,12 +25,18 @@ const REMOVE: [u64; 4] = [
     rot(BASES[3], (WINDOW as u32 * ROT) % 64),
 ];
 
+const REMOVE_S: [u64; 4] = [
+    rot(BASES[0], (SYNC_S as u32 * ROT) % 64),
+    rot(BASES[1], (SYNC_S as u32 * ROT) % 64),
+    rot(BASES[2], (SYNC_S as u32 * ROT) % 64),
+    rot(BASES[3], (SYNC_S as u32 * ROT) % 64),
+];
+
 pub const RADIX: usize = 24;
 pub const SHIFT: usize = 32 - RADIX;
 
 #[derive(Clone, Copy)]
 pub struct TuningConfig {
-    pub freq_filter: usize,
     pub chain_max_gap: i32,
     pub seed_weight: u8,
     pub match_score: i32,
@@ -40,17 +44,30 @@ pub struct TuningConfig {
     pub gap_open: i32,
     pub gap_ext: i32,
     pub min_identity: f32,
+    pub lookup_for_diag: usize,
+    pub x_drop: i32,
+    pub chain_gap_cost: i32,
+    pub chain_min_score: i32,
+    pub mapq_scale: f32,
+    pub max_mapq: u8,
+    pub band_width: usize,
 }
 
 pub const CONFIG: TuningConfig = TuningConfig {
-    freq_filter: 1000,
-    chain_max_gap: 50,
+    chain_max_gap: 150,
     seed_weight: 1,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -3,
     gap_ext: -1,
-    min_identity: 0.75,
+    min_identity: 0.90,
+    lookup_for_diag: 50,
+    x_drop: 20,
+    chain_gap_cost: 2,
+    chain_min_score: 25,
+    mapq_scale: 1200.0,
+    max_mapq: 60,
+    band_width: 32,
 };
 
 #[derive(Debug, Clone)]
@@ -58,11 +75,84 @@ pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
     pub freq_filter: u32,
+    pub genome_size: u64,
     pub ref_seqs: Vec<Vec<u8>>,
     pub ref_names: Vec<String>,
 }
 
 impl Index {
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut pos = 0usize;
+
+        fn read_u64(data: &[u8], pos: &mut usize, label: &str) -> Result<u64> {
+            if *pos + 8 > data.len() {
+                bail!("{}: unexpected EOF", label);
+            }
+            let val = u64::from_le_bytes(data[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Ok(val)
+        }
+
+        fn read_u32(data: &[u8], pos: &mut usize, label: &str) -> Result<u32> {
+            if *pos + 4 > data.len() {
+                bail!("{}: unexpected EOF", label);
+            }
+            let val = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            Ok(val)
+        }
+
+        let offsets_len = read_u64(data, &mut pos, "read offsets len")? as usize;
+        let offsets_bytes = offsets_len
+            .checked_mul(4)
+            .and_then(|n| pos.checked_add(n))
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read offsets: unexpected EOF"))?;
+        let mut offsets = Vec::with_capacity(offsets_len);
+        for chunk in data[pos..offsets_bytes].chunks_exact(4) {
+            offsets.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        pos = offsets_bytes;
+
+        let seeds_len = read_u64(data, &mut pos, "read seeds len")? as usize;
+        let seeds_bytes = seeds_len
+            .checked_mul(8)
+            .and_then(|n| pos.checked_add(n))
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read seeds: unexpected EOF"))?;
+        let mut seeds = Vec::with_capacity(seeds_len);
+        for chunk in data[pos..seeds_bytes].chunks_exact(8) {
+            seeds.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        pos = seeds_bytes;
+
+        let freq_filter = read_u32(data, &mut pos, "read freq_filter")?;
+        let genome_size = read_u64(data, &mut pos, "read genome_size")?;
+
+        let ref_count = read_u64(data, &mut pos, "read ref seq count")? as usize;
+        let mut ref_seqs = Vec::with_capacity(ref_count);
+        for _ in 0..ref_count {
+            let slen = read_u64(data, &mut pos, "read seq len")? as usize;
+            let end = pos.checked_add(slen).filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow::anyhow!("read seq bytes: unexpected EOF"))?;
+            ref_seqs.push(data[pos..end].to_vec());
+            pos = end;
+        }
+
+        let name_count = read_u64(data, &mut pos, "read name count")? as usize;
+        let mut ref_names = Vec::with_capacity(name_count);
+        for _ in 0..name_count {
+            let slen = read_u64(data, &mut pos, "read name len")? as usize;
+            let end = pos.checked_add(slen).filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow::anyhow!("read name bytes: unexpected EOF"))?;
+            let name_buf = &data[pos..end];
+            ref_names.push(String::from_utf8(name_buf.to_vec()).context("utf8 ref name")?);
+            pos = end;
+        }
+
+        Ok(Index { offsets, seeds, freq_filter, genome_size, ref_seqs, ref_names })
+    }
+
     pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
         let mut r = BufReader::new(reader);
         let mut buf8 = [0u8; 8];
@@ -87,6 +177,9 @@ impl Index {
         r.read_exact(&mut buf4).context("read freq_filter")?;
         let freq_filter = u32::from_le_bytes(buf4);
 
+        r.read_exact(&mut buf8).context("read genome_size")?;
+        let genome_size = u64::from_le_bytes(buf8);
+
         r.read_exact(&mut buf8).context("read ref seq count")?;
         let len = u64::from_le_bytes(buf8) as usize;
         let mut ref_seqs = Vec::with_capacity(len);
@@ -109,7 +202,7 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
-        Ok(Index { offsets, seeds, freq_filter, ref_seqs, ref_names })
+        Ok(Index { offsets, seeds, freq_filter, genome_size, ref_seqs, ref_names })
     }
 
     pub fn to_writer<W: Write>(&self, mut w: W) -> Result<()> {
@@ -124,6 +217,8 @@ impl Index {
         }
 
         w.write_all(&self.freq_filter.to_le_bytes())?;
+
+        w.write_all(&self.genome_size.to_le_bytes())?;
 
         w.write_all(&(self.ref_seqs.len() as u64).to_le_bytes())?;
         for seq in &self.ref_seqs {
@@ -160,67 +255,77 @@ where
 {
     let mut ref_seqs = Vec::new();
     let mut ref_names = Vec::new();
-    let mut seeds_tmp: Vec<(u64, u64)> = Vec::new();
 
-    for (rid, (name, seq)) in records.into_iter().enumerate() {
+    for (_rid, (name, seq)) in records.into_iter().enumerate() {
         ref_names.push(name.into());
-
-        let mut mins = Vec::new();
-        get_minimizers(&seq, &mut mins);
-        for (h, p) in mins {
-            let hash64 = h as u64;
-            let hash16 = (hash64 & 0xFFFF) as u64;
-            let packed = (hash16 << 48) | ((rid as u64) << 32) | (p as u64);
-            seeds_tmp.push((hash64, packed));
-        }
         ref_seqs.push(seq);
     }
 
-    let total_bases: usize = ref_seqs.iter().map(|s| s.len()).sum();
-    let freq_filter = ((total_bases as f64 / 500_000_000.0) * 1000.0) as usize;
-    let freq_filter = std::cmp::max(1000, freq_filter);
+    let total_bases: u64 = ref_seqs.iter().map(|s| s.len() as u64).sum();
+    let freq_filter = (total_bases as f64).powf(1.0 / 4.0) as usize;
+    let freq_filter = std::cmp::max(1, freq_filter);
     eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
 
-    seeds_tmp.sort_unstable_by_key(|k| k.0);
-
+    
+    
     let mut global_counts = vec![0u32; 1 << RADIX];
-    let mut seeds: Vec<u64> = Vec::new();
-    let mut i = 0usize;
-    let mut uniq_hashes = 0;
-    let mut kept_hashes = 0;
-
-    while i < seeds_tmp.len() {
-        let mut j = i;
-        while j < seeds_tmp.len() && seeds_tmp[j].0 == seeds_tmp[i].0 {
-            j += 1;
+    let mut mins = Vec::new();
+    for seq in &ref_seqs {
+        get_syncmers(seq, &mut mins);
+        for (h, _) in mins.iter() {
+            let bucket = (*h as u64 >> SHIFT) as usize;
+            global_counts[bucket] += 1;
         }
-        uniq_hashes += 1;
-        if j - i <= freq_filter {
-            kept_hashes += 1;
-            for k in i..j {
-                let (h, packed) = seeds_tmp[k];
-                let bucket = (h >> SHIFT) as usize;
-                global_counts[bucket] += 1;
-                seeds.push(packed);
-            }
-        }
-        i = j;
     }
 
-    eprintln!("Indexing statistics:");
-    eprintln!("  Total minimizers: {}", seeds_tmp.len());
-    eprintln!("  Unique hashes: {}", uniq_hashes);
-    eprintln!("  Unique hashes kept: {}", kept_hashes);
-    eprintln!("  Total seeds kept: {}", seeds.len());
+    
+    let mut kept_counts = vec![0u32; 1 << RADIX];
+    let mut kept_buckets = 0u64;
+    let mut total_seeds_kept = 0u64;
+    for (i, &count) in global_counts.iter().enumerate() {
+        if count as usize <= freq_filter {
+            kept_counts[i] = count;
+            if count > 0 {
+                kept_buckets += 1;
+                total_seeds_kept += count as u64;
+            }
+        }
+    }
 
-    let mut offsets = Vec::with_capacity(global_counts.len());
+    
+    let mut offsets = Vec::with_capacity(kept_counts.len());
     let mut current_offset = 0u32;
-    for count in &global_counts {
+    for count in &kept_counts {
         offsets.push(current_offset);
         current_offset += *count;
     }
 
-    Ok(Index { offsets, seeds, freq_filter: freq_filter as u32, ref_seqs, ref_names })
+    
+    
+    let mut seeds = vec![0u64; total_seeds_kept as usize];
+    let mut write_pos = offsets.clone();
+    for (rid, seq) in ref_seqs.iter().enumerate() {
+        get_syncmers(seq, &mut mins);
+        for (h, p) in mins.iter() {
+            let hash64 = *h as u64;
+            let bucket = (hash64 >> SHIFT) as usize;
+            if kept_counts[bucket] == 0 {
+                continue;
+            }
+            let hash16 = (hash64 & 0xFFFF) as u64;
+            let packed = (hash16 << 48) | ((rid as u64) << 32) | (*p as u64);
+            let pos = write_pos[bucket] as usize;
+            seeds[pos] = packed;
+            write_pos[bucket] += 1;
+        }
+    }
+
+    eprintln!("Indexing statistics:");
+    eprintln!("  Total seeds (all buckets): {}", global_counts.iter().map(|&c| c as u64).sum::<u64>());
+    eprintln!("  Buckets kept: {} / {}", kept_buckets, kept_counts.len());
+    eprintln!("  Total seeds kept: {}", seeds.len());
+
+    Ok(Index { offsets, seeds, freq_filter: freq_filter as u32, genome_size: total_bases, ref_seqs, ref_names })
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -242,17 +347,20 @@ pub struct ChainRes {
 pub struct State {
     pub mins: Vec<(u32, u32)>,
     pub candidates: Vec<Hit>,
+    pub dp_buf: Vec<i32>,
+    pub trace_buf: Vec<u8>,
 }
 
 impl State {
     pub fn new() -> Self {
-        Self { mins: Vec::with_capacity(100), candidates: Vec::with_capacity(1000) }
+        let dp_cap = 1000 * 100;
+        Self {
+            mins: Vec::with_capacity(100),
+            candidates: Vec::with_capacity(1000),
+            dp_buf: Vec::with_capacity(dp_cap),
+            trace_buf: Vec::with_capacity(dp_cap),
+        }
     }
-}
-
-#[inline(always)]
-fn to_base(b: u8) -> usize {
-    (b as usize >> 1) & 0x3
 }
 
 #[inline(always)]
@@ -266,70 +374,103 @@ fn base_to_index(b: u8) -> Option<usize> {
     }
 }
 
-pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
+pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     out.clear();
-    if seq.len() < WINDOW {
+    if seq.len() < WINDOW || WINDOW < SYNC_S {
         return;
     }
 
-    const Q_SIZE: usize = 16;
+    const Q_SIZE: usize = 32;
     let mut q_pos = [0u32; Q_SIZE];
     let mut q_hash = [u64::MAX; Q_SIZE];
     let mut head = 0;
     let mut tail = 0;
 
-    let mut h = 0u64;
-    let mut valid_run = 0usize;
+    let mut h_k = 0u64;
+    let mut h_s = 0u64;
+    let mut base_buf_k = [0usize; WINDOW];
+    let mut base_buf_s = [0usize; SYNC_S];
+    let mut ambig_buf_k = [0u8; WINDOW];
+    let mut ambig_buf_s = [0u8; SYNC_S];
+    let mut ambig_k = 0i32;
+    let mut ambig_s = 0i32;
 
     for i in 0..seq.len() {
-        let base_idx = match base_to_index(seq[i]) {
-            Some(idx) => idx,
-            None => {
-                valid_run = 0;
-                h = 0;
-                head = 0;
-                tail = 0;
-                continue;
-            }
+        let (base_idx, ambig) = match base_to_index(seq[i]) {
+            Some(idx) => (idx, 0u8),
+            None => (0usize, 1u8),
         };
 
-        if valid_run < WINDOW {
-            h = h.rotate_left(ROT) ^ BASES[base_idx];
-            valid_run += 1;
-            if valid_run < WINDOW {
-                continue;
-            }
+        let k_slot = i % WINDOW;
+        let prev_idx_k = base_buf_k[k_slot];
+        let prev_ambig_k = ambig_buf_k[k_slot];
+        base_buf_k[k_slot] = base_idx;
+        ambig_buf_k[k_slot] = ambig;
+        ambig_k += ambig as i32 - prev_ambig_k as i32;
+
+        let s_slot = i % SYNC_S;
+        let prev_idx_s = base_buf_s[s_slot];
+        let prev_ambig_s = ambig_buf_s[s_slot];
+        base_buf_s[s_slot] = base_idx;
+        ambig_buf_s[s_slot] = ambig;
+        ambig_s += ambig as i32 - prev_ambig_s as i32;
+
+        if i + 1 <= WINDOW {
+            h_k = h_k.rotate_left(ROT) ^ BASES[base_idx];
         } else {
-            let prev_idx = unsafe { to_base(*seq.get_unchecked(i - WINDOW)) };
-            h = h.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx];
+            h_k = h_k.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx_k];
         }
 
-        let k_pos = i + 1 - WINDOW;
-        let val = h.wrapping_mul(0x517cc1b727220a95);
-        let pos = k_pos as u32;
+        if i + 1 <= SYNC_S {
+            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx];
+        } else {
+            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE_S[prev_idx_s];
+        }
 
-        while tail > head {
-            if q_hash[(tail - 1) % Q_SIZE] > val {
-                tail -= 1;
-            } else {
-                break;
+        if i + 1 < SYNC_S {
+            continue;
+        }
+
+        let s_pos = i + 1 - SYNC_S;
+        if ambig_s == 0 {
+            let s_hash = h_s.wrapping_mul(0x517cc1b727220a95);
+            let s_pos_u32 = s_pos as u32;
+
+            while tail > head {
+                if q_hash[(tail - 1) % Q_SIZE] >= s_hash {
+                    tail -= 1;
+                } else {
+                    break;
+                }
             }
+
+            q_hash[tail % Q_SIZE] = s_hash;
+            q_pos[tail % Q_SIZE] = s_pos_u32;
+            tail += 1;
         }
 
-        q_hash[tail % Q_SIZE] = val;
-        q_pos[tail % Q_SIZE] = pos;
-        tail += 1;
+        if i + 1 >= WINDOW && ambig_k == 0 {
+            let k_pos = i + 1 - WINDOW;
+            let min_pos = k_pos as u32;
+            let max_pos = (k_pos + WINDOW - SYNC_S) as u32;
 
-        while head < tail && q_pos[head % Q_SIZE] <= pos.saturating_sub(MIN_W as u32) {
-            head += 1;
-        }
+            while head < tail && q_pos[head % Q_SIZE] < min_pos {
+                head += 1;
+            }
 
-        if k_pos >= MIN_W - 1 {
-            let m_pos = q_pos[head % Q_SIZE];
-            let m_hash = q_hash[head % Q_SIZE];
-
-            if out.last().map(|&(_, p)| p) != Some(m_pos) {
-                out.push((m_hash as u32, m_pos));
+            if head < tail {
+                let m_pos = q_pos[head % Q_SIZE];
+                if m_pos <= max_pos {
+                    
+                    
+                    
+                    
+                    
+                    let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
+                    if out.last().map(|&(_, p)| p) != Some(k_pos as u32) {
+                         out.push((k_hash as u32, k_pos as u32));
+                    }
+                }
             }
         }
     }
@@ -347,6 +488,7 @@ fn collect_candidates(idx: &Index, mins: &[(u32, u32)], is_rev: bool, out: &mut 
             .unwrap_or(idx.seeds.len() as u32) as usize;
 
         let count = end - start;
+
         if count > freq_filter {
             continue;
         }
@@ -374,10 +516,18 @@ fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
         return (ChainRes::default(), ChainRes::default());
     }
 
-    candidates.sort_unstable_by_key(|h| (h.id_strand, h.diag));
+    candidates.sort_unstable_by(|a, b| {
+        a.id_strand.cmp(&b.id_strand)
+            .then_with(|| a.ref_pos.cmp(&b.ref_pos))
+            .then_with(|| a.read_pos.cmp(&b.read_pos))
+    });
 
-    let mut best = ChainRes::default();
-    let mut second = ChainRes::default();
+    let mut scores = vec![0i32; candidates.len()];
+
+    let mut best_idx = 0;
+    let mut max_score = 0;
+    
+    let group_gap_dist = CONFIG.chain_max_gap;
 
     let mut group_start = 0;
     while group_start < candidates.len() {
@@ -387,74 +537,144 @@ fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
             group_end += 1;
         }
 
-        let mut left = group_start;
-        let mut sum = 0i32;
-        for right in group_start..group_end {
-            sum += candidates[right].weight as i32;
+        for i in group_start..group_end {
+            let curr = &candidates[i];
+            let mut best_s = curr.weight as i32;
+            let curr_ref = curr.ref_pos as i64;
+            let curr_read = curr.read_pos as i64;
+            
+            let check_start = if i > CONFIG.lookup_for_diag { i - CONFIG.lookup_for_diag } else { group_start };
+            
+            for j in (check_start..i).rev() {
+                let prev = &candidates[j];
+                
+                let d_ref = curr_ref - (prev.ref_pos as i64);
+                if d_ref <= 0 { continue; }
+                if d_ref > group_gap_dist as i64 { break; }
 
-            while candidates[right].diag - candidates[left].diag > CONFIG.chain_max_gap {
-                sum -= candidates[left].weight as i32;
-                left += 1;
+                let d_read = curr_read - (prev.read_pos as i64);
+                if d_read <= 0 { continue; } 
+
+                let gap = (d_ref - d_read).abs();
+                if gap > CONFIG.chain_max_gap as i64 { continue; }
+
+                let gap_cost = (gap as i32) * CONFIG.chain_gap_cost;
+                let score = scores[j] + (curr.weight as i32) - gap_cost;
+
+                if score > best_s {
+                    best_s = score;
+                }
             }
+            scores[i] = best_s;
 
-            let score = sum;
-            if score > best.score {
-                second = best;
-                best = ChainRes { score, start: left, end: right + 1 };
-            } else if score > second.score {
-                second = ChainRes { score, start: left, end: right + 1 };
+            if best_s > max_score {
+                max_score = best_s;
+                best_idx = i;
             }
         }
-
         group_start = group_end;
     }
 
-    (best, second)
+    if max_score < CONFIG.chain_min_score {
+        return (ChainRes::default(), ChainRes::default()); 
+    }
+
+    let target_id = candidates[best_idx].id_strand;
+    let center_ref = candidates[best_idx].ref_pos;
+    
+    let mut start = best_idx;
+    let mut end = best_idx;
+    
+    while start > 0 
+        && candidates[start-1].id_strand == target_id 
+        && center_ref - candidates[start-1].ref_pos < CONFIG.chain_max_gap as u32
+    {
+        start -= 1;
+    }
+    
+    while end < candidates.len() - 1 
+        && candidates[end+1].id_strand == target_id 
+        && candidates[end+1].ref_pos - center_ref < CONFIG.chain_max_gap as u32
+    {
+        end += 1;
+    }
+
+    let best_chain = ChainRes { score: max_score, start, end: end + 1 };
+    
+    (best_chain, ChainRes::default())
 }
 
 fn extend_left(read: &[u8], ref_seq: &[u8], r_start: usize, g_start: usize) -> (usize, usize) {
-    let mut matches = 0;
     let mut mismatches = 0;
-    let max_mis = 3;
+    
+    let mut score = 0;
+    let mut max_score = 0;
+    let mut best_len = 0;
+    let mut best_mismatches = 0;
+    let x_drop = CONFIG.x_drop;
+
     let len = r_start.min(g_start);
     for i in 1..=len {
         let r_base = read[r_start - i];
         let g_base = ref_seq[g_start - i];
+        
         if r_base.eq_ignore_ascii_case(&g_base) {
-            matches += 1;
+            score += CONFIG.match_score;
         } else {
             mismatches += 1;
-            if mismatches > max_mis {
-                return (i - 1, mismatches - 1);
-            }
-            matches += 1;
+            score += CONFIG.mismatch_pen;
+        }
+
+        if score > max_score {
+            max_score = score;
+            best_len = i;
+            best_mismatches = mismatches;
+        }
+
+        if max_score - score > x_drop {
+            break;
         }
     }
-    (matches, mismatches)
+    (best_len, best_mismatches)
 }
 
 fn extend_right(read: &[u8], ref_seq: &[u8], r_start: usize, g_start: usize) -> (usize, usize) {
-    let mut matches = 0;
     let mut mismatches = 0;
-    let max_mis = 5;
+    
+    let mut score = 0;
+    let mut max_score = 0;
+    let mut best_len = 0;
+    let mut best_mismatches = 0;
+    let x_drop = CONFIG.x_drop;
+    
     let r_len = read.len();
     let g_len = ref_seq.len();
     let mut i = 0;
+    
     while r_start + i < r_len && g_start + i < g_len {
         let r_base = read[r_start + i];
         let g_base = ref_seq[g_start + i];
+        
         if r_base.eq_ignore_ascii_case(&g_base) {
-            matches += 1;
+            score += CONFIG.match_score;
         } else {
             mismatches += 1;
-            if mismatches > max_mis {
-                return (i, mismatches);
-            }
-            matches += 1;
+            score += CONFIG.mismatch_pen;
+        }
+
+        let curr_len = i + 1;
+        if score > max_score {
+            max_score = score;
+            best_len = curr_len;
+            best_mismatches = mismatches;
+        }
+
+        if max_score - score > x_drop {
+            break;
         }
         i += 1;
     }
-    (matches, mismatches)
+    (best_len, best_mismatches)
 }
 
 fn push_cigar(cigar: &mut Vec<u32>, len: u32, op: u32) {
@@ -483,47 +703,252 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
     span
 }
 
-fn align_gap(cigar: &mut Vec<u32>, read: &[u8], ref_seq: &[u8]) {
+
+fn align_gap_nw(
+    cigar: &mut Vec<u32>,
+    read: &[u8],
+    ref_seq: &[u8],
+    dp_buf: &mut Vec<i32>,
+    trace_buf: &mut Vec<u8>,
+) {
     let n = read.len();
     let m = ref_seq.len();
-    if n == m {
-        let mut match_count = 0;
-        let mut mismatch_count = 0;
 
-        for i in 0..n {
-            if read[i].eq_ignore_ascii_case(&ref_seq[i]) {
-                if mismatch_count > 0 {
-                    push_cigar(cigar, mismatch_count, 0);
-                    mismatch_count = 0;
-                }
-                match_count += 1;
-            } else {
-                if match_count > 0 {
-                    push_cigar(cigar, match_count, 0);
-                    match_count = 0;
-                }
-                mismatch_count += 1;
-            }
+    if n == 0 || m == 0 {
+        if n > 0 {
+            push_cigar(cigar, n as u32, 1);
         }
-        if match_count > 0 {
-            push_cigar(cigar, match_count, 0);
-        }
-        if mismatch_count > 0 {
-            push_cigar(cigar, mismatch_count, 0);
+        if m > 0 {
+            push_cigar(cigar, m as u32, 2);
         }
         return;
     }
 
-    if n > m {
-        push_cigar(cigar, m as u32, 0);
-        push_cigar(cigar, (n - m) as u32, 1);
-    } else {
-        push_cigar(cigar, n as u32, 0);
-        push_cigar(cigar, (m - n) as u32, 2);
+    let match_score = CONFIG.match_score;
+    let mismatch_score = CONFIG.mismatch_pen;
+    let gap_open = CONFIG.gap_open;
+    let gap_ext = CONFIG.gap_ext;
+    let neg_inf: i32 = -1_000_000_000;
+
+    let band = CONFIG.band_width as i32;
+    let band_cols = (CONFIG.band_width * 2 + 1) as usize;
+    let cells = (n + 1) * band_cols;
+    let needed = cells * 3;
+
+    if dp_buf.len() < needed {
+        dp_buf.resize(needed, neg_inf);
     }
+    if trace_buf.len() < needed {
+        trace_buf.resize(needed, 0);
+    }
+
+    
+    let (trace_m, trace_rest) = trace_buf.split_at_mut(cells);
+    let (trace_i, trace_d) = trace_rest.split_at_mut(cells);
+
+    
+    let idx_of = |i: usize, j: usize| -> Option<usize> {
+        let band_k = j as i32 - i as i32 + band;
+        if band_k < 0 || band_k >= band_cols as i32 {
+            None
+        } else {
+            Some(i * band_cols + band_k as usize)
+        }
+    };
+
+    
+    {
+        let (m_buf, rest) = dp_buf.split_at_mut(cells);
+        let (i_buf, d_buf) = rest.split_at_mut(cells);
+
+        
+        for idx in 0..cells {
+            m_buf[idx] = neg_inf;
+            i_buf[idx] = neg_inf;
+            d_buf[idx] = neg_inf;
+            trace_m[idx] = 0;
+            trace_i[idx] = 0;
+            trace_d[idx] = 0;
+        }
+
+        for i in 0..=n {
+            for band_k in 0..band_cols {
+                let j = i as i32 + band_k as i32 - band;
+                if j < 0 || j > m as i32 {
+                    continue;
+                }
+                let j = j as usize;
+                let idx = i * band_cols + band_k;
+
+                if i == 0 && j == 0 {
+                    m_buf[idx] = 0;
+                    continue;
+                }
+
+                if i == 0 {
+                    
+                    if let Some(prev) = idx_of(i, j - 1) {
+                        let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
+                        let from_d = d_buf[prev].saturating_add(gap_ext);
+                        if from_m >= from_d {
+                            d_buf[idx] = from_m;
+                            trace_d[idx] = 0;
+                        } else {
+                            d_buf[idx] = from_d;
+                            trace_d[idx] = 2;
+                        }
+                    }
+                    continue;
+                }
+
+                if j == 0 {
+                    
+                    if let Some(prev) = idx_of(i - 1, j) {
+                        let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
+                        let from_i = i_buf[prev].saturating_add(gap_ext);
+                        if from_m >= from_i {
+                            i_buf[idx] = from_m;
+                            trace_i[idx] = 0;
+                        } else {
+                            i_buf[idx] = from_i;
+                            trace_i[idx] = 1;
+                        }
+                    }
+                    continue;
+                }
+
+                
+                if let Some(diag) = idx_of(i - 1, j - 1) {
+                    let s_char = if read[i - 1].eq_ignore_ascii_case(&ref_seq[j - 1]) {
+                        match_score
+                    } else {
+                        mismatch_score
+                    };
+
+                    let mut best_prev = m_buf[diag];
+                    let mut best_state = 0u8;
+                    if i_buf[diag] > best_prev {
+                        best_prev = i_buf[diag];
+                        best_state = 1;
+                    }
+                    if d_buf[diag] > best_prev {
+                        best_prev = d_buf[diag];
+                        best_state = 2;
+                    }
+                    m_buf[idx] = best_prev.saturating_add(s_char);
+                    trace_m[idx] = best_state;
+                }
+
+                
+                if let Some(prev) = idx_of(i - 1, j) {
+                    let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
+                    let from_i = i_buf[prev].saturating_add(gap_ext);
+                    if from_m >= from_i {
+                        i_buf[idx] = from_m;
+                        trace_i[idx] = 0;
+                    } else {
+                        i_buf[idx] = from_i;
+                        trace_i[idx] = 1;
+                    }
+                }
+
+                
+                if let Some(prev) = idx_of(i, j - 1) {
+                    let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
+                    let from_d = d_buf[prev].saturating_add(gap_ext);
+                    if from_m >= from_d {
+                        d_buf[idx] = from_m;
+                        trace_d[idx] = 0;
+                    } else {
+                        d_buf[idx] = from_d;
+                        trace_d[idx] = 2;
+                    }
+                }
+            }
+        }
+    }
+
+    
+    let end_idx = match idx_of(n, m) {
+        Some(v) => v,
+        None => return,
+    };
+
+    let cells = (n + 1) * band_cols;
+    let (m_buf, rest) = dp_buf.split_at_mut(cells);
+    let (i_buf, d_buf) = rest.split_at_mut(cells);
+
+    let mut state = 0u8;
+    let mut best = m_buf[end_idx];
+    if i_buf[end_idx] > best {
+        best = i_buf[end_idx];
+        state = 1;
+    }
+    if d_buf[end_idx] > best {
+        state = 2;
+    }
+
+    let mut i = n;
+    let mut j = m;
+    let mut ops_len = 0usize;
+
+    while i > 0 || j > 0 {
+        let idx = match idx_of(i, j) {
+            Some(v) => v,
+            None => break,
+        };
+        match state {
+            0 => {
+                m_buf[ops_len] = 0;
+                ops_len += 1;
+                let prev = trace_m[idx];
+                i -= 1;
+                j -= 1;
+                state = prev;
+            }
+            1 => {
+                m_buf[ops_len] = 1;
+                ops_len += 1;
+                let prev = trace_i[idx];
+                i -= 1;
+                state = prev;
+            }
+            _ => {
+                m_buf[ops_len] = 2;
+                ops_len += 1;
+                let prev = trace_d[idx];
+                j -= 1;
+                state = prev;
+            }
+        }
+    }
+
+    if ops_len == 0 {
+        return;
+    }
+
+    let mut curr_op = m_buf[ops_len - 1] as u32;
+    let mut curr_len = 0u32;
+    for idx in (0..ops_len).rev() {
+        let op = m_buf[idx] as u32;
+        if op == curr_op {
+            curr_len += 1;
+        } else {
+            push_cigar(cigar, curr_len, curr_op);
+            curr_op = op;
+            curr_len = 1;
+        }
+    }
+    push_cigar(cigar, curr_len, curr_op);
 }
 
-fn gen_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> (Vec<u32>, i32) {
+fn gen_cigar(
+    hits: &[Hit],
+    read_seq: &[u8],
+    ref_seq: &[u8],
+    dp_buf: &mut Vec<i32>,
+    trace_buf: &mut Vec<u8>,
+) -> (Vec<u32>, i32) {
     if hits.is_empty() {
         return (vec![], 0);
     }
@@ -580,7 +1005,7 @@ fn gen_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> (Vec<u32>, i32) {
             let g_gap_end = next_g.min(ref_seq.len());
             let g_gap_seq = if curr_g < g_gap_end { &ref_seq[curr_g..g_gap_end] } else { &[] };
 
-            align_gap(&mut cigar, r_gap_seq, g_gap_seq);
+            align_gap_nw(&mut cigar, r_gap_seq, g_gap_seq, dp_buf, trace_buf);
         }
 
         push_cigar(&mut cigar, WINDOW as u32, 0);
@@ -662,10 +1087,12 @@ fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32
 }
 
 pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> Option<AlignmentResult> {
-    state.candidates.clear();
+    let State { mins, candidates, dp_buf, trace_buf } = state;
 
-    get_minimizers(seq, &mut state.mins);
-    collect_candidates(idx, &state.mins, false, &mut state.candidates);
+    candidates.clear();
+
+    get_syncmers(seq, mins);
+    collect_candidates(idx, mins, false, candidates);
 
     rev.clear();
     rev.extend(seq.iter().rev().map(|b| match b {
@@ -679,25 +1106,31 @@ pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> O
         b't' => b'a',
         _ => b'N',
     }));
-    get_minimizers(rev, &mut state.mins);
-    collect_candidates(idx, &state.mins, true, &mut state.candidates);
+    get_syncmers(rev, mins);
+    collect_candidates(idx, mins, true, candidates);
 
-    if state.candidates.is_empty() {
+    if candidates.is_empty() {
         return None;
     }
 
-    let (c1, c2) = find_top_chains(&mut state.candidates);
-    let evaluate = |chain: &ChainRes, seq: &[u8], rev: &[u8]| -> Option<(AlignmentResult, i32)> {
+    let (c1, c2) = find_top_chains(candidates);
+    let evaluate = |chain: &ChainRes,
+                    seq: &[u8],
+                    rev: &[u8],
+                    candidates: &[Hit],
+                    dp_buf: &mut Vec<i32>,
+                    trace_buf: &mut Vec<u8>|
+     -> Option<(AlignmentResult, i32)> {
         if chain.score == 0 {
             return None;
         }
-        let hits = &state.candidates[chain.start..chain.end];
+        let hits = &candidates[chain.start..chain.end];
         let ref_id = (hits[0].id_strand >> 1) as i32;
         let is_rev = (hits[0].id_strand & 1) == 1;
         let target_seq = if is_rev { rev } else { seq };
         let ref_seq = &idx.ref_seqs[ref_id as usize];
 
-        let (cigar, pos) = gen_cigar(hits, target_seq, ref_seq);
+        let (cigar, pos) = gen_cigar(hits, target_seq, ref_seq, dp_buf, trace_buf);
         if pos < 0 {
             return None;
         }
@@ -714,8 +1147,8 @@ pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> O
         ))
     };
 
-    let r1 = evaluate(&c1, seq, rev);
-    let r2 = if c2.score > 0 { evaluate(&c2, seq, rev) } else { None };
+    let r1 = evaluate(&c1, seq, rev, candidates, dp_buf, trace_buf);
+    let r2 = if c2.score > 0 { evaluate(&c2, seq, rev, candidates, dp_buf, trace_buf) } else { None };
     let (mut best_res, best_chain_score, second_chain_score) = match (r1, r2) {
         (Some((a1, s1)), Some((a2, s2))) => {
             if s1 >= s2 {
@@ -736,8 +1169,8 @@ pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> O
     };
     let read_len_f32 = seq.len() as f32;
     let evidence_weight = (best_chain_score as f32).min(read_len_f32) / read_len_f32;
-    let raw_mapq = 1200.0 * diff * evidence_weight;
-    best_res.mapq = raw_mapq.min(60.0) as u8;
+    let raw_mapq = CONFIG.mapq_scale * diff * evidence_weight;
+    best_res.mapq = raw_mapq.min(CONFIG.max_mapq as f32) as u8;
 
     Some(best_res)
 }

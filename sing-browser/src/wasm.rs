@@ -13,10 +13,6 @@ use std::io::{BufRead, BufReader, Cursor, Write};
 #[wasm_bindgen(getter_with_clone)]
 pub struct MappingResult {
     pub bam_data: Vec<u8>,
-    pub total_reads: usize,
-    pub mapped_reads: usize,
-    pub mapped_bases: usize,
-    pub mapped_mask: Vec<u8>,
 }
 
 #[wasm_bindgen]
@@ -24,6 +20,9 @@ pub struct SingWebEngine {
     index: Option<Index>,
     state: State,
     rev_buf: Vec<u8>,
+    total_reads: usize,
+    mapped_reads: usize,
+    mapped_bases: usize,
     genome_size: usize,
 }
 
@@ -35,6 +34,9 @@ impl SingWebEngine {
             index: None,
             state: State::new(),
             rev_buf: Vec::new(),
+            total_reads: 0,
+            mapped_reads: 0,
+            mapped_bases: 0,
             genome_size: 0,
         }
     }
@@ -61,7 +63,7 @@ impl SingWebEngine {
 
     #[wasm_bindgen]
     pub fn import_index(&mut self, data: &[u8]) -> Result<(), JsValue> {
-        let idx = Index::from_reader(Cursor::new(data)).map_err(to_js)?;
+        let idx = Index::from_bytes(data).map_err(to_js)?;
         self.genome_size = idx.ref_seqs.iter().map(|s| s.len()).sum();
         self.index = Some(idx);
         Ok(())
@@ -76,7 +78,6 @@ impl SingWebEngine {
         output_format: String,
         sort_output: bool,
         write_header: bool,
-        filter_mask: Option<Vec<u8>>,
     ) -> Result<MappingResult, JsValue> {
         let idx = resolve_index(ref_index_ptr, self.index.as_ref()).map_err(to_js)?;
         let header = header_from_index(idx, sort_output).map_err(to_js)?;
@@ -88,144 +89,55 @@ impl SingWebEngine {
             Box::new(StreamWriter::new(format, header.clone(), write_header).map_err(to_js)?)
         };
 
-        let mut total_reads = 0;
-        let mut mapped_reads = 0;
-        let mut mapped_bases = 0;
-        let mut mapped_mask = Vec::new();
-
-        fn is_mapped(mask: &Option<Vec<u8>>, idx: usize) -> bool {
-            if let Some(m) = mask {
-                if idx / 8 < m.len() {
-                    return (m[idx / 8] & (1 << (idx % 8))) != 0;
-                }
-            }
-            false
-        }
-
-        fn set_mapped(mask: &mut Vec<u8>, idx: usize) {
-            let byte_idx = idx / 8;
-            if byte_idx >= mask.len() {
-                mask.resize(byte_idx + 1, 0);
-            }
-            mask[byte_idx] |= 1 << (idx % 8);
-        }
+        let reads1 = parse_reads_chunk(read1_chunk).map_err(to_js)?;
 
         if let Some(read2) = read2_chunk {
-            let mut r1_iter = parse_fastx_reader(get_smart_reader(read1_chunk)).map_err(to_js)?;
-            let mut r2_iter = parse_fastx_reader(get_smart_reader(&read2)).map_err(to_js)?;
+            let reads2 = parse_reads_chunk(&read2).map_err(to_js)?;
+            if reads1.len() != reads2.len() {
+                return Err(JsValue::from_str("paired-end inputs have mismatched read counts"));
+            }
 
-            loop {
-                match (r1_iter.next(), r2_iter.next()) {
-                    (None, None) => break,
-                    (Some(r1), Some(r2)) => {
-                        let rec1 = r1.map_err(to_js)?;
-                        let rec2 = r2.map_err(to_js)?;
-                        
-                        let current_read_idx = total_reads;
-                        let skip = is_mapped(&filter_mask, current_read_idx) || is_mapped(&filter_mask, current_read_idx + 1);
+            for ((name1, seq1, qual1), (name2, seq2, qual2)) in reads1.into_iter().zip(reads2.into_iter()) {
+                let res1 = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
+                let res2 = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
 
-                        let mut res1 = None;
-                        let mut res2 = None;
-                        
-                        if !skip {
-                            let seq1 = rec1.seq();
-                            let seq2 = rec2.seq();
-                            res1 = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
-                            res2 = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
-                        }
+                self.total_reads += 2;
+                if res1.is_some() { self.mapped_reads += 1; self.mapped_bases += seq1.len(); }
+                if res2.is_some() { self.mapped_reads += 1; self.mapped_bases += seq2.len(); }
 
-                        let name1 = String::from_utf8_lossy(rec1.id())
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("")
-                            .to_string();
-                        let seq1 = rec1.seq().to_vec();
-                        let qual1 = rec1
-                            .qual()
-                            .map(|q| q.to_vec())
-                            .unwrap_or_else(|| vec![b'*'; seq1.len().max(1)]);
+                let sam1 = sam_record(&name1, &seq1, &qual1, &res1, Some(&res2), true, idx).map_err(to_js)?;
+                let sam2 = sam_record(&name2, &seq2, &qual2, &res2, Some(&res1), false, idx).map_err(to_js)?;
 
-                        let name2 = String::from_utf8_lossy(rec2.id())
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("")
-                            .to_string();
-                        let seq2 = rec2.seq().to_vec();
-                        let qual2 = rec2
-                            .qual()
-                            .map(|q| q.to_vec())
-                            .unwrap_or_else(|| vec![b'*'; seq2.len().max(1)]);
-
-                        if res1.is_some() { 
-                            mapped_reads += 1; 
-                            mapped_bases += seq1.len(); 
-                            set_mapped(&mut mapped_mask, current_read_idx);
-                        }
-                        if res2.is_some() { 
-                            mapped_reads += 1; 
-                            mapped_bases += seq2.len();
-                            set_mapped(&mut mapped_mask, current_read_idx + 1);
-                        }
-                        total_reads += 2;
-
-                        if !skip {
-                            let sam1 = sam_record(&name1, &seq1, &qual1, &res1, Some(&res2), true, idx).map_err(to_js)?;
-                            let sam2 = sam_record(&name2, &seq2, &qual2, &res2, Some(&res1), false, idx).map_err(to_js)?;
-
-                            strategy.write(&sam1).map_err(to_js)?;
-                            strategy.write(&sam2).map_err(to_js)?;
-                        }
-                    }
-                    _ => return Err(JsValue::from_str("paired-end inputs have mismatched read counts")),
-                }
+                strategy.write(&sam1).map_err(to_js)?;
+                strategy.write(&sam2).map_err(to_js)?;
             }
         } else {
-            let mut r1_iter = parse_fastx_reader(get_smart_reader(read1_chunk)).map_err(to_js)?;
-            while let Some(rec) = r1_iter.next() {
-                let rec = rec.map_err(to_js)?;
-                
-                let current_read_idx = total_reads;
-                let skip = is_mapped(&filter_mask, current_read_idx);
-                
-                let mut res = None;
-                if !skip {
-                    let seq_ref = rec.seq();
-                    res = align(&seq_ref, idx, &mut self.state, &mut self.rev_buf);
-                }
+            for (name, seq, qual) in reads1 {
+                let res = align(&seq, idx, &mut self.state, &mut self.rev_buf);
+                self.total_reads += 1;
+                if res.is_some() { self.mapped_reads += 1; self.mapped_bases += seq.len(); }
 
-                let name = String::from_utf8_lossy(rec.id())
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let seq = rec.seq().to_vec();
-                let qual = rec
-                    .qual()
-                    .map(|q| q.to_vec())
-                    .unwrap_or_else(|| vec![b'*'; seq.len().max(1)]);
-                
-                if res.is_some() { 
-                    mapped_reads += 1; 
-                    mapped_bases += seq.len(); 
-                    set_mapped(&mut mapped_mask, current_read_idx);
-                }
-                total_reads += 1;
-
-                if !skip {
-                    let sam_rec = sam_record(&name, &seq, &qual, &res, None, true, idx).map_err(to_js)?;
-                    strategy.write(&sam_rec).map_err(to_js)?;
-                }
+                let sam_rec = sam_record(&name, &seq, &qual, &res, None, true, idx).map_err(to_js)?;
+                strategy.write(&sam_rec).map_err(to_js)?;
             }
         }
 
-        let bam_data = strategy.finalize().map_err(to_js)?;
-        Ok(MappingResult {
-            bam_data,
-            total_reads,
-            mapped_reads,
-            mapped_bases,
-            mapped_mask,
-        })
+        Ok(strategy.finalize().map_err(to_js)?)
+    }
+
+    #[wasm_bindgen]
+    pub fn get_total_reads(&self) -> usize {
+        self.total_reads
+    }
+
+    #[wasm_bindgen]
+    pub fn get_mapped_reads(&self) -> usize {
+        self.mapped_reads
+    }
+
+    #[wasm_bindgen]
+    pub fn get_mapped_bases(&self) -> usize {
+        self.mapped_bases
     }
 
     #[wasm_bindgen]
@@ -234,8 +146,17 @@ impl SingWebEngine {
     }
 
     #[wasm_bindgen]
+    pub fn get_avg_coverage(&self) -> f64 {
+        if self.genome_size == 0 {
+            0.0
+        } else {
+            self.mapped_bases as f64 / self.genome_size as f64
+        }
+    }
+
+    #[wasm_bindgen]
     pub fn map_reads_chunk(&mut self, reads_chunk: &[u8]) -> Result<MappingResult, JsValue> {
-        self.run_mapping_chunk(std::ptr::null(), reads_chunk, None, "bam".to_string(), false, true, None)
+        self.run_mapping_chunk(std::ptr::null(), reads_chunk, None, "bam".to_string(), false, true)
     }
 }
 
@@ -255,6 +176,27 @@ fn parse_reference_chunk(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
             .unwrap_or("")
             .to_string();
         out.push((name, rec.seq().to_vec()));
+    }
+    Ok(out)
+}
+
+fn parse_reads_chunk(data: &[u8]) -> Result<Vec<(String, Vec<u8>, Vec<u8>)>> {
+    let reader = get_smart_reader(data);
+    let mut parser = parse_fastx_reader(reader)?;
+    let mut out = Vec::new();
+    while let Some(rec) = parser.next() {
+        let rec = rec?;
+        let name = String::from_utf8_lossy(rec.id())
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let seq = rec.seq().to_vec();
+        let qual = rec
+            .qual()
+            .map(|q| q.to_vec())
+            .unwrap_or_else(|| vec![b'*'; seq.len().max(1)]);
+        out.push((name, seq, qual));
     }
     Ok(out)
 }
@@ -413,7 +355,7 @@ impl OutputFormat {
 
 trait OutputStrategy {
     fn write(&mut self, record: &sam::Record) -> Result<()>;
-    fn finalize(self: Box<Self>) -> Result<Vec<u8>>;
+    fn finalize(self: Box<Self>) -> Result<MappingResult>;
 }
 
 type BamWriter = bam::io::Writer<bgzf::io::writer::Writer<Cursor<Vec<u8>>>>;
@@ -460,12 +402,12 @@ impl OutputStrategy for StreamWriter {
         Ok(())
     }
 
-    fn finalize(self: Box<Self>) -> Result<Vec<u8>> {
+    fn finalize(self: Box<Self>) -> Result<MappingResult> {
         let bam_data = match self.writer {
             StreamWriterKind::Bam(w) => w.into_inner().finish()?.into_inner(),
             StreamWriterKind::Sam(w) => w.into_inner().into_inner(),
         };
-        Ok(bam_data)
+        Ok(MappingResult { bam_data })
     }
 }
 
@@ -488,7 +430,7 @@ impl OutputStrategy for SortWriter {
         Ok(())
     }
 
-    fn finalize(mut self: Box<Self>) -> Result<Vec<u8>> {
+    fn finalize(mut self: Box<Self>) -> Result<MappingResult> {
         self.records.sort_by(|a, b| {
             let refs = self.header.reference_sequences();
 
@@ -530,7 +472,8 @@ impl OutputStrategy for SortWriter {
                 }
 
                 let bam_data = writer.into_inner().finish()?.into_inner();
-                Ok(bam_data)
+
+                     Ok(MappingResult { bam_data })
              },
              OutputFormat::Sam => {
                 let cursor = Cursor::new(Vec::new());
@@ -541,7 +484,7 @@ impl OutputStrategy for SortWriter {
                 for record in &self.records {
                      writer.write_record(&self.header, record)?;
                 }
-                Ok(writer.into_inner().into_inner())
+                Ok(MappingResult { bam_data: writer.into_inner().into_inner() })
              }
         }
     }

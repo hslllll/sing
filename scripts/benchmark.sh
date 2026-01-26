@@ -39,7 +39,7 @@ else
     exit 1
 fi
 
-COVERAGE_LIST=(1 3)
+COVERAGE_LIST=(0.001)
 MUT_RATES=(0.001 0.01)
 
 OUTPUT_CSV="benchmark_results_f1.${MODE}.csv"
@@ -206,19 +206,20 @@ def main():
         'Sing':     sys.argv[5],
         'Bowtie2':  sys.argv[6]
     }
+    mode = sys.argv[7]
 
     file_paths = {
-        'Minimap2': 'minimap.sam',
-        'BWA-MEM2': 'bwa.sam',
-        'Columba': 'columba.sam',
-        'Sing': 'sing.sam',
-        'Bowtie2': 'bowtie2.sam'
+        'Minimap2': f'minimap.{mode}.sam',
+        'BWA-MEM2': f'bwa.{mode}.sam',
+        'Columba':  f'columba.{mode}.sam',
+        'Sing':     f'sing.{mode}.sam',
+        'Bowtie2':  f'bowtie2.{mode}.sam'
     }
 
     truth_dict, tool_results = load_sam_and_build_truth(file_paths)
     total_reads = len(truth_dict)
 
-    print(f"\n--- Summary: {exp_name} ---")
+    print(f"\n--- Summary: {exp_name} (Mode: {mode}) ---")
     print("Tool        | Time_ms  | Precision | Recall   | F1        | TP       | FP       | FN")
 
     tools_ordered = ['Minimap2', 'BWA-MEM2', 'Columba', 'Sing', 'Bowtie2']
@@ -231,17 +232,17 @@ def main():
             
             print(f"{tool:<10} | {time_val:<8} | {prec:6.2f}%   | {rec:6.2f}%   | {f1:6.2f}    | {tp:<8} | {fp:<8} | {fn:<8}")
             
-            sys.stderr.write(f"{exp_name},{tool},{time_val},{total_reads},{tp},{fp},{fn},{prec:.4f},{rec:.4f},{f1:.4f}\n")
+            sys.stderr.write(f"{exp_name},{tool},{time_val},{total_reads},{tp},{fp},{fn},{prec:.4f},{rec:.4f},{f1:.4f},{mode}\n")
         else:
             print(f"{tool:<10} | {time_val:<8} | {'FAILED':<9} | {'-':<9} | {'-':<9} | -        | -        | -")
-            sys.stderr.write(f"{exp_name},{tool},{time_val},{total_reads},0,0,0,0,0,0\n")
+            sys.stderr.write(f"{exp_name},{tool},{time_val},{total_reads},0,0,0,0,0,0,{mode}\n")
 
 if __name__ == "__main__":
     main()
 EOF
 
 if [ ! -f "$OUTPUT_CSV" ]; then
-    echo "Exp_ID,Tool,Time_ms,TotalReads,TP,FP,FN,Precision,Recall,F1" > "$OUTPUT_CSV"
+    echo "Exp_ID,Tool,Time_ms,TotalReads,TP,FP,FN,Precision,Recall,F1,Mode" > "$OUTPUT_CSV"
 fi
 
 for COVERAGE in "${COVERAGE_LIST[@]}"; do
@@ -263,7 +264,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         echo "1. Running Sing..."
         START=$(date +%s%N)
-        if ./target/release/sing map -t 8 "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" -o sing.sam > /dev/null 2>&1; then
+        if ./target/release/sing map -t 8 "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" -o "sing.${MODE}.sam" > /dev/null 2>&1; then
             END=$(date +%s%N)
             TIME_SING=$(( (END - START) / 1000000 ))
         else
@@ -273,7 +274,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         echo "2. Running Minimap2..."
         START=$(date +%s%N)
-        if minimap2 -t 8 -ax sr "$REF_DECOMP" "$R1" "$R2" > minimap.sam 2>/dev/null; then
+        if minimap2 -t 8 -ax sr "$REF_DECOMP" "$R1" "$R2" > "minimap.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_MM=$(( (END - START) / 1000000 ))
         else
@@ -284,7 +285,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         echo "3. Running Columba..."
         START=$(date +%s%N)
         if command -v columba &> /dev/null; then
-             if columba -t 8 -r "$REF_DECOMP" -f "$R1" -F "$R2" -o columba.sam > /dev/null 2>&1; then
+             if columba -t 8 -r "$REF_DECOMP" -f "$R1" -F "$R2" -o "columba.${MODE}.sam" > /dev/null 2>&1; then
                  END=$(date +%s%N)
                  TIME_COL=$(( (END - START) / 1000000 ))
              else
@@ -293,12 +294,12 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
              fi
         else
             TIME_COL="N/A"
-            touch columba.sam
+            touch "columba.${MODE}.sam"
         fi
         
         echo "4. Running BWA-MEM2..."
         START=$(date +%s%N)
-        if bwa-mem2 mem -t 8 "$REF_DECOMP" "$R1" "$R2" > bwa.sam 2>/dev/null; then
+        if bwa-mem2 mem -t 8 "$REF_DECOMP" "$R1" "$R2" > "bwa.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_BWA=$(( (END - START) / 1000000 ))
         else
@@ -308,7 +309,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         echo "5. Running Bowtie2..."
         START=$(date +%s%N)
-        if bowtie2 -p 8 -x "$REF_DECOMP" -1 "$R1" -2 "$R2" > bowtie2.sam 2>/dev/null; then
+        if bowtie2 -p 8 -x "$REF_DECOMP" -1 "$R1" -2 "$R2" > "bowtie2.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_BT2=$(( (END - START) / 1000000 ))
         else
@@ -316,9 +317,9 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
             echo "bowtie2: Failed"
         fi
 
-        python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_BWA" "$TIME_COL" "$TIME_SING" "$TIME_BT2" | tee -a "$OUTPUT_CSV"
+        python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_BWA" "$TIME_COL" "$TIME_SING" "$TIME_BT2" "$MODE" | tee -a "$OUTPUT_CSV"
 
-        rm minimap.sam bwa.sam columba.sam sing.sam bowtie2.sam "sim_${EXP_ID}"*
+        rm "minimap.${MODE}.sam" "bwa.${MODE}.sam" "columba.${MODE}.sam" "sing.${MODE}.sam" "bowtie2.${MODE}.sam"
         echo ""
     done
 done
