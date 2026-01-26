@@ -51,7 +51,6 @@ pub struct TuningConfig {
     pub mapq_scale: f32,
     pub max_mapq: u8,
     pub band_width: usize,
-    pub seed_top_n: usize,
 }
 
 pub const CONFIG: TuningConfig = TuningConfig {
@@ -69,7 +68,6 @@ pub const CONFIG: TuningConfig = TuningConfig {
     mapq_scale: 1200.0,
     max_mapq: 60,
     band_width: 32,
-    seed_top_n: 10,
 };
 
 #[derive(Debug, Clone)]
@@ -279,8 +277,6 @@ pub struct State {
     pub candidates: Vec<Hit>,
     pub dp_buf: Vec<i32>,
     pub trace_buf: Vec<u8>,
-    pub mins_tmp: Vec<(u32, u32, u32)>,
-    pub mins_sel: Vec<(u32, u32)>,
 }
 
 impl State {
@@ -291,8 +287,6 @@ impl State {
             candidates: Vec::with_capacity(1000),
             dp_buf: Vec::with_capacity(dp_cap),
             trace_buf: Vec::with_capacity(dp_cap),
-            mins_tmp: Vec::with_capacity(128),
-            mins_sel: Vec::with_capacity(32),
         }
     }
 }
@@ -445,62 +439,6 @@ fn collect_candidates(idx: &Index, mins: &[(u32, u32)], is_rev: bool, out: &mut 
     }
 }
 
-fn seed_genome_freq(idx: &Index, h: u32) -> u32 {
-    let bucket = (h >> SHIFT) as usize;
-    let start = idx.offsets[bucket] as usize;
-    let end = idx
-        .offsets
-        .get(bucket + 1)
-        .copied()
-        .unwrap_or(idx.seeds.len() as u32) as usize;
-
-    let target_hash = (h & 0xFFFF) as u64;
-    let mut count = 0u32;
-    for i in start..end {
-        let seed = idx.seeds[i];
-        if (seed >> 48) == target_hash {
-            count += 1;
-        }
-    }
-    count
-}
-
-fn select_top_mins(
-    idx: &Index,
-    mins: &[(u32, u32)],
-    tmp: &mut Vec<(u32, u32, u32)>,
-    out: &mut Vec<(u32, u32)>,
-    top_n: usize,
-) {
-    tmp.clear();
-    out.clear();
-    if mins.is_empty() {
-        return;
-    }
-
-    for &(h, p) in mins {
-        let freq = seed_genome_freq(idx, h);
-        if freq == 0 {
-            continue;
-        }
-        tmp.push((freq, p, h));
-    }
-
-    tmp.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let limit = top_n.min(tmp.len());
-    out.reserve(limit);
-    for i in 0..limit {
-        let (_, p, h) = tmp[i];
-        out.push((h, p));
-    }
-
-    if out.is_empty() {
-        let limit = top_n.min(mins.len());
-        out.extend(mins.iter().take(limit).copied());
-    }
-}
-
 fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
     if candidates.is_empty() {
         return (ChainRes::default(), ChainRes::default());
@@ -565,9 +503,7 @@ fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
         group_start = group_end;
     }
 
-    let max_possible = (CONFIG.seed_top_n as i32) * (CONFIG.seed_weight as i32);
-    let min_score = CONFIG.chain_min_score.min(max_possible.max(CONFIG.seed_weight as i32));
-    if max_score < min_score {
+    if max_score < CONFIG.chain_min_score {
         return (ChainRes::default(), ChainRes::default()); 
     }
 
@@ -1079,13 +1015,12 @@ fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32
 }
 
 pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> Option<AlignmentResult> {
-    let State { mins, candidates, dp_buf, trace_buf, mins_tmp, mins_sel } = state;
+    let State { mins, candidates, dp_buf, trace_buf } = state;
 
     candidates.clear();
 
     get_syncmers(seq, mins);
-    select_top_mins(idx, mins, mins_tmp, mins_sel, CONFIG.seed_top_n);
-    collect_candidates(idx, mins_sel, false, candidates);
+    collect_candidates(idx, mins, false, candidates);
 
     rev.clear();
     rev.extend(seq.iter().rev().map(|b| match b {
@@ -1100,8 +1035,7 @@ pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> O
         _ => b'N',
     }));
     get_syncmers(rev, mins);
-    select_top_mins(idx, mins, mins_tmp, mins_sel, CONFIG.seed_top_n);
-    collect_candidates(idx, mins_sel, true, candidates);
+    collect_candidates(idx, mins, true, candidates);
 
     if candidates.is_empty() {
         return None;
