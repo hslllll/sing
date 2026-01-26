@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
 
-pub const WINDOW: usize = 21;
+pub const WINDOW: usize = 16;
 pub const MIN_W: usize = WINDOW;
 pub const BATCH_SIZE: usize = 10_000;
 pub const BATCH_CAP: usize = 64;
@@ -27,7 +27,7 @@ const REMOVE: [u64; 4] = [
     rot(BASES[3], (WINDOW as u32 * ROT) % 64),
 ];
 
-const SYNC_S: usize = 10;
+const SYNC_S: usize = 8;
 const SYNC_T: usize = (WINDOW - SYNC_S) / 2;
 
 const REMOVE_S: [u64; 4] = [
