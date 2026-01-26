@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
 
-const WINDOW: usize = 20;
-const SYNC_S: usize = 7;
+const WINDOW: usize = 16;
+const SYNC_S: usize = 8;
 
 const BASES: [u64; 4] = [
     0x243f_6a88_85a3_08d3,
