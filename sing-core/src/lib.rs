@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
 
 const WINDOW: usize = 20;
-const SYNC_S: usize = 3;
+const SYNC_S: usize = 7;
 
 pub const BATCH_SIZE: usize = 10_000;
 pub const BATCH_CAP: usize = 64;
