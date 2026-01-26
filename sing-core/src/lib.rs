@@ -27,7 +27,7 @@ const REMOVE: [u64; 4] = [
     rot(BASES[3], (WINDOW as u32 * ROT) % 64),
 ];
 
-const SYNC_S: usize = 8;
+const SYNC_S: usize = 10;
 const SYNC_T: usize = (WINDOW - SYNC_S) / 2;
 
 const REMOVE_S: [u64; 4] = [
