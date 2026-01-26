@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
 
-pub const WINDOW: usize = 20;
+pub const WINDOW: usize = 21;
 pub const MIN_W: usize = WINDOW;
 pub const BATCH_SIZE: usize = 10_000;
 pub const BATCH_CAP: usize = 64;
@@ -42,7 +42,6 @@ pub const SHIFT: usize = 32 - RADIX;
 
 #[derive(Clone, Copy)]
 pub struct TuningConfig {
-    pub freq_filter: usize,
     pub chain_max_gap: i32,
     pub seed_weight: u8,
     pub match_score: i32,
@@ -53,8 +52,7 @@ pub struct TuningConfig {
 }
 
 pub const CONFIG: TuningConfig = TuningConfig {
-    freq_filter: 1000,
-    chain_max_gap: 50,
+    chain_max_gap: 150,
     seed_weight: 1,
     match_score: 2,
     mismatch_pen: -2,
@@ -68,6 +66,7 @@ pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
     pub freq_filter: u32,
+    pub genome_size: u64,
     pub ref_seqs: Vec<Vec<u8>>,
     pub ref_names: Vec<String>,
 }
@@ -97,6 +96,9 @@ impl Index {
         r.read_exact(&mut buf4).context("read freq_filter")?;
         let freq_filter = u32::from_le_bytes(buf4);
 
+        r.read_exact(&mut buf8).context("read genome_size")?;
+        let genome_size = u64::from_le_bytes(buf8);
+
         r.read_exact(&mut buf8).context("read ref seq count")?;
         let len = u64::from_le_bytes(buf8) as usize;
         let mut ref_seqs = Vec::with_capacity(len);
@@ -119,7 +121,7 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
-        Ok(Index { offsets, seeds, freq_filter, ref_seqs, ref_names })
+        Ok(Index { offsets, seeds, freq_filter, genome_size, ref_seqs, ref_names })
     }
 
     pub fn to_writer<W: Write>(&self, mut w: W) -> Result<()> {
@@ -134,6 +136,8 @@ impl Index {
         }
 
         w.write_all(&self.freq_filter.to_le_bytes())?;
+
+        w.write_all(&self.genome_size.to_le_bytes())?;
 
         w.write_all(&(self.ref_seqs.len() as u64).to_le_bytes())?;
         for seq in &self.ref_seqs {
@@ -186,9 +190,9 @@ where
         ref_seqs.push(seq);
     }
 
-    let total_bases: usize = ref_seqs.iter().map(|s| s.len()).sum();
-    let freq_filter = ((total_bases as f64 / 500_000_000.0) * 1000.0) as usize;
-    let freq_filter = std::cmp::max(1000, freq_filter);
+    let total_bases: u64 = ref_seqs.iter().map(|s| s.len() as u64).sum();
+    let freq_filter = (10.0_f64.powf((total_bases as f64).log10() / 2.0)) as usize;
+    let freq_filter = std::cmp::max(1, freq_filter);
     eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
 
     seeds_tmp.sort_unstable_by_key(|k| k.0);
@@ -230,7 +234,7 @@ where
         current_offset += *count;
     }
 
-    Ok(Index { offsets, seeds, freq_filter: freq_filter as u32, ref_seqs, ref_names })
+    Ok(Index { offsets, seeds, freq_filter: freq_filter as u32, genome_size: total_bases, ref_seqs, ref_names })
 }
 
 #[derive(Clone, Copy, Default, Debug)]
