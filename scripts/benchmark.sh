@@ -208,11 +208,11 @@ def main():
     }
 
     file_paths = {
-        'Minimap2': 'minimap.sam',
-        'BWA-MEM2': 'bwa.sam',
-        'Columba': 'columba.sam',
-        'Sing': 'sing.sam',
-        'Bowtie2': 'bowtie2.sam'
+        'Minimap2': 'minimap.${MODE}.sam',
+        'BWA-MEM2': 'bwa.${MODE}.sam',
+        'Columba': 'columba.${MODE}.sam',
+        'Sing': 'sing.${MODE}.sam',
+        'Bowtie2': 'bowtie2.${MODE}.sam'
     }
 
     truth_dict, tool_results = load_sam_and_build_truth(file_paths)
