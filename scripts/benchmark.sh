@@ -99,7 +99,7 @@ import sys
 import re
 import math
 
-TOLERANCE = 15
+TOLERANCE = 10
 
 def parse_dwgsim_qname(qname):
     """
