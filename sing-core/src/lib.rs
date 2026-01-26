@@ -51,7 +51,6 @@ pub struct TuningConfig {
     pub mapq_scale: f32,
     pub max_mapq: u8,
     pub band_width: usize,
-    pub freq_filter_max: usize,
 }
 
 pub const CONFIG: TuningConfig = TuningConfig {
@@ -69,7 +68,6 @@ pub const CONFIG: TuningConfig = TuningConfig {
     mapq_scale: 1200.0,
     max_mapq: 60,
     band_width: 32,
-    freq_filter_max: 100,
 };
 
 #[derive(Debug, Clone)]
@@ -194,7 +192,6 @@ where
     let total_bases: u64 = ref_seqs.iter().map(|s| s.len() as u64).sum();
     let freq_filter = (total_bases as f64).powf(1.0 / 5.0) as usize;
     let freq_filter = std::cmp::max(1, freq_filter);
-    let freq_filter = std::cmp::min(CONFIG.freq_filter_max, freq_filter);
     eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
 
     
