@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
 
-pub const WINDOW: usize = 16;
+pub const WINDOW: usize = 20;
 pub const MIN_W: usize = WINDOW;
 pub const BATCH_SIZE: usize = 10_000;
 pub const BATCH_CAP: usize = 64;
@@ -58,7 +58,7 @@ pub const CONFIG: TuningConfig = TuningConfig {
     mismatch_pen: -2,
     gap_open: -3,
     gap_ext: -1,
-    min_identity: 0.75,
+    min_identity: 0.90,
 };
 
 #[derive(Debug, Clone)]
