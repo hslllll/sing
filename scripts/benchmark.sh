@@ -39,7 +39,7 @@ else
     exit 1
 fi
 
-COVERAGE_LIST=(1 3)
+COVERAGE_LIST=(0.01 0.1)
 MUT_RATES=(0.001 0.01)
 
 OUTPUT_CSV="benchmark_results_f1.${MODE}.csv"
@@ -319,7 +319,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_BWA" "$TIME_COL" "$TIME_SING" "$TIME_BT2" "$MODE" | tee -a "$OUTPUT_CSV"
 
-        rm "minimap.${MODE}.sam" "bwa.${MODE}.sam" "columba.${MODE}.sam" "sing.${MODE}.sam" "bowtie2.${MODE}.sam" analyze_benchmark.py
+        rm "minimap.${MODE}.sam" "bwa.${MODE}.sam" "columba.${MODE}.sam" "sing.${MODE}.sam" "bowtie2.${MODE}.sam"
         echo ""
     done
 done
