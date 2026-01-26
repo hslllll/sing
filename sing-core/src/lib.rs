@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::borrow::Cow;
 use std::io::{BufReader, Read, Write};
 
@@ -81,6 +81,78 @@ pub struct Index {
 }
 
 impl Index {
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut pos = 0usize;
+
+        fn read_u64(data: &[u8], pos: &mut usize, label: &str) -> Result<u64> {
+            if *pos + 8 > data.len() {
+                bail!("{}: unexpected EOF", label);
+            }
+            let val = u64::from_le_bytes(data[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Ok(val)
+        }
+
+        fn read_u32(data: &[u8], pos: &mut usize, label: &str) -> Result<u32> {
+            if *pos + 4 > data.len() {
+                bail!("{}: unexpected EOF", label);
+            }
+            let val = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            Ok(val)
+        }
+
+        let offsets_len = read_u64(data, &mut pos, "read offsets len")? as usize;
+        let offsets_bytes = offsets_len
+            .checked_mul(4)
+            .and_then(|n| pos.checked_add(n))
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read offsets: unexpected EOF"))?;
+        let mut offsets = Vec::with_capacity(offsets_len);
+        for chunk in data[pos..offsets_bytes].chunks_exact(4) {
+            offsets.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        pos = offsets_bytes;
+
+        let seeds_len = read_u64(data, &mut pos, "read seeds len")? as usize;
+        let seeds_bytes = seeds_len
+            .checked_mul(8)
+            .and_then(|n| pos.checked_add(n))
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read seeds: unexpected EOF"))?;
+        let mut seeds = Vec::with_capacity(seeds_len);
+        for chunk in data[pos..seeds_bytes].chunks_exact(8) {
+            seeds.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        pos = seeds_bytes;
+
+        let freq_filter = read_u32(data, &mut pos, "read freq_filter")?;
+        let genome_size = read_u64(data, &mut pos, "read genome_size")?;
+
+        let ref_count = read_u64(data, &mut pos, "read ref seq count")? as usize;
+        let mut ref_seqs = Vec::with_capacity(ref_count);
+        for _ in 0..ref_count {
+            let slen = read_u64(data, &mut pos, "read seq len")? as usize;
+            let end = pos.checked_add(slen).filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow::anyhow!("read seq bytes: unexpected EOF"))?;
+            ref_seqs.push(data[pos..end].to_vec());
+            pos = end;
+        }
+
+        let name_count = read_u64(data, &mut pos, "read name count")? as usize;
+        let mut ref_names = Vec::with_capacity(name_count);
+        for _ in 0..name_count {
+            let slen = read_u64(data, &mut pos, "read name len")? as usize;
+            let end = pos.checked_add(slen).filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow::anyhow!("read name bytes: unexpected EOF"))?;
+            let name_buf = &data[pos..end];
+            ref_names.push(String::from_utf8(name_buf.to_vec()).context("utf8 ref name")?);
+            pos = end;
+        }
+
+        Ok(Index { offsets, seeds, freq_filter, genome_size, ref_seqs, ref_names })
+    }
+
     pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
         let mut r = BufReader::new(reader);
         let mut buf8 = [0u8; 8];
