@@ -39,7 +39,7 @@ else
     exit 1
 fi
 
-COVERAGE_LIST=(0.001 0.01)
+COVERAGE_LIST=(0.001)
 MUT_RATES=(0.001 0.01)
 
 OUTPUT_CSV="benchmark_results_f1.${MODE}.csv"
