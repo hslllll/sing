@@ -50,6 +50,7 @@ pub struct TuningConfig {
     pub chain_min_score: i32,
     pub mapq_scale: f32,
     pub max_mapq: u8,
+    pub band_width: usize,
 }
 
 pub const CONFIG: TuningConfig = TuningConfig {
@@ -66,6 +67,7 @@ pub const CONFIG: TuningConfig = TuningConfig {
     chain_min_score: 25,
     mapq_scale: 1200.0,
     max_mapq: 60,
+    band_width: 32,
 };
 
 #[derive(Debug, Clone)]
@@ -181,19 +183,9 @@ where
 {
     let mut ref_seqs = Vec::new();
     let mut ref_names = Vec::new();
-    let mut seeds_tmp: Vec<(u64, u64)> = Vec::new();
 
-    for (rid, (name, seq)) in records.into_iter().enumerate() {
+    for (_rid, (name, seq)) in records.into_iter().enumerate() {
         ref_names.push(name.into());
-
-        let mut mins = Vec::new();
-        get_syncmers(&seq, &mut mins);
-        for (h, p) in mins {
-            let hash64 = h as u64;
-            let hash16 = (hash64 & 0xFFFF) as u64;
-            let packed = (hash16 << 48) | ((rid as u64) << 32) | (p as u64);
-            seeds_tmp.push((hash64, packed));
-        }
         ref_seqs.push(seq);
     }
 
@@ -202,44 +194,64 @@ where
     let freq_filter = std::cmp::max(1, freq_filter);
     eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
 
-    seeds_tmp.sort_unstable_by_key(|k| k.0);
-
+    
+    
     let mut global_counts = vec![0u32; 1 << RADIX];
-    let mut seeds: Vec<u64> = Vec::new();
-    let mut i = 0usize;
-    let mut uniq_hashes = 0;
-    let mut kept_hashes = 0;
-
-    while i < seeds_tmp.len() {
-        let mut j = i;
-        while j < seeds_tmp.len() && seeds_tmp[j].0 == seeds_tmp[i].0 {
-            j += 1;
+    let mut mins = Vec::new();
+    for seq in &ref_seqs {
+        get_syncmers(seq, &mut mins);
+        for (h, _) in mins.iter() {
+            let bucket = (*h as u64 >> SHIFT) as usize;
+            global_counts[bucket] += 1;
         }
-        uniq_hashes += 1;
-        if j - i <= freq_filter {
-            kept_hashes += 1;
-            for k in i..j {
-                let (h, packed) = seeds_tmp[k];
-                let bucket = (h >> SHIFT) as usize;
-                global_counts[bucket] += 1;
-                seeds.push(packed);
-            }
-        }
-        i = j;
     }
 
-    eprintln!("Indexing statistics:");
-    eprintln!("  Total hashes: {}", seeds_tmp.len());
-    eprintln!("  Unique hashes: {}", uniq_hashes);
-    eprintln!("  Unique hashes kept: {}", kept_hashes);
-    eprintln!("  Total seeds kept: {}", seeds.len());
+    
+    let mut kept_counts = vec![0u32; 1 << RADIX];
+    let mut kept_buckets = 0u64;
+    let mut total_seeds_kept = 0u64;
+    for (i, &count) in global_counts.iter().enumerate() {
+        if count as usize <= freq_filter {
+            kept_counts[i] = count;
+            if count > 0 {
+                kept_buckets += 1;
+                total_seeds_kept += count as u64;
+            }
+        }
+    }
 
-    let mut offsets = Vec::with_capacity(global_counts.len());
+    
+    let mut offsets = Vec::with_capacity(kept_counts.len());
     let mut current_offset = 0u32;
-    for count in &global_counts {
+    for count in &kept_counts {
         offsets.push(current_offset);
         current_offset += *count;
     }
+
+    
+    
+    let mut seeds = vec![0u64; total_seeds_kept as usize];
+    let mut write_pos = offsets.clone();
+    for (rid, seq) in ref_seqs.iter().enumerate() {
+        get_syncmers(seq, &mut mins);
+        for (h, p) in mins.iter() {
+            let hash64 = *h as u64;
+            let bucket = (hash64 >> SHIFT) as usize;
+            if kept_counts[bucket] == 0 {
+                continue;
+            }
+            let hash16 = (hash64 & 0xFFFF) as u64;
+            let packed = (hash16 << 48) | ((rid as u64) << 32) | (*p as u64);
+            let pos = write_pos[bucket] as usize;
+            seeds[pos] = packed;
+            write_pos[bucket] += 1;
+        }
+    }
+
+    eprintln!("Indexing statistics:");
+    eprintln!("  Total seeds (all buckets): {}", global_counts.iter().map(|&c| c as u64).sum::<u64>());
+    eprintln!("  Buckets kept: {} / {}", kept_buckets, kept_counts.len());
+    eprintln!("  Total seeds kept: {}", seeds.len());
 
     Ok(Index { offsets, seeds, freq_filter: freq_filter as u32, genome_size: total_bases, ref_seqs, ref_names })
 }
@@ -630,92 +642,212 @@ fn align_gap_nw(
     let n = read.len();
     let m = ref_seq.len();
 
-    
-    
     if n == 0 || m == 0 {
-        if n > 0 { push_cigar(cigar, n as u32, 1); } 
-        if m > 0 { push_cigar(cigar, m as u32, 2); } 
+        if n > 0 {
+            push_cigar(cigar, n as u32, 1);
+        }
+        if m > 0 {
+            push_cigar(cigar, m as u32, 2);
+        }
         return;
     }
 
-    
-    
     let match_score = CONFIG.match_score;
     let mismatch_score = CONFIG.mismatch_pen;
-    let gap_score = CONFIG.gap_open; 
-    
-    let cols = m + 1;
-    let needed = (n + 1) * cols;
+    let gap_open = CONFIG.gap_open;
+    let gap_ext = CONFIG.gap_ext;
+    let neg_inf: i32 = -1_000_000_000;
+
+    let band = CONFIG.band_width as i32;
+    let band_cols = (CONFIG.band_width * 2 + 1) as usize;
+    let cells = (n + 1) * band_cols;
+    let needed = cells * 3;
+
     if dp_buf.len() < needed {
-        dp_buf.resize(needed, 0);
+        dp_buf.resize(needed, neg_inf);
     }
     if trace_buf.len() < needed {
         trace_buf.resize(needed, 0);
     }
-    let dp = &mut dp_buf[..needed];
-    let trace = &mut trace_buf[..needed];
-    dp[0] = 0;
-    trace[0] = 0;
 
-    for i in 1..=n {
-        let idx = i * cols;
-        dp[idx] = i as i32 * gap_score;
-        trace[idx] = 2;
-    }
-    for j in 1..=m {
-        dp[j] = j as i32 * gap_score;
-        trace[j] = 3;
-    }
+    
+    let (trace_m, trace_rest) = trace_buf.split_at_mut(cells);
+    let (trace_i, trace_d) = trace_rest.split_at_mut(cells);
 
-    for i in 1..=n {
-        let curr_row = i * cols;
-        let prev_row = (i - 1) * cols;
+    
+    let idx_of = |i: usize, j: usize| -> Option<usize> {
+        let band_k = j as i32 - i as i32 + band;
+        if band_k < 0 || band_k >= band_cols as i32 {
+            None
+        } else {
+            Some(i * band_cols + band_k as usize)
+        }
+    };
+
+    
+    {
+        let (m_buf, rest) = dp_buf.split_at_mut(cells);
+        let (i_buf, d_buf) = rest.split_at_mut(cells);
+
         
-        for j in 1..=m {
-            let is_match = read[i - 1].eq_ignore_ascii_case(&ref_seq[j - 1]);
-            let s_char = if is_match { match_score } else { mismatch_score };
+        for idx in 0..cells {
+            m_buf[idx] = neg_inf;
+            i_buf[idx] = neg_inf;
+            d_buf[idx] = neg_inf;
+            trace_m[idx] = 0;
+            trace_i[idx] = 0;
+            trace_d[idx] = 0;
+        }
 
-            let score_diag = dp[prev_row + j - 1] + s_char;
-            let score_up = dp[prev_row + j] + gap_score;   
-            let score_left = dp[curr_row + j - 1] + gap_score; 
+        for i in 0..=n {
+            for band_k in 0..band_cols {
+                let j = i as i32 + band_k as i32 - band;
+                if j < 0 || j > m as i32 {
+                    continue;
+                }
+                let j = j as usize;
+                let idx = i * band_cols + band_k;
 
-            if score_diag >= score_up && score_diag >= score_left {
-                dp[curr_row + j] = score_diag;
-                trace[curr_row + j] = 1;
-            } else if score_up >= score_left {
-                dp[curr_row + j] = score_up;
-                trace[curr_row + j] = 2;
-            } else {
-                dp[curr_row + j] = score_left;
-                trace[curr_row + j] = 3;
+                if i == 0 && j == 0 {
+                    m_buf[idx] = 0;
+                    continue;
+                }
+
+                if i == 0 {
+                    
+                    if let Some(prev) = idx_of(i, j - 1) {
+                        let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
+                        let from_d = d_buf[prev].saturating_add(gap_ext);
+                        if from_m >= from_d {
+                            d_buf[idx] = from_m;
+                            trace_d[idx] = 0;
+                        } else {
+                            d_buf[idx] = from_d;
+                            trace_d[idx] = 2;
+                        }
+                    }
+                    continue;
+                }
+
+                if j == 0 {
+                    
+                    if let Some(prev) = idx_of(i - 1, j) {
+                        let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
+                        let from_i = i_buf[prev].saturating_add(gap_ext);
+                        if from_m >= from_i {
+                            i_buf[idx] = from_m;
+                            trace_i[idx] = 0;
+                        } else {
+                            i_buf[idx] = from_i;
+                            trace_i[idx] = 1;
+                        }
+                    }
+                    continue;
+                }
+
+                
+                if let Some(diag) = idx_of(i - 1, j - 1) {
+                    let s_char = if read[i - 1].eq_ignore_ascii_case(&ref_seq[j - 1]) {
+                        match_score
+                    } else {
+                        mismatch_score
+                    };
+
+                    let mut best_prev = m_buf[diag];
+                    let mut best_state = 0u8;
+                    if i_buf[diag] > best_prev {
+                        best_prev = i_buf[diag];
+                        best_state = 1;
+                    }
+                    if d_buf[diag] > best_prev {
+                        best_prev = d_buf[diag];
+                        best_state = 2;
+                    }
+                    m_buf[idx] = best_prev.saturating_add(s_char);
+                    trace_m[idx] = best_state;
+                }
+
+                
+                if let Some(prev) = idx_of(i - 1, j) {
+                    let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
+                    let from_i = i_buf[prev].saturating_add(gap_ext);
+                    if from_m >= from_i {
+                        i_buf[idx] = from_m;
+                        trace_i[idx] = 0;
+                    } else {
+                        i_buf[idx] = from_i;
+                        trace_i[idx] = 1;
+                    }
+                }
+
+                
+                if let Some(prev) = idx_of(i, j - 1) {
+                    let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
+                    let from_d = d_buf[prev].saturating_add(gap_ext);
+                    if from_m >= from_d {
+                        d_buf[idx] = from_m;
+                        trace_d[idx] = 0;
+                    } else {
+                        d_buf[idx] = from_d;
+                        trace_d[idx] = 2;
+                    }
+                }
             }
         }
     }
 
     
+    let end_idx = match idx_of(n, m) {
+        Some(v) => v,
+        None => return,
+    };
+
+    let cells = (n + 1) * band_cols;
+    let (m_buf, rest) = dp_buf.split_at_mut(cells);
+    let (i_buf, d_buf) = rest.split_at_mut(cells);
+
+    let mut state = 0u8;
+    let mut best = m_buf[end_idx];
+    if i_buf[end_idx] > best {
+        best = i_buf[end_idx];
+        state = 1;
+    }
+    if d_buf[end_idx] > best {
+        state = 2;
+    }
+
     let mut i = n;
     let mut j = m;
     let mut ops_len = 0usize;
 
     while i > 0 || j > 0 {
-        match trace[i * cols + j] {
-            1 => { 
-                dp[ops_len] = 0;
+        let idx = match idx_of(i, j) {
+            Some(v) => v,
+            None => break,
+        };
+        match state {
+            0 => {
+                m_buf[ops_len] = 0;
                 ops_len += 1;
+                let prev = trace_m[idx];
                 i -= 1;
                 j -= 1;
+                state = prev;
             }
-            2 => { 
-                dp[ops_len] = 1;
+            1 => {
+                m_buf[ops_len] = 1;
                 ops_len += 1;
+                let prev = trace_i[idx];
                 i -= 1;
+                state = prev;
             }
-            3 => { 
-                dp[ops_len] = 2;
+            _ => {
+                m_buf[ops_len] = 2;
                 ops_len += 1;
+                let prev = trace_d[idx];
                 j -= 1;
+                state = prev;
             }
-            _ => break, 
         }
     }
 
@@ -723,10 +855,10 @@ fn align_gap_nw(
         return;
     }
 
-    let mut curr_op = dp[ops_len - 1] as u32;
+    let mut curr_op = m_buf[ops_len - 1] as u32;
     let mut curr_len = 0u32;
     for idx in (0..ops_len).rev() {
-        let op = dp[idx] as u32;
+        let op = m_buf[idx] as u32;
         if op == curr_op {
             curr_len += 1;
         } else {
