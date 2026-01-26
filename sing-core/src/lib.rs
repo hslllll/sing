@@ -69,7 +69,7 @@ pub const CONFIG: TuningConfig = TuningConfig {
     mapq_scale: 1200.0,
     max_mapq: 60,
     band_width: 32,
-    freq_filter_max: 500,
+    freq_filter_max: 100,
 };
 
 #[derive(Debug, Clone)]
