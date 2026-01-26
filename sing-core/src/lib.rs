@@ -6,6 +6,7 @@ pub const WINDOW: usize = 16;
 pub const MIN_W: usize = WINDOW;
 pub const BATCH_SIZE: usize = 10_000;
 pub const BATCH_CAP: usize = 64;
+pub const FILTERFOR_1000BP: f64 = 500_000_000.0;
 
 const BASES: [u64; 4] = [
     0x243f_6a88_85a3_08d3,
@@ -27,7 +28,7 @@ const REMOVE: [u64; 4] = [
     rot(BASES[3], (WINDOW as u32 * ROT) % 64),
 ];
 
-const SYNC_S: usize = 12;
+const SYNC_S: usize = 8;
 const SYNC_T: usize = (WINDOW - SYNC_S) / 2;
 
 const REMOVE_S: [u64; 4] = [
@@ -54,13 +55,13 @@ pub struct TuningConfig {
 
 pub const CONFIG: TuningConfig = TuningConfig {
     freq_filter: 1000,
-    chain_max_gap: 50,
+    chain_max_gap: 100,
     seed_weight: 1,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -3,
     gap_ext: -1,
-    min_identity: 0.75,
+    min_identity: 0.7,
 };
 
 #[derive(Debug, Clone)]
@@ -187,7 +188,7 @@ where
     }
 
     let total_bases: usize = ref_seqs.iter().map(|s| s.len()).sum();
-    let freq_filter = ((total_bases as f64 / 500_000_000.0) * 1000.0) as usize;
+    let freq_filter = ((total_bases as f64 / FILTERFOR_1000BP) * 1000.0) as usize;
     let freq_filter = std::cmp::max(1000, freq_filter);
     eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
 
