@@ -8,7 +8,6 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use needletail::parse_fastx_file;
 use sing_core::{
     align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index, State,
-    BATCH_CAP, BATCH_SIZE,
 };
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
@@ -48,17 +47,19 @@ struct ReadBatch {
     quals2: Vec<Vec<u8>>,
     names: Vec<String>,
     count: usize,
+    max_size: usize,
 }
 
 impl ReadBatch {
-    fn new() -> Self {
+    fn new(max_size: usize) -> Self {
         Self {
-            seqs1: Vec::with_capacity(BATCH_SIZE),
-            quals1: Vec::with_capacity(BATCH_SIZE),
-            seqs2: Vec::with_capacity(BATCH_SIZE),
-            quals2: Vec::with_capacity(BATCH_SIZE),
-            names: Vec::with_capacity(BATCH_SIZE),
+            seqs1: Vec::with_capacity(max_size),
+            quals1: Vec::with_capacity(max_size),
+            seqs2: Vec::with_capacity(max_size),
+            quals2: Vec::with_capacity(max_size),
+            names: Vec::with_capacity(max_size),
             count: 0,
+            max_size,
         }
     }
 }
@@ -109,14 +110,16 @@ fn main() -> Result<()> {
 
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let threads = threads.min(max_hw);
+            let batch_size = threads * 512;
+            let batch_cap = threads * 4;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
             eprintln!("Index loaded.");
 
-            let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(BATCH_CAP);
-            let (recycler_tx, recycler_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(BATCH_CAP);
-            let (w_tx, w_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(BATCH_CAP);
+            let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(batch_cap);
+            let (recycler_tx, recycler_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(batch_cap);
+            let (w_tx, w_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(batch_cap);
             let paired_mode = r2.is_some();
             let mut reader_handles = Vec::new();
 
@@ -141,7 +144,7 @@ fn main() -> Result<()> {
                     let recycler_rx = recycler_rx.clone();
 
                     reader_handles.push(thread::spawn(move || {
-                        let mut batch = ReadBatch::new();
+                        let mut batch = ReadBatch::new(batch_size);
                         loop {
                             let i = pair_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if i >= pairs.len() {
@@ -190,9 +193,9 @@ fn main() -> Result<()> {
 
                                 batch.count += 1;
 
-                                if batch.count >= BATCH_SIZE {
+                                if batch.count >= batch.max_size {
                                     tx.send(batch).unwrap();
-                                    batch = recycler_rx.try_recv().unwrap_or_else(|_| ReadBatch::new());
+                                    batch = recycler_rx.try_recv().unwrap_or_else(|_| ReadBatch::new(batch_size));
                                     batch.count = 0;
                                 }
                             }
@@ -213,7 +216,7 @@ fn main() -> Result<()> {
                     let recycler_rx = recycler_rx.clone();
 
                     reader_handles.push(thread::spawn(move || {
-                        let mut batch = ReadBatch::new();
+                        let mut batch = ReadBatch::new(batch_size);
                         loop {
                             let i = r1_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if i >= r1_paths.len() {
@@ -254,9 +257,9 @@ fn main() -> Result<()> {
 
                                 batch.count += 1;
 
-                                if batch.count >= BATCH_SIZE {
+                                if batch.count >= batch.max_size {
                                     tx.send(batch).unwrap();
-                                    batch = recycler_rx.try_recv().unwrap_or_else(|_| ReadBatch::new());
+                                    batch = recycler_rx.try_recv().unwrap_or_else(|_| ReadBatch::new(batch_size));
                                     batch.count = 0;
                                 }
                             }
