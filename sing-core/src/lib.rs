@@ -5,9 +5,6 @@ use std::io::{BufReader, Read, Write};
 const WINDOW: usize = 20;
 const SYNC_S: usize = 7;
 
-pub const BATCH_SIZE: usize = 10_000;
-pub const BATCH_CAP: usize = 64;
-
 const BASES: [u64; 4] = [
     0x243f_6a88_85a3_08d3,
     0xb7e1_5162_8aed_2a6a,
