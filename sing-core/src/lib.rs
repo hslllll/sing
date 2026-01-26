@@ -57,6 +57,7 @@ pub const CONFIG: TuningConfig = TuningConfig {
 pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
+    pub freq_filter: u32,
     pub ref_seqs: Vec<Vec<u8>>,
     pub ref_names: Vec<String>,
 }
@@ -83,6 +84,9 @@ impl Index {
             seeds.push(u64::from_le_bytes(buf8));
         }
 
+        r.read_exact(&mut buf4).context("read freq_filter")?;
+        let freq_filter = u32::from_le_bytes(buf4);
+
         r.read_exact(&mut buf8).context("read ref seq count")?;
         let len = u64::from_le_bytes(buf8) as usize;
         let mut ref_seqs = Vec::with_capacity(len);
@@ -105,7 +109,7 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
-        Ok(Index { offsets, seeds, ref_seqs, ref_names })
+        Ok(Index { offsets, seeds, freq_filter, ref_seqs, ref_names })
     }
 
     pub fn to_writer<W: Write>(&self, mut w: W) -> Result<()> {
@@ -118,6 +122,8 @@ impl Index {
         for s in &self.seeds {
             w.write_all(&s.to_le_bytes())?;
         }
+
+        w.write_all(&self.freq_filter.to_le_bytes())?;
 
         w.write_all(&(self.ref_seqs.len() as u64).to_le_bytes())?;
         for seq in &self.ref_seqs {
@@ -163,8 +169,8 @@ where
         get_minimizers(&seq, &mut mins);
         for (h, p) in mins {
             let hash64 = h as u64;
-            let low = (hash64 & 0xFF) as u64;
-            let packed = (low << 56) | ((rid as u64) << 40) | (p as u64);
+            let hash16 = (hash64 & 0xFFFF) as u64;
+            let packed = (hash16 << 48) | ((rid as u64) << 32) | (p as u64);
             seeds_tmp.push((hash64, packed));
         }
         ref_seqs.push(seq);
@@ -214,7 +220,7 @@ where
         current_offset += *count;
     }
 
-    Ok(Index { offsets, seeds, ref_seqs, ref_names })
+    Ok(Index { offsets, seeds, freq_filter: freq_filter as u32, ref_seqs, ref_names })
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -308,6 +314,7 @@ pub fn get_minimizers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
 }
 
 fn collect_candidates(idx: &Index, mins: &[(u32, u32)], is_rev: bool, out: &mut Vec<Hit>) {
+    let freq_filter = idx.freq_filter as usize;
     for &(h, r_pos) in mins {
         let bucket = (h >> SHIFT) as usize;
         let start = idx.offsets[bucket] as usize;
@@ -318,18 +325,18 @@ fn collect_candidates(idx: &Index, mins: &[(u32, u32)], is_rev: bool, out: &mut 
             .unwrap_or(idx.seeds.len() as u32) as usize;
 
         let count = end - start;
-        if count > CONFIG.freq_filter {
+        if count > freq_filter {
             continue;
         }
 
         let weight = CONFIG.seed_weight;
 
-        let target_low = (h & 0xFF) as u64;
+        let target_hash = (h & 0xFFFF) as u64;
         for i in start..end {
             let seed = idx.seeds[i];
-            if (seed >> 56) == target_low {
-                let rid = ((seed >> 40) & 0xFFFF) as u32;
-                let pos = (seed & 0xFFFFFFFFFF) as u32;
+            if (seed >> 48) == target_hash {
+                let rid = ((seed >> 32) & 0xFFFF) as u32;
+                let pos = seed as u32;
 
                 let id_strand = (rid << 1) | (is_rev as u32);
                 let diag = (pos as i32) - (r_pos as i32);
