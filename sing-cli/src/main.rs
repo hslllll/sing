@@ -1,14 +1,10 @@
-use mimalloc::MiMalloc;
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{bounded, Receiver, Sender};
-use memmap2::MmapOptions;
 use needletail::parse_fastx_file;
 use sing_core::{
-    align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index, State,
+    align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index,
+    IndexLike, MappedIndex, State,
 };
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -65,10 +61,8 @@ impl ReadBatch {
     }
 }
 
-fn load_index(path: &PathBuf) -> Result<Index> {
-    let file = File::open(path)?;
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
-    Index::from_bytes(&mmap)
+fn load_index(path: &PathBuf) -> Result<MappedIndex> {
+    MappedIndex::from_path(path)
 }
 
 fn save_index(index: &Index, path: &PathBuf) -> Result<()> {
@@ -280,7 +274,9 @@ fn main() -> Result<()> {
                 };
 
                 writeln!(out, "@HD\tVN:1.6\tSO:unsorted").unwrap();
-                for (name, seq) in idx_writer.ref_names.iter().zip(idx_writer.ref_seqs.iter()) {
+                for i in 0..idx_writer.ref_count() {
+                    let name = idx_writer.ref_name(i);
+                    let seq = idx_writer.ref_seq(i);
                     writeln!(out, "@SQ\tSN:{}\tLN:{}", name, seq.len()).unwrap();
                 }
                 writeln!(out, "@RG\tID:sing\tSM:song\tPL:ILLUMINA").unwrap();
@@ -357,7 +353,7 @@ fn main() -> Result<()> {
                                 let q2 = &batch.quals2[i];
                                 let s2 = &batch.seqs2[i];
 
-                                format_sam(&mut output_chunk, name, s1, q1, &a1, &a2, true, tlen, proper_pair, &idx.ref_names);
+                                format_sam(&mut output_chunk, name, s1, q1, &a1, &a2, true, tlen, proper_pair, &idx);
                                 format_sam(
                                     &mut output_chunk,
                                     name,
@@ -368,10 +364,10 @@ fn main() -> Result<()> {
                                     false,
                                     -tlen,
                                     proper_pair,
-                                    &idx.ref_names,
+                                    &idx,
                                 );
                             } else {
-                                format_sam_single(&mut output_chunk, name, s1, q1, &a1, &idx.ref_names);
+                                format_sam_single(&mut output_chunk, name, s1, q1, &a1, &idx);
                             }
                         }
                         w_tx.send(output_chunk).unwrap();
@@ -405,7 +401,18 @@ fn main() -> Result<()> {
     std::process::exit(0);
 }
 
-fn format_sam(out: &mut Vec<u8>, name: &str, seq: &[u8], qual: &[u8], res: &Option<AlignmentResult>, mate_res: &Option<AlignmentResult>, first: bool, tlen: i32, proper_pair: bool, ref_names: &[String]) {
+fn format_sam<I: IndexLike>(
+    out: &mut Vec<u8>,
+    name: &str,
+    seq: &[u8],
+    qual: &[u8],
+    res: &Option<AlignmentResult>,
+    mate_res: &Option<AlignmentResult>,
+    first: bool,
+    tlen: i32,
+    proper_pair: bool,
+    idx: &I,
+) {
     out.extend_from_slice(name.as_bytes());
     out.push(b'\t');
     let mut flag = 0x1;
@@ -439,7 +446,7 @@ fn format_sam(out: &mut Vec<u8>, name: &str, seq: &[u8], qual: &[u8], res: &Opti
     let mut mapq = 0;
     let mut cigar_ref: Option<&Vec<u32>> = None;
     if let Some(r) = res {
-        rname = &ref_names[r.ref_id as usize];
+        rname = idx.ref_name(r.ref_id as usize);
         pos = r.pos + 1;
         mapq = r.mapq;
         cigar_ref = Some(&r.cigar);
@@ -452,10 +459,10 @@ fn format_sam(out: &mut Vec<u8>, name: &str, seq: &[u8], qual: &[u8], res: &Opti
             if m.ref_id == r.ref_id {
                 rnext = "=";
             } else {
-                rnext = &ref_names[m.ref_id as usize];
+                rnext = idx.ref_name(m.ref_id as usize);
             }
         } else {
-            rnext = &ref_names[m.ref_id as usize];
+            rnext = idx.ref_name(m.ref_id as usize);
         }
     }
     write!(out, "{}\t{}\t{}\t{}\t", flag, rname, pos, mapq).unwrap();
@@ -478,7 +485,14 @@ fn format_sam(out: &mut Vec<u8>, name: &str, seq: &[u8], qual: &[u8], res: &Opti
     out.push(b'\n');
 }
 
-fn format_sam_single(out: &mut Vec<u8>, name: &str, seq: &[u8], qual: &[u8], res: &Option<AlignmentResult>, ref_names: &[String]) {
+fn format_sam_single<I: IndexLike>(
+    out: &mut Vec<u8>,
+    name: &str,
+    seq: &[u8],
+    qual: &[u8],
+    res: &Option<AlignmentResult>,
+    idx: &I,
+) {
     out.extend_from_slice(name.as_bytes());
     out.push(b'\t');
     let mut flag = 0u16;
@@ -496,7 +510,7 @@ fn format_sam_single(out: &mut Vec<u8>, name: &str, seq: &[u8], qual: &[u8], res
     let mut mapq = 0;
     let mut cigar_ref: Option<&Vec<u32>> = None;
     if let Some(r) = res {
-        rname = &ref_names[r.ref_id as usize];
+        rname = idx.ref_name(r.ref_id as usize);
         pos = r.pos + 1;
         mapq = r.mapq;
         cigar_ref = Some(&r.cigar);

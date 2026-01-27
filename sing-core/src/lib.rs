@@ -1,6 +1,15 @@
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use anyhow::{bail, Context, Result};
+use bytemuck::try_cast_slice;
+use memmap2::{Mmap, MmapOptions};
 use std::borrow::Cow;
+use std::fs::File;
 use std::io::{BufReader, Read, Write};
+use std::ops::Range;
+use std::path::Path;
 
 const WINDOW: usize = 16;
 const SYNC_S: usize = 8;
@@ -78,6 +87,16 @@ pub struct Index {
     pub genome_size: u64,
     pub ref_seqs: Vec<Vec<u8>>,
     pub ref_names: Vec<String>,
+}
+
+pub trait IndexLike {
+    fn offsets(&self) -> &[u32];
+    fn seeds(&self) -> &[u64];
+    fn freq_filter(&self) -> u32;
+    fn genome_size(&self) -> u64;
+    fn ref_count(&self) -> usize;
+    fn ref_seq(&self, id: usize) -> &[u8];
+    fn ref_name(&self, id: usize) -> &str;
 }
 
 impl Index {
@@ -233,6 +252,199 @@ impl Index {
             w.write_all(bytes)?;
         }
         Ok(())
+    }
+}
+
+impl IndexLike for Index {
+    fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    fn seeds(&self) -> &[u64] {
+        &self.seeds
+    }
+
+    fn freq_filter(&self) -> u32 {
+        self.freq_filter
+    }
+
+    fn genome_size(&self) -> u64 {
+        self.genome_size
+    }
+
+    fn ref_count(&self) -> usize {
+        self.ref_seqs.len()
+    }
+
+    fn ref_seq(&self, id: usize) -> &[u8] {
+        &self.ref_seqs[id]
+    }
+
+    fn ref_name(&self, id: usize) -> &str {
+        &self.ref_names[id]
+    }
+}
+
+pub struct MappedIndex {
+    mmap: Mmap,
+    offsets_range: Range<usize>,
+    seeds_range: Range<usize>,
+    freq_filter: u32,
+    genome_size: u64,
+    ref_seq_ranges: Vec<Range<usize>>,
+    ref_name_ranges: Vec<Range<usize>>,
+}
+
+impl MappedIndex {
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        Self::from_mmap(mmap)
+    }
+
+    fn from_mmap(mmap: Mmap) -> Result<Self> {
+        let data = &mmap[..];
+        let mut pos = 0usize;
+
+        fn read_u64(data: &[u8], pos: &mut usize, label: &str) -> Result<u64> {
+            if *pos + 8 > data.len() {
+                bail!("{}: unexpected EOF", label);
+            }
+            let val = u64::from_le_bytes(data[*pos..*pos + 8].try_into().unwrap());
+            *pos += 8;
+            Ok(val)
+        }
+
+        fn read_u32(data: &[u8], pos: &mut usize, label: &str) -> Result<u32> {
+            if *pos + 4 > data.len() {
+                bail!("{}: unexpected EOF", label);
+            }
+            let val = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
+            *pos += 4;
+            Ok(val)
+        }
+
+        let offsets_len = read_u64(data, &mut pos, "read offsets len")? as usize;
+        let offsets_bytes = offsets_len
+            .checked_mul(4)
+            .and_then(|n| pos.checked_add(n))
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read offsets: unexpected EOF"))?;
+        let offsets_range = pos..offsets_bytes;
+        try_cast_slice::<u8, u32>(&data[offsets_range.clone()])
+            .map_err(|_| anyhow::anyhow!("read offsets: unaligned data"))?;
+        pos = offsets_bytes;
+
+        let seeds_len = read_u64(data, &mut pos, "read seeds len")? as usize;
+        let seeds_bytes = seeds_len
+            .checked_mul(8)
+            .and_then(|n| pos.checked_add(n))
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read seeds: unexpected EOF"))?;
+        let seeds_range = pos..seeds_bytes;
+        try_cast_slice::<u8, u64>(&data[seeds_range.clone()])
+            .map_err(|_| anyhow::anyhow!("read seeds: unaligned data"))?;
+        pos = seeds_bytes;
+
+        let freq_filter = read_u32(data, &mut pos, "read freq_filter")?;
+        let genome_size = read_u64(data, &mut pos, "read genome_size")?;
+
+        let ref_count = read_u64(data, &mut pos, "read ref seq count")? as usize;
+        let mut ref_seq_ranges = Vec::with_capacity(ref_count);
+        for _ in 0..ref_count {
+            let slen = read_u64(data, &mut pos, "read seq len")? as usize;
+            let end = pos
+                .checked_add(slen)
+                .filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow::anyhow!("read seq bytes: unexpected EOF"))?;
+            ref_seq_ranges.push(pos..end);
+            pos = end;
+        }
+
+        let name_count = read_u64(data, &mut pos, "read name count")? as usize;
+        let mut ref_name_ranges = Vec::with_capacity(name_count);
+        for _ in 0..name_count {
+            let slen = read_u64(data, &mut pos, "read name len")? as usize;
+            let end = pos
+                .checked_add(slen)
+                .filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow::anyhow!("read name bytes: unexpected EOF"))?;
+            let name_buf = &data[pos..end];
+            std::str::from_utf8(name_buf).context("utf8 ref name")?;
+            ref_name_ranges.push(pos..end);
+            pos = end;
+        }
+
+        Ok(Self {
+            mmap,
+            offsets_range,
+            seeds_range,
+            freq_filter,
+            genome_size,
+            ref_seq_ranges,
+            ref_name_ranges,
+        })
+    }
+}
+
+impl IndexLike for MappedIndex {
+    fn offsets(&self) -> &[u32] {
+        bytemuck::cast_slice(&self.mmap[self.offsets_range.clone()])
+    }
+
+    fn seeds(&self) -> &[u64] {
+        bytemuck::cast_slice(&self.mmap[self.seeds_range.clone()])
+    }
+
+    fn freq_filter(&self) -> u32 {
+        self.freq_filter
+    }
+
+    fn genome_size(&self) -> u64 {
+        self.genome_size
+    }
+
+    fn ref_count(&self) -> usize {
+        self.ref_seq_ranges.len()
+    }
+
+    fn ref_seq(&self, id: usize) -> &[u8] {
+        &self.mmap[self.ref_seq_ranges[id].clone()]
+    }
+
+    fn ref_name(&self, id: usize) -> &str {
+        let bytes = &self.mmap[self.ref_name_ranges[id].clone()];
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    }
+}
+
+impl<T: IndexLike> IndexLike for std::sync::Arc<T> {
+    fn offsets(&self) -> &[u32] {
+        self.as_ref().offsets()
+    }
+
+    fn seeds(&self) -> &[u64] {
+        self.as_ref().seeds()
+    }
+
+    fn freq_filter(&self) -> u32 {
+        self.as_ref().freq_filter()
+    }
+
+    fn genome_size(&self) -> u64 {
+        self.as_ref().genome_size()
+    }
+
+    fn ref_count(&self) -> usize {
+        self.as_ref().ref_count()
+    }
+
+    fn ref_seq(&self, id: usize) -> &[u8] {
+        self.as_ref().ref_seq(id)
+    }
+
+    fn ref_name(&self, id: usize) -> &str {
+        self.as_ref().ref_name(id)
     }
 }
 
@@ -476,16 +688,17 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     }
 }
 
-fn collect_candidates(idx: &Index, mins: &[(u32, u32)], is_rev: bool, out: &mut Vec<Hit>) {
-    let freq_filter = idx.freq_filter as usize;
+fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, out: &mut Vec<Hit>) {
+    let freq_filter = idx.freq_filter() as usize;
     for &(h, r_pos) in mins {
         let bucket = (h >> SHIFT) as usize;
-        let start = idx.offsets[bucket] as usize;
-        let end = idx
-            .offsets
+        let offsets = idx.offsets();
+        let seeds = idx.seeds();
+        let start = offsets[bucket] as usize;
+        let end = offsets
             .get(bucket + 1)
             .copied()
-            .unwrap_or(idx.seeds.len() as u32) as usize;
+            .unwrap_or(seeds.len() as u32) as usize;
 
         let count = end - start;
 
@@ -497,7 +710,7 @@ fn collect_candidates(idx: &Index, mins: &[(u32, u32)], is_rev: bool, out: &mut 
 
         let target_hash = (h & 0xFFFF) as u64;
         for i in start..end {
-            let seed = idx.seeds[i];
+            let seed = seeds[i];
             if (seed >> 48) == target_hash {
                 let rid = ((seed >> 32) & 0xFFFF) as u32;
                 let pos = seed as u32;
@@ -1086,7 +1299,7 @@ fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32
     (nm, String::new(), as_score)
 }
 
-pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> Option<AlignmentResult> {
+pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec<u8>) -> Option<AlignmentResult> {
     let State { mins, candidates, dp_buf, trace_buf } = state;
 
     candidates.clear();
@@ -1128,7 +1341,7 @@ pub fn align(seq: &[u8], idx: &Index, state: &mut State, rev: &mut Vec<u8>) -> O
         let ref_id = (hits[0].id_strand >> 1) as i32;
         let is_rev = (hits[0].id_strand & 1) == 1;
         let target_seq = if is_rev { rev } else { seq };
-        let ref_seq = &idx.ref_seqs[ref_id as usize];
+        let ref_seq = idx.ref_seq(ref_id as usize);
 
         let (cigar, pos) = gen_cigar(hits, target_seq, ref_seq, dp_buf, trace_buf);
         if pos < 0 {

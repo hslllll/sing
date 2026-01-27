@@ -57,6 +57,32 @@ else
     echo "dwgsim already installed"
 fi
 
+echo "Installing minimap2..."
+if ! command -v minimap2 &> /dev/null; then
+    cd /tmp
+    if [ ! -d "minimap2-2.30_x64-linux" ]; then
+        curl -L https://github.com/lh3/minimap2/releases/download/v2.30/minimap2-2.30_x64-linux.tar.bz2 | tar -jxvf -
+    fi
+    $SUDO cp /tmp/minimap2-2.30_x64-linux/minimap2 /usr/local/bin/
+    $SUDO chmod +x /usr/local/bin/minimap2
+    echo "minimap2 installed successfully"
+else
+    echo "minimap2 already installed"
+fi
+
+echo "Installing bwa-mem2..."
+if ! command -v bwa-mem2 &> /dev/null || [ ! -f "/usr/local/bin/bwa-mem2.avx2" ]; then
+    cd /tmp
+    if [ ! -d "bwa-mem2-2.2.1_x64-linux" ]; then
+        curl -L https://github.com/bwa-mem2/bwa-mem2/releases/download/v2.2.1/bwa-mem2-2.2.1_x64-linux.tar.bz2 | tar jxf -
+    fi
+    $SUDO cp -f /tmp/bwa-mem2-2.2.1_x64-linux/bwa-mem2* /usr/local/bin/
+    $SUDO chmod +x /usr/local/bin/bwa-mem2*
+    echo "bwa-mem2 installed successfully"
+else
+    echo "bwa-mem2 already installed"
+fi
+
 echo "Installing Columba..."
 if ! command -v columba &> /dev/null; then
     cd /tmp
