@@ -127,7 +127,7 @@ fn main() -> Result<()> {
             let idx = Arc::new(load_index(&index)?);
             eprintln!("Index loaded.");
 
-            let channel_cap = worker_threads * 64;
+            let channel_cap = worker_threads * 32;
             let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(channel_cap);
             let (recycle_tx, recycle_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(channel_cap);
             let paired_mode = r2.is_some();
@@ -409,13 +409,14 @@ fn main() -> Result<()> {
                 h.join().unwrap();
             }
             drop(tx);
+            drop(recycle_rx);  
 
             for h in handles {
                 h.join().unwrap();
             }
+            drop(recycle_tx);  
             
             
-            shared_writer.lock().unwrap().flush().unwrap();
             shared_writer.lock().unwrap().flush().unwrap();
 
             let total = total_reads.load(std::sync::atomic::Ordering::Relaxed);
