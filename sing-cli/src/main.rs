@@ -134,8 +134,7 @@ fn main() -> Result<()> {
             let paired_mode = r2.is_some();
             let mut reader_handles = Vec::new();
 
-            eprintln!("Mapping with {} worker threads ({} readers, 1 writer)...", 
-                      worker_threads, reader_threads);
+            eprintln!("Mapping with {} worker threads...", worker_threads);
             let total_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mapped_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
