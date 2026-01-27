@@ -9,8 +9,8 @@ use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
-const WINDOW: usize = 16;
-const SYNC_S: usize = 4;
+const WINDOW: usize = 20;
+const SYNC_S: usize = 2;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
@@ -810,54 +810,99 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
     span
 }
 
-
-fn gen_cigar(
-    hits: &[Hit],
-    read_seq: &[u8],
-    ref_seq: &[u8],
- ) -> (Vec<u32>, i32, usize) {
-    if hits.is_empty() {
-        return (vec![], 0, 0);
+#[inline(always)]
+fn hough_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> Option<(Vec<u32>, i32, usize)> {
+    if hits.len() < 8 {
+        return None;
     }
 
-    let mut cigar = Vec::with_capacity(32);
-
-    let diag_sum: i64 = hits
+    let bin = (WINDOW as i32 / 2).max(1);
+    let mut diags: Vec<(i32, u32, u32)> = hits
         .iter()
-        .map(|h| (h.ref_pos as i64) - (h.read_pos as i64))
-        .sum();
-    let diag = (diag_sum / hits.len() as i64) as i32;
+        .map(|h| ((h.ref_pos as i32) - (h.read_pos as i32), h.read_pos, h.ref_pos))
+        .collect();
+
+    diags.sort_unstable_by_key(|(d, _, _)| d.div_euclid(bin));
+
+    let mut best = (0i32, 0usize, 0usize);
+    let mut second = (0i32, 0usize, 0usize);
+    let mut i = 0usize;
+    while i < diags.len() {
+        let key = diags[i].0.div_euclid(bin);
+        let start = i;
+        let mut end = i + 1;
+        while end < diags.len() && diags[end].0.div_euclid(bin) == key {
+            end += 1;
+        }
+        let count = (end - start) as i32;
+        if count > best.0 {
+            second = best;
+            best = (count, start, end);
+        } else if count > second.0 {
+            second = (count, start, end);
+        }
+        i = end;
+    }
+
+    if best.0 < 4 || second.0 < 3 {
+        return None;
+    }
+
+    let best_diag = diags[best.1..best.2]
+        .iter()
+        .map(|(d, _, _)| *d as i64)
+        .sum::<i64>()
+        / (best.2 - best.1) as i64;
+    let second_diag = diags[second.1..second.2]
+        .iter()
+        .map(|(d, _, _)| *d as i64)
+        .sum::<i64>()
+        / (second.2 - second.1) as i64;
+
+    let diag_diff = (second_diag - best_diag) as i32;
+    if diag_diff.abs() < 3 {
+        return None;
+    }
+
+    let best_mid = (best.1 + best.2) / 2;
+    let second_mid = (second.1 + second.2) / 2;
+    let (first, _second) = if diags[best_mid].1 <= diags[second_mid].1 {
+        (best, second)
+    } else {
+        (second, best)
+    };
+
+    let r_split = diags[first.2 - 1].1 as usize;
+    let g_split = (r_split as i32 + (best_diag as i32)).max(0) as usize;
+
+    if r_split >= read_seq.len() || g_split >= ref_seq.len() {
+        return None;
+    }
 
     let read_len = read_seq.len();
     let ref_len = ref_seq.len();
 
-    let (leading_clip, ref_start) = if diag < 0 {
-        ((-diag) as usize, 0usize)
+    let mut cigar = Vec::with_capacity(8);
+    if r_split > 0 {
+        push_cigar(&mut cigar, r_split as u32, 0);
+    }
+
+    if diag_diff > 0 {
+        push_cigar(&mut cigar, diag_diff as u32, 2);
     } else {
-        (0usize, diag as usize)
-    };
-
-    if leading_clip >= read_len || ref_start >= ref_len {
-        push_cigar(&mut cigar, read_len as u32, 4);
-        return (cigar, ref_start as i32, 0);
+        push_cigar(&mut cigar, (-diag_diff) as u32, 1);
     }
 
-    let max_align_len = read_len - leading_clip;
-    let ref_avail = ref_len.saturating_sub(ref_start);
-    let aligned_len = max_align_len.min(ref_avail);
-    let trailing_clip = read_len - leading_clip - aligned_len;
+    let r_rest = read_len.saturating_sub(r_split);
+    let g_rest = ref_len.saturating_sub(g_split);
+    let tail = r_rest.min(g_rest);
+    if tail > 0 {
+        push_cigar(&mut cigar, tail as u32, 0);
+    }
+    let aligned_len = r_split + tail;
+    let ref_start = (best_diag as i32).max(0);
 
-    if leading_clip > 0 {
-        push_cigar(&mut cigar, leading_clip as u32, 4);
-    }
-    if aligned_len > 0 {
-        push_cigar(&mut cigar, aligned_len as u32, 0);
-    }
-    if trailing_clip > 0 {
-        push_cigar(&mut cigar, trailing_clip as u32, 4);
-    }
-
-    (cigar, ref_start as i32, aligned_len)
+    Some((cigar, ref_start, aligned_len))
 }
 
 fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32]) -> (i32, String, i32) {
@@ -949,7 +994,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     }
 
     let (c1, c2) = find_top_chains(candidates);
-    let min_identity = (SYNC_S as f32) / (WINDOW as f32);
+    let min_identity = (0.5 + (SYNC_S as f32) / (WINDOW as f32)).min(1.0);
     let evaluate = |chain: &ChainRes,
                     seq: &[u8],
                     rev: &[u8],
@@ -967,7 +1012,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         let target_seq = if is_rev { rev } else { seq };
         let ref_seq = idx.ref_seq(ref_id as usize);
 
-        let (cigar, pos, aligned_len) = gen_cigar(hits, target_seq, ref_seq);
+        let (cigar, pos, aligned_len) = hough_indel_cigar(hits, target_seq, ref_seq)?;
         if pos < 0 || (pos as usize) >= ref_seq.len() {
             return None;
         }
