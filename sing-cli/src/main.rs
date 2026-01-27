@@ -59,6 +59,10 @@ impl ReadBatch {
             max_size,
         }
     }
+
+    fn clear(&mut self) {
+        self.count = 0;
+    }
 }
 
 fn load_index(path: &PathBuf) -> Result<MappedIndex> {
@@ -113,7 +117,7 @@ fn main() -> Result<()> {
             eprintln!("Index loaded.");
 
             let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(batch_cap);
-            let (recycler_tx, recycler_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(batch_cap);
+            let (recycle_tx, recycle_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(batch_cap);
             let (w_tx, w_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(batch_cap);
             let paired_mode = r2.is_some();
             let mut reader_handles = Vec::new();
@@ -136,10 +140,13 @@ fn main() -> Result<()> {
                     let pairs = pairs.clone();
                     let pair_idx = pair_idx.clone();
                     let tx = tx.clone();
-                    let recycler_rx = recycler_rx.clone();
+                    let recycle_rx = recycle_rx.clone();
 
                     reader_handles.push(thread::spawn(move || {
-                        let mut batch = ReadBatch::new(batch_size);
+                        let mut batch = recycle_rx
+                            .try_recv()
+                            .unwrap_or_else(|_| ReadBatch::new(batch_size));
+                        batch.clear();
                         loop {
                             let i = pair_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if i >= pairs.len() {
@@ -190,8 +197,10 @@ fn main() -> Result<()> {
 
                                 if batch.count >= batch.max_size {
                                     tx.send(batch).unwrap();
-                                    batch = recycler_rx.try_recv().unwrap_or_else(|_| ReadBatch::new(batch_size));
-                                    batch.count = 0;
+                                    batch = recycle_rx
+                                        .try_recv()
+                                        .unwrap_or_else(|_| ReadBatch::new(batch_size));
+                                    batch.clear();
                                 }
                             }
                         }
@@ -208,10 +217,13 @@ fn main() -> Result<()> {
                     let r1_paths = r1_paths.clone();
                     let r1_idx = r1_idx.clone();
                     let tx = tx.clone();
-                    let recycler_rx = recycler_rx.clone();
+                    let recycle_rx = recycle_rx.clone();
 
                     reader_handles.push(thread::spawn(move || {
-                        let mut batch = ReadBatch::new(batch_size);
+                        let mut batch = recycle_rx
+                            .try_recv()
+                            .unwrap_or_else(|_| ReadBatch::new(batch_size));
+                        batch.clear();
                         loop {
                             let i = r1_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if i >= r1_paths.len() {
@@ -254,8 +266,10 @@ fn main() -> Result<()> {
 
                                 if batch.count >= batch.max_size {
                                     tx.send(batch).unwrap();
-                                    batch = recycler_rx.try_recv().unwrap_or_else(|_| ReadBatch::new(batch_size));
-                                    batch.count = 0;
+                                    batch = recycle_rx
+                                        .try_recv()
+                                        .unwrap_or_else(|_| ReadBatch::new(batch_size));
+                                    batch.clear();
                                 }
                             }
                         }
@@ -269,8 +283,8 @@ fn main() -> Result<()> {
             let idx_writer = idx.clone();
             let writer = thread::spawn(move || {
                 let mut out: Box<dyn Write> = match output {
-                    Some(p) => Box::new(BufWriter::new(File::create(p).unwrap())),
-                    None => Box::new(BufWriter::new(std::io::stdout())),
+                    Some(p) => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p).unwrap())),
+                    None => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout())),
                 };
 
                 writeln!(out, "@HD\tVN:1.6\tSO:unsorted").unwrap();
@@ -291,7 +305,7 @@ fn main() -> Result<()> {
             for _ in 0..threads {
                 let rx = rx.clone();
                 let w_tx = w_tx.clone();
-                let recycler_tx = recycler_tx.clone();
+                let recycle_tx = recycle_tx.clone();
                 let idx = idx.clone();
                 let total_reads = total_reads.clone();
                 let mapped_reads = mapped_reads.clone();
@@ -371,7 +385,7 @@ fn main() -> Result<()> {
                             }
                         }
                         w_tx.send(output_chunk).unwrap();
-                        let _ = recycler_tx.try_send(batch);
+                        let _ = recycle_tx.send(batch);
                     }
                 }));
             }
