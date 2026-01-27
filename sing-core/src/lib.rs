@@ -11,8 +11,8 @@ use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
-const WINDOW: usize = 16;
-const SYNC_S: usize = 8;
+const WINDOW: usize = 18;
+const SYNC_S: usize = 2;
 
 const BASES: [u64; 4] = [
     0x243f_6a88_85a3_08d3,
