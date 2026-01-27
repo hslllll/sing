@@ -33,8 +33,8 @@ enum Commands {
         r2: Option<Vec<PathBuf>>,
         #[arg(short, long)]
         output: Option<PathBuf>,
-        #[arg(short, long, default_value_t = 4)]
-        threads: usize,
+        #[arg(short, long)]
+        threads: Option<usize>,
     },
 }
 
@@ -113,7 +113,7 @@ fn main() -> Result<()> {
             }
 
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-            let threads = threads.min(max_hw);
+            let threads = threads.unwrap_or(max_hw).min(max_hw).max(1);
             let batch_size = threads * 2048;
             let batch_cap = threads * 32;
 

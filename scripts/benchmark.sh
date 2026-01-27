@@ -50,6 +50,7 @@ check_tool() {
         exit 1
     fi
 }
+
 check_tool dwgsim
 check_tool minimap2
 check_tool bowtie2

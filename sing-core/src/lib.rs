@@ -4,6 +4,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
+use memmap2::MmapOptions;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
@@ -270,8 +271,21 @@ impl IndexLike for Index {
     }
 }
 
+enum IndexBuffer {
+    Mmap(memmap2::Mmap),
+}
+
+impl IndexBuffer {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mmap(mmap) => mmap.as_ref(),
+        }
+    }
+}
+
 pub struct InMemoryIndex {
-    buf: Vec<u8>,
+    buf: IndexBuffer,
     offsets_ptr: *const u32,
     offsets_len: usize,
     seeds_ptr: *const u64,
@@ -287,14 +301,13 @@ unsafe impl Sync for InMemoryIndex {}
 
 impl InMemoryIndex {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf).context("read index file")?;
-        Self::from_bytes(buf)
+        let file = File::open(path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file).context("mmap index file")? };
+        Self::from_data(IndexBuffer::Mmap(mmap))
     }
 
-    fn from_bytes(buf: Vec<u8>) -> Result<Self> {
-        let data = &buf[..];
+    fn from_data(buf: IndexBuffer) -> Result<Self> {
+        let data = buf.as_slice();
         let mut pos = 0usize;
 
         fn read_u64(data: &[u8], pos: &mut usize, label: &str) -> Result<u64> {
@@ -406,11 +419,13 @@ impl IndexLike for InMemoryIndex {
     }
 
     fn ref_seq(&self, id: usize) -> &[u8] {
-        &self.buf[self.ref_seq_ranges[id].clone()]
+        let data = self.buf.as_slice();
+        &data[self.ref_seq_ranges[id].clone()]
     }
 
     fn ref_name(&self, id: usize) -> &str {
-        let bytes = &self.buf[self.ref_name_ranges[id].clone()];
+        let data = self.buf.as_slice();
+        let bytes = &data[self.ref_name_ranges[id].clone()];
         unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 }
@@ -722,10 +737,9 @@ fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
     }
 
     let bin_width = (WINDOW as i32).max(1);
-    let mut counts: HashMap<(u32, i32), u32> = HashMap::new();
+    let mut counts: HashMap<(u32, i32), u32> = HashMap::with_capacity(candidates.len() / 2 + 1);
     for hit in candidates.iter() {
-        let diag = hit.ref_pos as i32 - hit.read_pos as i32;
-        let bin = diag.div_euclid(bin_width);
+        let bin = hit.diag.div_euclid(bin_width);
         *counts.entry((hit.id_strand, bin)).or_insert(0) += 1;
     }
 
@@ -749,31 +763,41 @@ fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
         return (ChainRes::default(), ChainRes::default());
     }
 
-    let mut best_hits = Vec::new();
-    let mut second_hits = Vec::new();
-    let mut rest = Vec::with_capacity(candidates.len());
+    let mut reordered = Vec::with_capacity(candidates.len());
 
-    for hit in candidates.drain(..) {
-        let diag = hit.ref_pos as i32 - hit.read_pos as i32;
-        let bin = diag.div_euclid(bin_width);
-        let key = (hit.id_strand, bin);
-        if Some(key) == best_key {
-            best_hits.push(hit);
-        } else if Some(key) == second_key {
-            second_hits.push(hit);
-        } else {
-            rest.push(hit);
+    if let Some(key) = best_key {
+        for hit in candidates.iter() {
+            let bin = hit.diag.div_euclid(bin_width);
+            if (hit.id_strand, bin) == key {
+                reordered.push(*hit);
+            }
         }
     }
 
+    if let Some(key) = second_key {
+        for hit in candidates.iter() {
+            let bin = hit.diag.div_euclid(bin_width);
+            if (hit.id_strand, bin) == key {
+                reordered.push(*hit);
+            }
+        }
+    }
+
+    for hit in candidates.iter() {
+        let bin = hit.diag.div_euclid(bin_width);
+        let key = (hit.id_strand, bin);
+        if Some(key) != best_key && Some(key) != second_key {
+            reordered.push(*hit);
+        }
+    }
+
+    *candidates = reordered;
+
     let best_start = 0usize;
-    let best_end = best_hits.len();
-    candidates.extend(best_hits);
+    let best_end = best_count as usize;
 
     let second_start = best_end;
-    let second_end = second_start + second_hits.len();
-    candidates.extend(second_hits);
-    candidates.extend(rest);
+    let second_end = second_start + second_count as usize;
 
     let best_chain = ChainRes { score: best_count as i32, start: best_start, end: best_end };
     let second_chain = if second_count > 0 && second_end > second_start {
