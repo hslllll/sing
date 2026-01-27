@@ -118,8 +118,8 @@ fn main() -> Result<()> {
 
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let threads = threads.unwrap_or(max_hw).min(max_hw).max(1);
-            let batch_size = threads * 2048;
-            let batch_cap = threads * 32;
+            let batch_size = threads * 256;
+            let batch_cap = threads * 16;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
@@ -144,7 +144,7 @@ fn main() -> Result<()> {
                 let pairs: Vec<(PathBuf, PathBuf)> = r1.into_iter().zip(r2.into_iter()).collect();
                 let pair_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-                let reader_threads = threads;
+                let reader_threads = (threads / 2).max(1);
                 for _ in 0..reader_threads {
                     let pairs = pairs.clone();
                     let pair_idx = pair_idx.clone();
@@ -221,7 +221,7 @@ fn main() -> Result<()> {
             } else {
                 let r1_paths = r1.clone();
                 let r1_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let reader_threads = threads;
+                let reader_threads = (threads / 2).max(1);
                 for _ in 0..reader_threads {
                     let r1_paths = r1_paths.clone();
                     let r1_idx = r1_idx.clone();
