@@ -314,7 +314,7 @@ fn main() -> Result<()> {
                     let mut state = State::new();
                     let mut rev_buf = Vec::new();
                     while let Ok(batch) = rx.recv() {
-                        let mut output_chunk = Vec::with_capacity(batch.count * 200);
+                        let mut output_chunk = Vec::with_capacity(batch.count * 800);
                         for i in 0..batch.count {
                             let s1 = &batch.seqs1[i];
                             let q1 = &batch.quals1[i];
