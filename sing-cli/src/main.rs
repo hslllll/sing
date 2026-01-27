@@ -4,7 +4,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use needletail::parse_fastx_file;
 use sing_core::{
     align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index,
@@ -127,8 +127,9 @@ fn main() -> Result<()> {
             let idx = Arc::new(load_index(&index)?);
             eprintln!("Index loaded.");
 
-            let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = unbounded();
-            let (recycle_tx, recycle_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = unbounded();
+            let channel_cap = worker_threads * 64;
+            let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(channel_cap);
+            let (recycle_tx, recycle_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(channel_cap);
             let paired_mode = r2.is_some();
             let mut reader_handles = Vec::new();
 
