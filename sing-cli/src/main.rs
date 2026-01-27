@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use needletail::parse_fastx_file;
 use sing_core::{
     align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index,
@@ -98,6 +98,19 @@ fn build_from_reference(reference: PathBuf, output: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn try_send_retry<T>(sender: &Sender<T>, mut value: T) {
+    loop {
+        match sender.try_send(value) {
+            Ok(()) => return,
+            Err(TrySendError::Full(v)) => {
+                value = v;
+                std::thread::yield_now();
+            }
+            Err(TrySendError::Disconnected(_)) => return,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Commands::Build { reference, output } => {
@@ -111,7 +124,7 @@ fn main() -> Result<()> {
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let threads = threads.min(max_hw);
             let batch_size = threads * 2048;
-            let batch_cap = threads * 16;
+            let batch_cap = threads * 8;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
@@ -197,7 +210,7 @@ fn main() -> Result<()> {
                                 batch.count += 1;
 
                                 if batch.count >= batch.max_size {
-                                    tx.send(batch).unwrap();
+                                    try_send_retry(&tx, batch);
                                     batch = recycle_rx
                                         .try_recv()
                                         .unwrap_or_else(|_| ReadBatch::new(batch_size));
@@ -206,7 +219,7 @@ fn main() -> Result<()> {
                             }
                         }
                         if batch.count > 0 {
-                            tx.send(batch).unwrap();
+                            try_send_retry(&tx, batch);
                         }
                     }));
                 }
@@ -266,7 +279,7 @@ fn main() -> Result<()> {
                                 batch.count += 1;
 
                                 if batch.count >= batch.max_size {
-                                    tx.send(batch).unwrap();
+                                    try_send_retry(&tx, batch);
                                     batch = recycle_rx
                                         .try_recv()
                                         .unwrap_or_else(|_| ReadBatch::new(batch_size));
@@ -275,7 +288,7 @@ fn main() -> Result<()> {
                             }
                         }
                         if batch.count > 0 {
-                            tx.send(batch).unwrap();
+                            try_send_retry(&tx, batch);
                         }
                     }));
                 }
@@ -385,8 +398,8 @@ fn main() -> Result<()> {
                                 format_sam_single(&mut output_chunk, name, s1, q1, &a1, &idx);
                             }
                         }
-                        w_tx.send(output_chunk).unwrap();
-                        let _ = recycle_tx.send(batch);
+                        try_send_retry(&w_tx, output_chunk);
+                        try_send_retry(&recycle_tx, batch);
                     }
                 }));
             }
