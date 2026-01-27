@@ -121,7 +121,7 @@ fn main() -> Result<()> {
                 bail!("Provide at least one -1 input file");
             }
 
-            let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+            let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
             let threads = threads.min(max_hw);
             let batch_size = threads * 2048;
             let batch_cap = threads * 8;
@@ -149,7 +149,7 @@ fn main() -> Result<()> {
                 let pairs: Vec<(PathBuf, PathBuf)> = r1.into_iter().zip(r2.into_iter()).collect();
                 let pair_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-                let reader_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let reader_threads = threads;
                 for _ in 0..reader_threads {
                     let pairs = pairs.clone();
                     let pair_idx = pair_idx.clone();
