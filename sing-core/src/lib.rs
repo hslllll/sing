@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::path::Path;
 
 const WINDOW: usize = 16;
-const SYNC_S: usize = 2;
+const SYNC_S: usize = 4;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),

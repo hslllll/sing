@@ -295,6 +295,7 @@ fn main() -> Result<()> {
             }
 
             let idx_writer = idx.clone();
+            let max_write_merge = std::cmp::min(std::cmp::max(threads * 1024 * 1024, 8 * 1024 * 1024), 64 * 1024 * 1024);
             let writer = thread::spawn(move || {
                 let mut out: Box<dyn Write> = match output {
                     Some(p) => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p).unwrap())),
@@ -310,7 +311,13 @@ fn main() -> Result<()> {
                 writeln!(out, "@RG\tID:sing\tSM:song\tPL:ILLUMINA").unwrap();
                 writeln!(out, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION).unwrap();
 
-                while let Ok(chunk) = w_rx.recv() {
+                while let Ok(mut chunk) = w_rx.recv() {
+                    while let Ok(next) = w_rx.try_recv() {
+                        if chunk.len() + next.len() > max_write_merge {
+                            break;
+                        }
+                        chunk.extend_from_slice(&next);
+                    }
                     out.write_all(&chunk).unwrap();
                 }
             });
