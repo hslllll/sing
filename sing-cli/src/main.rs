@@ -316,6 +316,7 @@ fn main() -> Result<()> {
                     }
                     out.write_all(&chunk).unwrap();
                 }
+                out.flush().unwrap();  
             });
 
             let mut handles = Vec::new();
@@ -415,7 +416,7 @@ fn main() -> Result<()> {
             for h in handles {
                 h.join().unwrap();
             }
-            drop(w_tx);
+            drop(w_tx);  
             writer.join().unwrap();
 
             let total = total_reads.load(std::sync::atomic::Ordering::Relaxed);
@@ -427,6 +428,7 @@ fn main() -> Result<()> {
             };
             eprintln!("Total reads: {}", total);
             eprintln!("Mapped reads: {} ({:.2}%)", mapped, rate);
+            eprintln!("Done.");  
         }
     }
     std::process::exit(0);
