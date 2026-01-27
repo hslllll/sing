@@ -4,7 +4,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use needletail::parse_fastx_file;
 use sing_core::{
     align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index,
@@ -121,16 +121,15 @@ fn main() -> Result<()> {
             
             let reader_threads = (worker_threads / 4).max(1).min(8);
             
-            let batch_size = worker_threads * 256;
-            let batch_cap = worker_threads * 16;
+            let batch_size = worker_threads * 32;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
             eprintln!("Index loaded.");
 
-            let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(batch_cap);
-            let (recycle_tx, recycle_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(batch_cap);
-            let (w_tx, w_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(batch_cap);
+            let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = unbounded();
+            let (recycle_tx, recycle_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = unbounded();
+            let (w_tx, w_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = unbounded();
             let paired_mode = r2.is_some();
             let mut reader_handles = Vec::new();
 
@@ -316,7 +315,7 @@ fn main() -> Result<()> {
                     }
                     out.write_all(&chunk).unwrap();
                 }
-                out.flush().unwrap();  
+                out.flush().unwrap();
             });
 
             let mut handles = Vec::new();
@@ -428,7 +427,7 @@ fn main() -> Result<()> {
             };
             eprintln!("Total reads: {}", total);
             eprintln!("Mapped reads: {} ({:.2}%)", mapped, rate);
-            eprintln!("Done.");  
+            eprintln!("Done.");
         }
     }
     std::process::exit(0);
