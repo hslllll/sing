@@ -8,3 +8,6 @@ anyhow = "1.0"
 bytemuck = "1.16"
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libc = "0.2"

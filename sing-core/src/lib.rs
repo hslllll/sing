@@ -12,7 +12,7 @@ use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
-const WINDOW: usize = 16;
+const WINDOW: usize = 20;
 const SYNC_S: usize = 4;
 
 const BASES: [u64; 4] = [
@@ -284,7 +284,7 @@ impl IndexBuffer {
     }
 }
 
-pub struct InMemoryIndex {
+pub struct MemoryIndex {
     buf: IndexBuffer,
     offsets_ptr: *const u32,
     offsets_len: usize,
@@ -296,13 +296,20 @@ pub struct InMemoryIndex {
     ref_name_ranges: Vec<Range<usize>>,
 }
 
-unsafe impl Send for InMemoryIndex {}
-unsafe impl Sync for InMemoryIndex {}
+unsafe impl Send for MemoryIndex {}
+unsafe impl Sync for MemoryIndex {}
 
-impl InMemoryIndex {
+impl MemoryIndex {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { MmapOptions::new().map(&file).context("mmap index file")? };
+        #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+        unsafe {
+            let ptr = mmap.as_ptr() as *mut libc::c_void;
+            let len = mmap.len();
+            let advice = libc::MADV_WILLNEED | libc::MADV_SEQUENTIAL;
+            let _ = libc::madvise(ptr, len, advice);
+        }
         Self::from_data(IndexBuffer::Mmap(mmap))
     }
 
@@ -397,7 +404,7 @@ impl InMemoryIndex {
     }
 }
 
-impl IndexLike for InMemoryIndex {
+impl IndexLike for MemoryIndex {
     fn offsets(&self) -> &[u32] {
         unsafe { std::slice::from_raw_parts(self.offsets_ptr, self.offsets_len) }
     }

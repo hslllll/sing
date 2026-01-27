@@ -4,7 +4,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use needletail::parse_fastx_file;
 use sing_core::{
     align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index,
-    IndexLike, InMemoryIndex, State,
+    IndexLike, MemoryIndex, State,
 };
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -66,8 +66,8 @@ impl ReadBatch {
     }
 }
 
-fn load_index(path: &PathBuf) -> Result<InMemoryIndex> {
-    InMemoryIndex::from_path(path)
+fn load_index(path: &PathBuf) -> Result<MemoryIndex> {
+    MemoryIndex::from_path(path)
 }
 
 fn save_index(index: &Index, path: &PathBuf) -> Result<()> {
