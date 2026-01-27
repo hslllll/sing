@@ -121,7 +121,7 @@ fn main() -> Result<()> {
                 bail!("Provide at least one -1 input file");
             }
 
-            let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+            let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let threads = threads.min(max_hw);
             let batch_size = threads * 2048;
             let batch_cap = threads * 8;
