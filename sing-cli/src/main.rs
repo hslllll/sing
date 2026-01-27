@@ -119,7 +119,7 @@ fn main() -> Result<()> {
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let worker_threads = threads.unwrap_or(max_hw).max(1);
             
-            let reader_threads = (worker_threads / 4).max(1).min(4);
+            let reader_threads = (worker_threads / 4).max(1).min(8);
             
             let batch_size = worker_threads * 256;
             let batch_cap = worker_threads * 16;
