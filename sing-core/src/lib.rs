@@ -5,6 +5,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::ops::Range;
@@ -56,40 +57,12 @@ const REMOVE_S: [u64; 4] = [
 pub const RADIX: usize = 24;
 pub const SHIFT: usize = 32 - RADIX;
 
-#[derive(Clone, Copy)]
-pub struct TuningConfig {
-    pub chain_max_gap: i32,
-    pub seed_weight: u8,
-    pub match_score: i32,
-    pub mismatch_pen: i32,
-    pub gap_open: i32,
-    pub gap_ext: i32,
-    pub min_identity: f32,
-    pub lookup_for_diag: usize,
-    pub x_drop: i32,
-    pub chain_gap_cost: i32,
-    pub chain_min_score: i32,
-    pub mapq_scale: f32,
-    pub max_mapq: u8,
-    pub band_width: usize,
+#[inline(always)]
+fn scoring_params() -> (i32, i32) {
+    let match_score = WINDOW as i32;
+    let mismatch_pen = -((SYNC_S as i32).max(1));
+    (match_score, mismatch_pen)
 }
-
-pub const CONFIG: TuningConfig = TuningConfig {
-    chain_max_gap: 50,
-    seed_weight: 1,
-    match_score: 2,
-    mismatch_pen: -2,
-    gap_open: -1,
-    gap_ext: -1,
-    min_identity: 0.90,
-    lookup_for_diag: 5,
-    x_drop: 10,
-    chain_gap_cost: 2,
-    chain_min_score: 25,
-    mapq_scale: 1200.0,
-    max_mapq: 60,
-    band_width: 16,
-};
 
 #[derive(Debug, Clone)]
 pub struct Index {
@@ -570,7 +543,6 @@ pub struct Hit {
     pub diag: i32,
     pub read_pos: u32,
     pub ref_pos: u32,
-    pub weight: u8,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -583,18 +555,13 @@ pub struct ChainRes {
 pub struct State {
     pub mins: Vec<(u32, u32)>,
     pub candidates: Vec<Hit>,
-    pub dp_buf: Vec<i32>,
-    pub trace_buf: Vec<u8>,
 }
 
 impl State {
     pub fn new() -> Self {
-        let dp_cap = 1000 * 100;
         Self {
             mins: Vec::with_capacity(100),
             candidates: Vec::with_capacity(1000),
-            dp_buf: Vec::with_capacity(dp_cap),
-            trace_buf: Vec::with_capacity(dp_cap),
         }
     }
 }
@@ -730,8 +697,6 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, 
             continue;
         }
 
-        let weight = CONFIG.seed_weight;
-
         let target_hash = (h & 0xFFFF) as u64;
         let mut i = start;
         while i < end {
@@ -743,7 +708,7 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, 
                 let id_strand = (rid << 1) | (is_rev as u32);
                 let diag = (pos as i32) - (r_pos as i32);
 
-                out.push(Hit { id_strand, diag, read_pos: r_pos, ref_pos: pos, weight });
+                out.push(Hit { id_strand, diag, read_pos: r_pos, ref_pos: pos });
             }
             i += 1;
         }
@@ -756,168 +721,70 @@ fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
         return (ChainRes::default(), ChainRes::default());
     }
 
-    candidates.sort_unstable_by(|a, b| {
-        a.id_strand.cmp(&b.id_strand)
-            .then_with(|| a.ref_pos.cmp(&b.ref_pos))
-            .then_with(|| a.read_pos.cmp(&b.read_pos))
-    });
+    let bin_width = (WINDOW as i32).max(1);
+    let mut counts: HashMap<(u32, i32), u32> = HashMap::new();
+    for hit in candidates.iter() {
+        let diag = hit.ref_pos as i32 - hit.read_pos as i32;
+        let bin = diag.div_euclid(bin_width);
+        *counts.entry((hit.id_strand, bin)).or_insert(0) += 1;
+    }
 
-    let mut scores = vec![0i32; candidates.len()];
-
-    let mut best_idx = 0;
-    let mut max_score = 0;
-    
-    let group_gap_dist = CONFIG.chain_max_gap;
-
-    let mut group_start = 0;
-    while group_start < candidates.len() {
-        let id = candidates[group_start].id_strand;
-        let mut group_end = group_start;
-        while group_end < candidates.len() && candidates[group_end].id_strand == id {
-            group_end += 1;
+    let mut best_key: Option<(u32, i32)> = None;
+    let mut second_key: Option<(u32, i32)> = None;
+    let mut best_count = 0u32;
+    let mut second_count = 0u32;
+    for (&key, &count) in counts.iter() {
+        if count > best_count {
+            second_count = best_count;
+            second_key = best_key;
+            best_count = count;
+            best_key = Some(key);
+        } else if count > second_count {
+            second_count = count;
+            second_key = Some(key);
         }
-
-        for i in group_start..group_end {
-            let curr = &candidates[i];
-            let mut best_s = curr.weight as i32;
-            let curr_ref = curr.ref_pos as i64;
-            let curr_read = curr.read_pos as i64;
-            
-            let check_start = if i > CONFIG.lookup_for_diag { i - CONFIG.lookup_for_diag } else { group_start };
-            
-            for j in (check_start..i).rev() {
-                let prev = &candidates[j];
-                
-                let d_ref = curr_ref - (prev.ref_pos as i64);
-                if d_ref <= 0 { continue; }
-                if d_ref > group_gap_dist as i64 { break; }
-
-                let d_read = curr_read - (prev.read_pos as i64);
-                if d_read <= 0 { continue; } 
-
-                let gap = (d_ref - d_read).abs();
-                if gap > CONFIG.chain_max_gap as i64 { continue; }
-
-                let gap_cost = (gap as i32) * CONFIG.chain_gap_cost;
-                let score = scores[j] + (curr.weight as i32) - gap_cost;
-
-                if score > best_s {
-                    best_s = score;
-                }
-            }
-            scores[i] = best_s;
-
-            if best_s > max_score {
-                max_score = best_s;
-                best_idx = i;
-            }
-        }
-        group_start = group_end;
     }
 
-    if max_score < CONFIG.chain_min_score {
-        return (ChainRes::default(), ChainRes::default()); 
+    if best_count == 0 {
+        return (ChainRes::default(), ChainRes::default());
     }
 
-    let target_id = candidates[best_idx].id_strand;
-    let center_ref = candidates[best_idx].ref_pos;
-    
-    let mut start = best_idx;
-    let mut end = best_idx;
-    
-    while start > 0 
-        && candidates[start-1].id_strand == target_id 
-        && center_ref - candidates[start-1].ref_pos < CONFIG.chain_max_gap as u32
-    {
-        start -= 1;
-    }
-    
-    while end < candidates.len() - 1 
-        && candidates[end+1].id_strand == target_id 
-        && candidates[end+1].ref_pos - center_ref < CONFIG.chain_max_gap as u32
-    {
-        end += 1;
-    }
+    let mut best_hits = Vec::new();
+    let mut second_hits = Vec::new();
+    let mut rest = Vec::with_capacity(candidates.len());
 
-    let best_chain = ChainRes { score: max_score, start, end: end + 1 };
-    
-    (best_chain, ChainRes::default())
-}
-
-#[inline(always)]
-fn extend_left(read: &[u8], ref_seq: &[u8], r_start: usize, g_start: usize) -> (usize, usize) {
-    let mut mismatches = 0;
-    
-    let mut score = 0;
-    let mut max_score = 0;
-    let mut best_len = 0;
-    let mut best_mismatches = 0;
-    let x_drop = CONFIG.x_drop;
-
-    let len = r_start.min(g_start);
-    for i in 1..=len {
-        let r_base = read[r_start - i];
-        let g_base = ref_seq[g_start - i];
-        
-        if r_base.eq_ignore_ascii_case(&g_base) {
-            score += CONFIG.match_score;
+    for hit in candidates.drain(..) {
+        let diag = hit.ref_pos as i32 - hit.read_pos as i32;
+        let bin = diag.div_euclid(bin_width);
+        let key = (hit.id_strand, bin);
+        if Some(key) == best_key {
+            best_hits.push(hit);
+        } else if Some(key) == second_key {
+            second_hits.push(hit);
         } else {
-            mismatches += 1;
-            score += CONFIG.mismatch_pen;
-        }
-
-        if score > max_score {
-            max_score = score;
-            best_len = i;
-            best_mismatches = mismatches;
-        }
-
-        if max_score - score > x_drop {
-            break;
+            rest.push(hit);
         }
     }
-    (best_len, best_mismatches)
+
+    let best_start = 0usize;
+    let best_end = best_hits.len();
+    candidates.extend(best_hits);
+
+    let second_start = best_end;
+    let second_end = second_start + second_hits.len();
+    candidates.extend(second_hits);
+    candidates.extend(rest);
+
+    let best_chain = ChainRes { score: best_count as i32, start: best_start, end: best_end };
+    let second_chain = if second_count > 0 && second_end > second_start {
+        ChainRes { score: second_count as i32, start: second_start, end: second_end }
+    } else {
+        ChainRes::default()
+    };
+
+    (best_chain, second_chain)
 }
 
-#[inline(always)]
-fn extend_right(read: &[u8], ref_seq: &[u8], r_start: usize, g_start: usize) -> (usize, usize) {
-    let mut mismatches = 0;
-    
-    let mut score = 0;
-    let mut max_score = 0;
-    let mut best_len = 0;
-    let mut best_mismatches = 0;
-    let x_drop = CONFIG.x_drop;
-    
-    let r_len = read.len();
-    let g_len = ref_seq.len();
-    let mut i = 0;
-    
-    while r_start + i < r_len && g_start + i < g_len {
-        let r_base = read[r_start + i];
-        let g_base = ref_seq[g_start + i];
-        
-        if r_base.eq_ignore_ascii_case(&g_base) {
-            score += CONFIG.match_score;
-        } else {
-            mismatches += 1;
-            score += CONFIG.mismatch_pen;
-        }
-
-        let curr_len = i + 1;
-        if score > max_score {
-            max_score = score;
-            best_len = curr_len;
-            best_mismatches = mismatches;
-        }
-
-        if max_score - score > x_drop {
-            break;
-        }
-        i += 1;
-    }
-    (best_len, best_mismatches)
-}
 
 #[inline(always)]
 fn push_cigar(cigar: &mut Vec<u32>, len: u32, op: u32) {
@@ -948,355 +815,60 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
 }
 
 
-fn align_gap_nw(
-    cigar: &mut Vec<u32>,
-    read: &[u8],
-    ref_seq: &[u8],
-    dp_buf: &mut Vec<i32>,
-    trace_buf: &mut Vec<u8>,
-    band_width: usize,
-) {
-    let n = read.len();
-    let m = ref_seq.len();
-
-    if n == 0 || m == 0 {
-        if n > 0 {
-            push_cigar(cigar, n as u32, 1);
-        }
-        if m > 0 {
-            push_cigar(cigar, m as u32, 2);
-        }
-        return;
-    }
-
-    let match_score = CONFIG.match_score;
-    let mismatch_score = CONFIG.mismatch_pen;
-    let gap_open = CONFIG.gap_open;
-    let gap_ext = CONFIG.gap_ext;
-    let neg_inf: i32 = -1_000_000_000;
-
-    let band = band_width as i32;
-    let band_cols = (band_width * 2 + 1) as usize;
-    let cells = (n + 1) * band_cols;
-    let needed = cells * 3;
-
-    if dp_buf.len() < needed {
-        dp_buf.resize(needed, neg_inf);
-    }
-    if trace_buf.len() < needed {
-        trace_buf.resize(needed, 0);
-    }
-
-    
-    let (trace_m, trace_rest) = trace_buf.split_at_mut(cells);
-    let (trace_i, trace_d) = trace_rest.split_at_mut(cells);
-
-    
-    let idx_of = |i: usize, j: usize| -> Option<usize> {
-        let band_k = j as i32 - i as i32 + band;
-        if band_k < 0 || band_k >= band_cols as i32 {
-            None
-        } else {
-            Some(i * band_cols + band_k as usize)
-        }
-    };
-
-    
-    {
-        let (m_buf, rest) = dp_buf.split_at_mut(cells);
-        let (i_buf, d_buf) = rest.split_at_mut(cells);
-
-        
-        for idx in 0..cells {
-            m_buf[idx] = neg_inf;
-            i_buf[idx] = neg_inf;
-            d_buf[idx] = neg_inf;
-            trace_m[idx] = 0;
-            trace_i[idx] = 0;
-            trace_d[idx] = 0;
-        }
-
-        for i in 0..=n {
-            for band_k in 0..band_cols {
-                let j = i as i32 + band_k as i32 - band;
-                if j < 0 || j > m as i32 {
-                    continue;
-                }
-                let j = j as usize;
-                let idx = i * band_cols + band_k;
-
-                if i == 0 && j == 0 {
-                    m_buf[idx] = 0;
-                    continue;
-                }
-
-                if i == 0 {
-                    
-                    if let Some(prev) = idx_of(i, j - 1) {
-                        let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
-                        let from_d = d_buf[prev].saturating_add(gap_ext);
-                        if from_m >= from_d {
-                            d_buf[idx] = from_m;
-                            trace_d[idx] = 0;
-                        } else {
-                            d_buf[idx] = from_d;
-                            trace_d[idx] = 2;
-                        }
-                    }
-                    continue;
-                }
-
-                if j == 0 {
-                    
-                    if let Some(prev) = idx_of(i - 1, j) {
-                        let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
-                        let from_i = i_buf[prev].saturating_add(gap_ext);
-                        if from_m >= from_i {
-                            i_buf[idx] = from_m;
-                            trace_i[idx] = 0;
-                        } else {
-                            i_buf[idx] = from_i;
-                            trace_i[idx] = 1;
-                        }
-                    }
-                    continue;
-                }
-
-                
-                if let Some(diag) = idx_of(i - 1, j - 1) {
-                    let s_char = if read[i - 1].eq_ignore_ascii_case(&ref_seq[j - 1]) {
-                        match_score
-                    } else {
-                        mismatch_score
-                    };
-
-                    let mut best_prev = m_buf[diag];
-                    let mut best_state = 0u8;
-                    if i_buf[diag] > best_prev {
-                        best_prev = i_buf[diag];
-                        best_state = 1;
-                    }
-                    if d_buf[diag] > best_prev {
-                        best_prev = d_buf[diag];
-                        best_state = 2;
-                    }
-                    m_buf[idx] = best_prev.saturating_add(s_char);
-                    trace_m[idx] = best_state;
-                }
-
-                
-                if let Some(prev) = idx_of(i - 1, j) {
-                    let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
-                    let from_i = i_buf[prev].saturating_add(gap_ext);
-                    if from_m >= from_i {
-                        i_buf[idx] = from_m;
-                        trace_i[idx] = 0;
-                    } else {
-                        i_buf[idx] = from_i;
-                        trace_i[idx] = 1;
-                    }
-                }
-
-                
-                if let Some(prev) = idx_of(i, j - 1) {
-                    let from_m = m_buf[prev].saturating_add(gap_open + gap_ext);
-                    let from_d = d_buf[prev].saturating_add(gap_ext);
-                    if from_m >= from_d {
-                        d_buf[idx] = from_m;
-                        trace_d[idx] = 0;
-                    } else {
-                        d_buf[idx] = from_d;
-                        trace_d[idx] = 2;
-                    }
-                }
-            }
-        }
-    }
-
-    
-    let end_idx = match idx_of(n, m) {
-        Some(v) => v,
-        None => return,
-    };
-
-    let cells = (n + 1) * band_cols;
-    let (m_buf, rest) = dp_buf.split_at_mut(cells);
-    let (i_buf, d_buf) = rest.split_at_mut(cells);
-
-    let mut state = 0u8;
-    let mut best = m_buf[end_idx];
-    if i_buf[end_idx] > best {
-        best = i_buf[end_idx];
-        state = 1;
-    }
-    if d_buf[end_idx] > best {
-        state = 2;
-    }
-
-    let mut i = n;
-    let mut j = m;
-    let mut ops_len = 0usize;
-
-    while i > 0 || j > 0 {
-        let idx = match idx_of(i, j) {
-            Some(v) => v,
-            None => break,
-        };
-        match state {
-            0 => {
-                m_buf[ops_len] = 0;
-                ops_len += 1;
-                let prev = trace_m[idx];
-                i -= 1;
-                j -= 1;
-                state = prev;
-            }
-            1 => {
-                m_buf[ops_len] = 1;
-                ops_len += 1;
-                let prev = trace_i[idx];
-                i -= 1;
-                state = prev;
-            }
-            _ => {
-                m_buf[ops_len] = 2;
-                ops_len += 1;
-                let prev = trace_d[idx];
-                j -= 1;
-                state = prev;
-            }
-        }
-    }
-
-    if ops_len == 0 {
-        return;
-    }
-
-    let mut curr_op = m_buf[ops_len - 1] as u32;
-    let mut curr_len = 0u32;
-    for idx in (0..ops_len).rev() {
-        let op = m_buf[idx] as u32;
-        if op == curr_op {
-            curr_len += 1;
-        } else {
-            push_cigar(cigar, curr_len, curr_op);
-            curr_op = op;
-            curr_len = 1;
-        }
-    }
-    push_cigar(cigar, curr_len, curr_op);
-}
-
 fn gen_cigar(
     hits: &[Hit],
     read_seq: &[u8],
     ref_seq: &[u8],
-    dp_buf: &mut Vec<i32>,
-    trace_buf: &mut Vec<u8>,
-) -> (Vec<u32>, i32) {
+ ) -> (Vec<u32>, i32, usize) {
     if hits.is_empty() {
-        return (vec![], 0);
-    }
-
-    let mut sorted = hits.to_vec();
-    sorted.sort_unstable_by_key(|h| h.read_pos);
-
-    let mut filtered = Vec::with_capacity(sorted.len());
-    filtered.push(sorted[0]);
-    for i in 1..sorted.len() {
-        let last = filtered.last().unwrap();
-        let curr = sorted[i];
-        if curr.ref_pos > last.ref_pos && curr.read_pos > last.read_pos {
-            filtered.push(curr);
-        }
+        return (vec![], 0, 0);
     }
 
     let mut cigar = Vec::with_capacity(32);
 
-    let band = CONFIG.band_width.max(1);
-    let first = filtered[0];
+    let diag_sum: i64 = hits
+        .iter()
+        .map(|h| (h.ref_pos as i64) - (h.read_pos as i64))
+        .sum();
+    let diag = (diag_sum / hits.len() as i64) as i32;
 
-    let r_start = first.read_pos as usize;
-    let g_start = first.ref_pos as usize;
-    let (match_len_left, _) = extend_left(read_seq, ref_seq, r_start, g_start);
-    let leading_clip = r_start - match_len_left;
-    let final_ref_start = (g_start - match_len_left) as i32;
+    let read_len = read_seq.len();
+    let ref_len = ref_seq.len();
+
+    let (leading_clip, ref_start) = if diag < 0 {
+        ((-diag) as usize, 0usize)
+    } else {
+        (0usize, diag as usize)
+    };
+
+    if leading_clip >= read_len || ref_start >= ref_len {
+        push_cigar(&mut cigar, read_len as u32, 4);
+        return (cigar, ref_start as i32, 0);
+    }
+
+    let max_align_len = read_len - leading_clip;
+    let ref_avail = ref_len.saturating_sub(ref_start);
+    let aligned_len = max_align_len.min(ref_avail);
+    let trailing_clip = read_len - leading_clip - aligned_len;
 
     if leading_clip > 0 {
         push_cigar(&mut cigar, leading_clip as u32, 4);
     }
-    if match_len_left > 0 {
-        push_cigar(&mut cigar, match_len_left as u32, 0);
+    if aligned_len > 0 {
+        push_cigar(&mut cigar, aligned_len as u32, 0);
     }
-
-    let mut curr_r = r_start;
-    let mut curr_g = g_start;
-    let mut no_internal_gaps = true;
-    push_cigar(&mut cigar, WINDOW as u32, 0);
-    curr_r += WINDOW;
-    curr_g += WINDOW;
-
-    for i in 1..filtered.len() {
-        let hit = filtered[i];
-        let next_r = hit.read_pos as usize;
-        let next_g = hit.ref_pos as usize;
-
-        if next_r < curr_r || next_g < curr_g {
-            continue;
-        }
-
-        let gap_r = next_r - curr_r;
-        let gap_g = next_g - curr_g;
-        if gap_r > 0 || gap_g > 0 || next_r != curr_r || next_g != curr_g {
-            no_internal_gaps = false;
-        }
-
-        if gap_r > 0 || gap_g > 0 {
-            let r_gap_seq = &read_seq[curr_r..next_r];
-            let g_gap_end = next_g.min(ref_seq.len());
-            let g_gap_seq = if curr_g < g_gap_end { &ref_seq[curr_g..g_gap_end] } else { &[] };
-            if gap_r == gap_g {
-                let match_len = gap_r.min(g_gap_seq.len());
-                if match_len > 0 {
-                    push_cigar(&mut cigar, match_len as u32, 0);
-                }
-            } else {
-                align_gap_nw(&mut cigar, r_gap_seq, g_gap_seq, dp_buf, trace_buf, band);
-            }
-        }
-
-        push_cigar(&mut cigar, WINDOW as u32, 0);
-        curr_r = next_r + WINDOW;
-        curr_g = next_g + WINDOW;
-    }
-    let r_end_idx = curr_r;
-    let g_end_idx = curr_g;
-    let (match_len_right, _) = extend_right(read_seq, ref_seq, r_end_idx, g_end_idx);
-
-    let consumed_r = r_end_idx + match_len_right;
-    let trailing_clip = read_seq.len().saturating_sub(consumed_r);
-    let full_covered = leading_clip == 0 && trailing_clip == 0 && consumed_r == read_seq.len();
-
-    if no_internal_gaps && full_covered {
-        let mut full = Vec::with_capacity(1);
-        push_cigar(&mut full, read_seq.len() as u32, 0);
-        return (full, final_ref_start);
-    }
-
-    if match_len_right > 0 {
-        push_cigar(&mut cigar, match_len_right as u32, 0);
-    }
-
     if trailing_clip > 0 {
         push_cigar(&mut cigar, trailing_clip as u32, 4);
     }
 
-    (cigar, final_ref_start)
+    (cigar, ref_start as i32, aligned_len)
 }
 
 fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32]) -> (i32, String, i32) {
     let mut nm = 0;
     let mut as_score = 0;
+
+    let (match_score, mismatch_pen) = scoring_params();
 
     let mut r_idx = start_pos as usize;
     let mut q_idx = 0;
@@ -1312,14 +884,14 @@ fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32
                         let r = ref_seq[r_idx];
                         let q = read_seq[q_idx];
                         if r.eq_ignore_ascii_case(&q) {
-                            as_score += CONFIG.match_score;
+                            as_score += match_score;
                         } else {
                             nm += 1;
-                            as_score += CONFIG.mismatch_pen;
+                            as_score += mismatch_pen;
                         }
                     } else {
                         nm += 1;
-                        as_score += CONFIG.mismatch_pen;
+                        as_score += mismatch_pen;
                     }
                     r_idx += 1;
                     q_idx += 1;
@@ -1327,18 +899,18 @@ fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32
             }
             8 => {
                 nm += len as i32;
-                as_score += len as i32 * CONFIG.mismatch_pen;
+                as_score += len as i32 * mismatch_pen;
                 r_idx += len;
                 q_idx += len;
             }
             1 => {
                 nm += len as i32;
-                as_score += CONFIG.gap_open + ((len as i32 - 1) * CONFIG.gap_ext);
+                as_score += len as i32 * mismatch_pen;
                 q_idx += len;
             }
             2 => {
                 nm += len as i32;
-                as_score += CONFIG.gap_open + ((len as i32 - 1) * CONFIG.gap_ext);
+                as_score += len as i32 * mismatch_pen;
                 r_idx += len;
             }
             4 => {
@@ -1352,7 +924,7 @@ fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32
 }
 
 pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec<u8>) -> Option<AlignmentResult> {
-    let State { mins, candidates, dp_buf, trace_buf } = state;
+    let State { mins, candidates } = state;
 
     candidates.clear();
 
@@ -1379,12 +951,11 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     }
 
     let (c1, c2) = find_top_chains(candidates);
+    let min_identity = (SYNC_S as f32) / (WINDOW as f32);
     let evaluate = |chain: &ChainRes,
                     seq: &[u8],
                     rev: &[u8],
-                    candidates: &[Hit],
-                    dp_buf: &mut Vec<i32>,
-                    trace_buf: &mut Vec<u8>|
+                    candidates: &[Hit]|
      -> Option<(AlignmentResult, i32)> {
         if chain.score == 0 {
             return None;
@@ -1398,15 +969,19 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         let target_seq = if is_rev { rev } else { seq };
         let ref_seq = idx.ref_seq(ref_id as usize);
 
-        let (cigar, pos) = gen_cigar(hits, target_seq, ref_seq, dp_buf, trace_buf);
+        let (cigar, pos, aligned_len) = gen_cigar(hits, target_seq, ref_seq);
         if pos < 0 || (pos as usize) >= ref_seq.len() {
             return None;
         }
 
-        let (nm, md, as_score) = compute_metrics(target_seq, ref_seq, pos, &cigar);
-        let identity = 1.0 - (nm as f32 / seq.len() as f32);
+        if aligned_len == 0 {
+            return None;
+        }
 
-        if identity < CONFIG.min_identity {
+        let (nm, md, as_score) = compute_metrics(target_seq, ref_seq, pos, &cigar);
+        let identity = 1.0 - (nm as f32 / aligned_len as f32);
+
+        if identity < min_identity {
             return None;
         }
         Some((
@@ -1415,8 +990,8 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         ))
     };
 
-    let r1 = evaluate(&c1, seq, rev, candidates, dp_buf, trace_buf);
-    let r2 = if c2.score > 0 { evaluate(&c2, seq, rev, candidates, dp_buf, trace_buf) } else { None };
+    let r1 = evaluate(&c1, seq, rev, candidates);
+    let r2 = if c2.score > 0 { evaluate(&c2, seq, rev, candidates) } else { None };
     let (mut best_res, best_chain_score, second_chain_score) = match (r1, r2) {
         (Some((a1, s1)), Some((a2, s2))) => {
             if s1 >= s2 {
@@ -1430,15 +1005,15 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         (None, None) => return None,
     };
 
-    let diff = if second_chain_score > 0 {
-        (best_chain_score - second_chain_score) as f32
+    let best_count = best_chain_score.max(0) as u32;
+    let second_count = second_chain_score.max(0) as u32;
+    if best_count == 0 {
+        best_res.mapq = 0;
     } else {
-        best_chain_score as f32
-    };
-    let read_len_f32 = seq.len() as f32;
-    let evidence_weight = (best_chain_score as f32).min(read_len_f32) / read_len_f32;
-    let raw_mapq = CONFIG.mapq_scale * diff * evidence_weight;
-    best_res.mapq = raw_mapq.min(CONFIG.max_mapq as f32) as u8;
+        let diff = best_count.saturating_sub(second_count) as f32;
+        let frac = diff / (best_count as f32);
+        best_res.mapq = (frac * (u8::MAX as f32)).round() as u8;
+    }
 
     Some(best_res)
 }
