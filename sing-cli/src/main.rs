@@ -72,7 +72,7 @@ fn load_index(path: &PathBuf) -> Result<MappedIndex> {
 
 fn save_index(index: &Index, path: &PathBuf) -> Result<()> {
     let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(16*1024*1024, file);
     index.to_writer(&mut writer)
 }
 

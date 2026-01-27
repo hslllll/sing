@@ -11,8 +11,8 @@ use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
-const WINDOW: usize = 18;
-const SYNC_S: usize = 2;
+const WINDOW: usize = 16;
+const SYNC_S: usize = 4;
 
 const BASES: [u64; 4] = [
     0x243f_6a88_85a3_08d3,
@@ -63,20 +63,20 @@ pub struct TuningConfig {
 }
 
 pub const CONFIG: TuningConfig = TuningConfig {
-    chain_max_gap: 150,
+    chain_max_gap: 50,
     seed_weight: 1,
     match_score: 2,
     mismatch_pen: -2,
-    gap_open: -3,
+    gap_open: -1,
     gap_ext: -1,
     min_identity: 0.90,
-    lookup_for_diag: 50,
-    x_drop: 20,
+    lookup_for_diag: 5,
+    x_drop: 10,
     chain_gap_cost: 2,
     chain_min_score: 25,
     mapq_scale: 1200.0,
     max_mapq: 60,
-    band_width: 32,
+    band_width: 16,
 };
 
 #[derive(Debug, Clone)]
@@ -923,6 +923,7 @@ fn align_gap_nw(
     ref_seq: &[u8],
     dp_buf: &mut Vec<i32>,
     trace_buf: &mut Vec<u8>,
+    band_width: usize,
 ) {
     let n = read.len();
     let m = ref_seq.len();
@@ -943,8 +944,8 @@ fn align_gap_nw(
     let gap_ext = CONFIG.gap_ext;
     let neg_inf: i32 = -1_000_000_000;
 
-    let band = CONFIG.band_width as i32;
-    let band_cols = (CONFIG.band_width * 2 + 1) as usize;
+    let band = band_width as i32;
+    let band_cols = (band_width * 2 + 1) as usize;
     let cells = (n + 1) * band_cols;
     let needed = cells * 3;
 
@@ -1180,6 +1181,18 @@ fn gen_cigar(
     }
 
     let mut cigar = Vec::with_capacity(32);
+
+    let center_diag = (filtered[0].ref_pos as i32) - (filtered[0].read_pos as i32);
+    let mut max_diag_dev = 0i32;
+    for h in &filtered {
+        let d = (h.ref_pos as i32) - (h.read_pos as i32);
+        let dev = (d - center_diag).abs();
+        if dev > max_diag_dev {
+            max_diag_dev = dev;
+        }
+    }
+    let adaptive_band = ((max_diag_dev + 2).min(CONFIG.band_width as i32)).max(1) as usize;
+    let skip_nw_all = max_diag_dev == 0;
     let first = filtered[0];
 
     let r_start = first.read_pos as usize;
@@ -1197,6 +1210,7 @@ fn gen_cigar(
 
     let mut curr_r = r_start;
     let mut curr_g = g_start;
+    let mut no_internal_gaps = true;
     push_cigar(&mut cigar, WINDOW as u32, 0);
     curr_r += WINDOW;
     curr_g += WINDOW;
@@ -1212,13 +1226,26 @@ fn gen_cigar(
 
         let gap_r = next_r - curr_r;
         let gap_g = next_g - curr_g;
+        if gap_r > 0 || gap_g > 0 || next_r != curr_r || next_g != curr_g {
+            no_internal_gaps = false;
+        }
 
         if gap_r > 0 || gap_g > 0 {
             let r_gap_seq = &read_seq[curr_r..next_r];
             let g_gap_end = next_g.min(ref_seq.len());
             let g_gap_seq = if curr_g < g_gap_end { &ref_seq[curr_g..g_gap_end] } else { &[] };
-
-            align_gap_nw(&mut cigar, r_gap_seq, g_gap_seq, dp_buf, trace_buf);
+            if skip_nw_all {
+                if gap_r == gap_g {
+                    let match_len = gap_r.min(g_gap_seq.len());
+                    if match_len > 0 {
+                        push_cigar(&mut cigar, match_len as u32, 0);
+                    }
+                } else {
+                    align_gap_nw(&mut cigar, r_gap_seq, g_gap_seq, dp_buf, trace_buf, adaptive_band);
+                }
+            } else {
+                align_gap_nw(&mut cigar, r_gap_seq, g_gap_seq, dp_buf, trace_buf, adaptive_band);
+            }
         }
 
         push_cigar(&mut cigar, WINDOW as u32, 0);
@@ -1229,12 +1256,20 @@ fn gen_cigar(
     let g_end_idx = curr_g;
     let (match_len_right, _) = extend_right(read_seq, ref_seq, r_end_idx, g_end_idx);
 
+    let consumed_r = r_end_idx + match_len_right;
+    let trailing_clip = read_seq.len().saturating_sub(consumed_r);
+    let full_covered = leading_clip == 0 && trailing_clip == 0 && consumed_r == read_seq.len();
+
+    if no_internal_gaps && full_covered {
+        let mut full = Vec::with_capacity(1);
+        push_cigar(&mut full, read_seq.len() as u32, 0);
+        return (full, final_ref_start);
+    }
+
     if match_len_right > 0 {
         push_cigar(&mut cigar, match_len_right as u32, 0);
     }
 
-    let consumed_r = r_end_idx + match_len_right;
-    let trailing_clip = read_seq.len().saturating_sub(consumed_r);
     if trailing_clip > 0 {
         push_cigar(&mut cigar, trailing_clip as u32, 4);
     }
