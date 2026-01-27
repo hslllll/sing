@@ -495,7 +495,7 @@ where
     }
 
     let total_bases: u64 = ref_seqs.iter().map(|s| s.len() as u64).sum();
-    let freq_filter = (total_bases as f64).powf(1.0 / 4.0) as usize;
+    let freq_filter = (total_bases as f64).powf(1.0 / 3.0) as usize;
     let freq_filter = std::cmp::max(1, freq_filter);
     eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
 
@@ -685,11 +685,6 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
             if head < tail {
                 let m_pos = q_pos[head & Q_MASK];
                 if m_pos <= max_pos {
-                    
-                    
-                    
-                    
-                    
                     let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
                     if out.last().map(|&(_, p)| p) != Some(k_pos as u32) {
                          out.push((k_hash as u32, k_pos as u32));
