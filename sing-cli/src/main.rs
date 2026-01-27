@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use needletail::parse_fastx_file;
 use sing_core::{
     align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index,
@@ -98,17 +98,8 @@ fn build_from_reference(reference: PathBuf, output: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn try_send_retry<T>(sender: &Sender<T>, mut value: T) {
-    loop {
-        match sender.try_send(value) {
-            Ok(()) => return,
-            Err(TrySendError::Full(v)) => {
-                value = v;
-                std::thread::yield_now();
-            }
-            Err(TrySendError::Disconnected(_)) => return,
-        }
-    }
+fn try_send_retry<T>(sender: &Sender<T>, value: T) {
+    let _ = sender.send(value);
 }
 
 fn main() -> Result<()> {
@@ -298,8 +289,8 @@ fn main() -> Result<()> {
             let max_write_merge = std::cmp::min(std::cmp::max(threads * 1024 * 1024, 8 * 1024 * 1024), 64 * 1024 * 1024);
             let writer = thread::spawn(move || {
                 let mut out: Box<dyn Write> = match output {
-                    Some(p) => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p).unwrap())),
-                    None => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout())),
+                    Some(p) => Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(p).unwrap())),
+                    None => Box::new(BufWriter::with_capacity(16 * 1024 * 1024, std::io::stdout())),
                 };
 
                 writeln!(out, "@HD\tVN:1.6\tSO:unsorted").unwrap();
