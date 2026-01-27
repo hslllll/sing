@@ -300,13 +300,18 @@ impl IndexLike for Index {
 
 pub struct MappedIndex {
     mmap: Mmap,
-    offsets_range: Range<usize>,
-    seeds_range: Range<usize>,
+    offsets_ptr: *const u32,
+    offsets_len: usize,
+    seeds_ptr: *const u64,
+    seeds_len: usize,
     freq_filter: u32,
     genome_size: u64,
     ref_seq_ranges: Vec<Range<usize>>,
     ref_name_ranges: Vec<Range<usize>>,
 }
+
+unsafe impl Send for MappedIndex {}
+unsafe impl Sync for MappedIndex {}
 
 impl MappedIndex {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -344,8 +349,10 @@ impl MappedIndex {
             .filter(|&end| end <= data.len())
             .ok_or_else(|| anyhow::anyhow!("read offsets: unexpected EOF"))?;
         let offsets_range = pos..offsets_bytes;
-        try_cast_slice::<u8, u32>(&data[offsets_range.clone()])
+        let offsets_slice = try_cast_slice::<u8, u32>(&data[offsets_range])
             .map_err(|_| anyhow::anyhow!("read offsets: unaligned data"))?;
+        let offsets_ptr = offsets_slice.as_ptr();
+        let offsets_len = offsets_slice.len();
         pos = offsets_bytes;
 
         let seeds_len = read_u64(data, &mut pos, "read seeds len")? as usize;
@@ -355,8 +362,10 @@ impl MappedIndex {
             .filter(|&end| end <= data.len())
             .ok_or_else(|| anyhow::anyhow!("read seeds: unexpected EOF"))?;
         let seeds_range = pos..seeds_bytes;
-        try_cast_slice::<u8, u64>(&data[seeds_range.clone()])
+        let seeds_slice = try_cast_slice::<u8, u64>(&data[seeds_range])
             .map_err(|_| anyhow::anyhow!("read seeds: unaligned data"))?;
+        let seeds_ptr = seeds_slice.as_ptr();
+        let seeds_len = seeds_slice.len();
         pos = seeds_bytes;
 
         let freq_filter = read_u32(data, &mut pos, "read freq_filter")?;
@@ -390,8 +399,10 @@ impl MappedIndex {
 
         Ok(Self {
             mmap,
-            offsets_range,
-            seeds_range,
+            offsets_ptr,
+            offsets_len,
+            seeds_ptr,
+            seeds_len,
             freq_filter,
             genome_size,
             ref_seq_ranges,
@@ -402,11 +413,11 @@ impl MappedIndex {
 
 impl IndexLike for MappedIndex {
     fn offsets(&self) -> &[u32] {
-        bytemuck::cast_slice(&self.mmap[self.offsets_range.clone()])
+        unsafe { std::slice::from_raw_parts(self.offsets_ptr, self.offsets_len) }
     }
 
     fn seeds(&self) -> &[u64] {
-        bytemuck::cast_slice(&self.mmap[self.seeds_range.clone()])
+        unsafe { std::slice::from_raw_parts(self.seeds_ptr, self.seeds_len) }
     }
 
     fn freq_filter(&self) -> u32 {
@@ -703,13 +714,15 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, 
     let freq_filter = idx.freq_filter() as usize;
     let offsets = idx.offsets();
     let seeds = idx.seeds();
+    let offsets_len = offsets.len();
     for &(h, r_pos) in mins {
         let bucket = (h >> SHIFT) as usize;
-        let start = offsets[bucket] as usize;
-        let end = offsets
-            .get(bucket + 1)
-            .copied()
-            .unwrap_or(seeds.len() as u32) as usize;
+        let start = unsafe { *offsets.get_unchecked(bucket) } as usize;
+        let end = if bucket + 1 < offsets_len {
+            (unsafe { *offsets.get_unchecked(bucket + 1) }) as usize
+        } else {
+            seeds.len()
+        };
 
         let count = end - start;
 
@@ -720,7 +733,9 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, 
         let weight = CONFIG.seed_weight;
 
         let target_hash = (h & 0xFFFF) as u64;
-        for &seed in &seeds[start..end] {
+        let mut i = start;
+        while i < end {
+            let seed = unsafe { *seeds.get_unchecked(i) };
             if (seed >> 48) == target_hash {
                 let rid = ((seed >> 32) & 0xFFFF) as u32;
                 let pos = seed as u32;
@@ -730,6 +745,7 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, 
 
                 out.push(Hit { id_strand, diag, read_pos: r_pos, ref_pos: pos, weight });
             }
+            i += 1;
         }
     }
 }
