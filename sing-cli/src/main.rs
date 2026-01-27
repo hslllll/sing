@@ -14,6 +14,7 @@ use std::thread;
 
 const PROG_NAME: &str = env!("CARGO_PKG_NAME");
 const PROG_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_SEQ_LEN: usize = 600;
 
 #[derive(Parser)]
 struct Cli {
@@ -109,8 +110,8 @@ fn main() -> Result<()> {
 
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let threads = threads.min(max_hw);
-            let batch_size = threads * 1024;
-            let batch_cap = threads * 8;
+            let batch_size = threads * 2048;
+            let batch_cap = threads * 16;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
@@ -159,11 +160,11 @@ fn main() -> Result<()> {
 
                             while let (Some(Ok(rec1)), Some(Ok(rec2))) = (r1.next(), r2.next()) {
                                 if batch.count >= batch.seqs1.len() {
-                                    batch.seqs1.push(Vec::with_capacity(150));
-                                    batch.quals1.push(Vec::with_capacity(150));
-                                    batch.seqs2.push(Vec::with_capacity(150));
-                                    batch.quals2.push(Vec::with_capacity(150));
-                                    batch.names.push(String::with_capacity(64));
+                                    batch.seqs1.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                    batch.quals1.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                    batch.seqs2.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                    batch.quals2.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                    batch.names.push(String::with_capacity(100));
                                 }
                                 let idx = batch.count;
                                 let name_str = String::from_utf8_lossy(rec1.id());
@@ -234,8 +235,8 @@ fn main() -> Result<()> {
 
                             while let Some(Ok(rec1)) = r1.next() {
                                 if batch.count >= batch.seqs1.len() {
-                                    batch.seqs1.push(Vec::with_capacity(150));
-                                    batch.quals1.push(Vec::with_capacity(150));
+                                    batch.seqs1.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                    batch.quals1.push(Vec::with_capacity(MAX_SEQ_LEN));
                                     batch.seqs2.push(Vec::new());
                                     batch.quals2.push(Vec::new());
                                     batch.names.push(String::with_capacity(64));
