@@ -290,11 +290,11 @@ fn main() -> Result<()> {
             }
 
             let idx_writer = idx.clone();
-            let max_write_merge = std::cmp::min(std::cmp::max(worker_threads * 1024 * 1024, 8 * 1024 * 1024), 64 * 1024 * 1024);
+            let max_write_merge = std::cmp::min(std::cmp::max(worker_threads * 512 * 1024, 4 * 1024 * 1024), 32 * 1024 * 1024);
             let writer = thread::spawn(move || {
                 let mut out: Box<dyn Write> = match output {
-                    Some(p) => Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(p).unwrap())),
-                    None => Box::new(BufWriter::with_capacity(16 * 1024 * 1024, std::io::stdout())),
+                    Some(p) => Box::new(BufWriter::with_capacity(8 * 1024 * 1024, File::create(p).unwrap())),
+                    None => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout())),
                 };
 
                 writeln!(out, "@HD\tVN:1.6\tSO:unsorted").unwrap();
@@ -306,6 +306,7 @@ fn main() -> Result<()> {
                 writeln!(out, "@RG\tID:sing\tSM:song\tPL:ILLUMINA").unwrap();
                 writeln!(out, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION).unwrap();
 
+                let mut buffer_size = 0;
                 while let Ok(mut chunk) = w_rx.recv() {
                     while let Ok(next) = w_rx.try_recv() {
                         if chunk.len() + next.len() > max_write_merge {
@@ -314,6 +315,13 @@ fn main() -> Result<()> {
                         chunk.extend_from_slice(&next);
                     }
                     out.write_all(&chunk).unwrap();
+                    buffer_size += chunk.len();
+                    
+                    // 일정 크기 이상 쌓이면 flush
+                    if buffer_size > 4 * 1024 * 1024 {
+                        out.flush().unwrap();
+                        buffer_size = 0;
+                    }
                 }
                 out.flush().unwrap();
             });
@@ -427,7 +435,6 @@ fn main() -> Result<()> {
             };
             eprintln!("Total reads: {}", total);
             eprintln!("Mapped reads: {} ({:.2}%)", mapped, rate);
-            eprintln!("Done.");
         }
     }
     std::process::exit(0);
