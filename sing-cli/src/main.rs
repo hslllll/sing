@@ -117,7 +117,7 @@ fn main() -> Result<()> {
             }
 
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-            let total_threads = threads.unwrap_or(max_hw).min(max_hw).max(2);
+            let total_threads = threads.unwrap_or(max_hw).max(2);
             
             let worker_threads = ((total_threads - 1) * 3) / 4;  
             let reader_threads = total_threads - 1 - worker_threads;  
