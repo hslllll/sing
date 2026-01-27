@@ -13,7 +13,7 @@ use sing_core::{
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 const PROG_NAME: &str = env!("CARGO_PKG_NAME");
@@ -290,41 +290,38 @@ fn main() -> Result<()> {
             }
 
             let idx_writer = idx.clone();
-            let max_write_merge = std::cmp::min(std::cmp::max(worker_threads * 256 * 1024, 4 * 1024 * 1024), 16 * 1024 * 1024);
-            let writer = thread::spawn(move || {
-                let mut out: Box<dyn Write> = match output {
-                    Some(p) => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p).unwrap())),
-                    None => Box::new(BufWriter::with_capacity(2 * 1024 * 1024, std::io::stdout())),
-                };
-
-                writeln!(out, "@HD\tVN:1.6\tSO:unsorted").unwrap();
+            
+            
+            let shared_writer: Arc<Mutex<Box<dyn Write + Send>>> = match &output {
+                Some(p) => Arc::new(Mutex::new(Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p)?)))),
+                None => Arc::new(Mutex::new(Box::new(BufWriter::with_capacity(2 * 1024 * 1024, std::io::stdout())))),
+            };
+            
+            {
+                let mut out = shared_writer.lock().unwrap();
+                writeln!(out, "@HD\tVN:1.6\tSO:unsorted")?;
                 for i in 0..idx_writer.ref_count() {
                     let name = idx_writer.ref_name(i);
                     let seq = idx_writer.ref_seq(i);
-                    writeln!(out, "@SQ\tSN:{}\tLN:{}", name, seq.len()).unwrap();
+                    writeln!(out, "@SQ\tSN:{}\tLN:{}", name, seq.len())?;
                 }
-                writeln!(out, "@RG\tID:sing\tSM:song\tPL:ILLUMINA").unwrap();
-                writeln!(out, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION).unwrap();
-
-                let mut buffer_size = 0;
-                while let Ok(mut chunk) = w_rx.recv() {
-                    while let Ok(next) = w_rx.try_recv() {
-                        if chunk.len() + next.len() > max_write_merge {
-                            break;
-                        }
-                        chunk.extend_from_slice(&next);
+                writeln!(out, "@RG\tID:sing\tSM:song\tPL:ILLUMINA")?;
+                writeln!(out, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION)?;
+            }
+            
+            
+            let mut writer_handles = Vec::new();
+            for _ in 0..reader_threads {
+                let w_rx = w_rx.clone();
+                let writer = shared_writer.clone();
+                
+                writer_handles.push(thread::spawn(move || {
+                    while let Ok(chunk) = w_rx.recv() {
+                        let mut out = writer.lock().unwrap();
+                        out.write_all(&chunk).unwrap();
                     }
-                    out.write_all(&chunk).unwrap();
-                    buffer_size += chunk.len();
-                    
-                    // 일정 크기 이상 쌓이면 flush
-                    if buffer_size > 4 * 1024 * 1024 {
-                        out.flush().unwrap();
-                        buffer_size = 0;
-                    }
-                }
-                out.flush().unwrap();
-            });
+                }));
+            }
 
             let mut handles = Vec::new();
             for _ in 0..worker_threads {
@@ -423,8 +420,14 @@ fn main() -> Result<()> {
             for h in handles {
                 h.join().unwrap();
             }
-            drop(w_tx);  
-            writer.join().unwrap();
+            drop(w_tx);
+            
+            for h in writer_handles {
+                h.join().unwrap();
+            }
+            
+            
+            shared_writer.lock().unwrap().flush().unwrap();
 
             let total = total_reads.load(std::sync::atomic::Ordering::Relaxed);
             let mapped = mapped_reads.load(std::sync::atomic::Ordering::Relaxed);
