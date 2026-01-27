@@ -12,7 +12,7 @@ use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
-const WINDOW: usize = 20;
+const WINDOW: usize = 32;
 const SYNC_S: usize = 4;
 
 const BASES: [u64; 4] = [
@@ -60,8 +60,8 @@ pub const SHIFT: usize = 32 - RADIX;
 
 #[inline(always)]
 fn scoring_params() -> (i32, i32) {
-    let match_score = WINDOW as i32;
-    let mismatch_pen = -((SYNC_S as i32).max(1));
+    let match_score = (WINDOW as i32 / 10).max(1);
+    let mismatch_pen = -((SYNC_S as i32 / 10).max(1));
     (match_score, mismatch_pen)
 }
 
