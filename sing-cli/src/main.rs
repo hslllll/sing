@@ -1,3 +1,7 @@
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use crossbeam_channel::{bounded, Receiver, Sender};
