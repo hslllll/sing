@@ -4,7 +4,6 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
-use memmap2::{Mmap, MmapOptions};
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -298,8 +297,8 @@ impl IndexLike for Index {
     }
 }
 
-pub struct MappedIndex {
-    mmap: Mmap,
+pub struct InMemoryIndex {
+    buf: Vec<u8>,
     offsets_ptr: *const u32,
     offsets_len: usize,
     seeds_ptr: *const u64,
@@ -310,18 +309,19 @@ pub struct MappedIndex {
     ref_name_ranges: Vec<Range<usize>>,
 }
 
-unsafe impl Send for MappedIndex {}
-unsafe impl Sync for MappedIndex {}
+unsafe impl Send for InMemoryIndex {}
+unsafe impl Sync for InMemoryIndex {}
 
-impl MappedIndex {
+impl InMemoryIndex {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = File::open(path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        Self::from_mmap(mmap)
+        let mut file = File::open(path)?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).context("read index file")?;
+        Self::from_bytes(buf)
     }
 
-    fn from_mmap(mmap: Mmap) -> Result<Self> {
-        let data = &mmap[..];
+    fn from_bytes(buf: Vec<u8>) -> Result<Self> {
+        let data = &buf[..];
         let mut pos = 0usize;
 
         fn read_u64(data: &[u8], pos: &mut usize, label: &str) -> Result<u64> {
@@ -398,7 +398,7 @@ impl MappedIndex {
         }
 
         Ok(Self {
-            mmap,
+            buf,
             offsets_ptr,
             offsets_len,
             seeds_ptr,
@@ -411,7 +411,7 @@ impl MappedIndex {
     }
 }
 
-impl IndexLike for MappedIndex {
+impl IndexLike for InMemoryIndex {
     fn offsets(&self) -> &[u32] {
         unsafe { std::slice::from_raw_parts(self.offsets_ptr, self.offsets_len) }
     }
@@ -433,11 +433,11 @@ impl IndexLike for MappedIndex {
     }
 
     fn ref_seq(&self, id: usize) -> &[u8] {
-        &self.mmap[self.ref_seq_ranges[id].clone()]
+        &self.buf[self.ref_seq_ranges[id].clone()]
     }
 
     fn ref_name(&self, id: usize) -> &str {
-        let bytes = &self.mmap[self.ref_name_ranges[id].clone()];
+        let bytes = &self.buf[self.ref_name_ranges[id].clone()];
         unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 }
@@ -1213,17 +1213,7 @@ fn gen_cigar(
 
     let mut cigar = Vec::with_capacity(32);
 
-    let center_diag = (filtered[0].ref_pos as i32) - (filtered[0].read_pos as i32);
-    let mut max_diag_dev = 0i32;
-    for h in &filtered {
-        let d = (h.ref_pos as i32) - (h.read_pos as i32);
-        let dev = (d - center_diag).abs();
-        if dev > max_diag_dev {
-            max_diag_dev = dev;
-        }
-    }
-    let adaptive_band = ((max_diag_dev + 2).min(CONFIG.band_width as i32)).max(1) as usize;
-    let skip_nw_all = max_diag_dev == 0;
+    let band = CONFIG.band_width.max(1);
     let first = filtered[0];
 
     let r_start = first.read_pos as usize;
@@ -1265,17 +1255,13 @@ fn gen_cigar(
             let r_gap_seq = &read_seq[curr_r..next_r];
             let g_gap_end = next_g.min(ref_seq.len());
             let g_gap_seq = if curr_g < g_gap_end { &ref_seq[curr_g..g_gap_end] } else { &[] };
-            if skip_nw_all {
-                if gap_r == gap_g {
-                    let match_len = gap_r.min(g_gap_seq.len());
-                    if match_len > 0 {
-                        push_cigar(&mut cigar, match_len as u32, 0);
-                    }
-                } else {
-                    align_gap_nw(&mut cigar, r_gap_seq, g_gap_seq, dp_buf, trace_buf, adaptive_band);
+            if gap_r == gap_g {
+                let match_len = gap_r.min(g_gap_seq.len());
+                if match_len > 0 {
+                    push_cigar(&mut cigar, match_len as u32, 0);
                 }
             } else {
-                align_gap_nw(&mut cigar, r_gap_seq, g_gap_seq, dp_buf, trace_buf, adaptive_band);
+                align_gap_nw(&mut cigar, r_gap_seq, g_gap_seq, dp_buf, trace_buf, band);
             }
         }
 
