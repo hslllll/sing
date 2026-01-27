@@ -12,14 +12,27 @@ use std::ops::Range;
 use std::path::Path;
 
 const WINDOW: usize = 16;
-const SYNC_S: usize = 4;
+const SYNC_S: usize = 2;
 
 const BASES: [u64; 4] = [
-    0x243f_6a88_85a3_08d3,
-    0xb7e1_5162_8aed_2a6a,
-    0x6a09_e667_f3bc_c908,
-    0xbb67_ae85_84ca_a73b,
+    (std::f64::consts::E - 2f64).to_bits(),
+    (std::f64::consts::PI - 3.0).to_bits(),
+    (std::f64::consts::SQRT_2 - 1.0).to_bits(),
+    (1.7320508075688772f64 - 1.0).to_bits(),
 ];
+
+const BASE_LUT: [i8; 256] = {
+    let mut lut = [(-1i8); 256];
+    lut[b'A' as usize] = 0;
+    lut[b'a' as usize] = 0;
+    lut[b'C' as usize] = 1;
+    lut[b'c' as usize] = 1;
+    lut[b'G' as usize] = 2;
+    lut[b'g' as usize] = 2;
+    lut[b'T' as usize] = 3;
+    lut[b't' as usize] = 3;
+    lut
+};
 
 const ROT: u32 = 1;
 
@@ -577,15 +590,11 @@ impl State {
 
 #[inline(always)]
 fn base_to_index(b: u8) -> Option<usize> {
-    match b {
-        b'A' | b'a' => Some(0),
-        b'C' | b'c' => Some(1),
-        b'G' | b'g' => Some(2),
-        b'T' | b't' => Some(3),
-        _ => None,
-    }
+    let v = BASE_LUT[b as usize];
+    if v >= 0 { Some(v as usize) } else { None }
 }
 
+#[inline(always)]
 pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     out.clear();
     if seq.len() < WINDOW || WINDOW < SYNC_S {
@@ -593,6 +602,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     }
 
     const Q_SIZE: usize = 32;
+    const Q_MASK: usize = Q_SIZE - 1;
     let mut q_pos = [0u32; Q_SIZE];
     let mut q_hash = [u64::MAX; Q_SIZE];
     let mut head = 0;
@@ -649,15 +659,15 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
             let s_pos_u32 = s_pos as u32;
 
             while tail > head {
-                if q_hash[(tail - 1) % Q_SIZE] >= s_hash {
+                if q_hash[(tail - 1) & Q_MASK] >= s_hash {
                     tail -= 1;
                 } else {
                     break;
                 }
             }
 
-            q_hash[tail % Q_SIZE] = s_hash;
-            q_pos[tail % Q_SIZE] = s_pos_u32;
+            q_hash[tail & Q_MASK] = s_hash;
+            q_pos[tail & Q_MASK] = s_pos_u32;
             tail += 1;
         }
 
@@ -666,12 +676,12 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
             let min_pos = k_pos as u32;
             let max_pos = (k_pos + WINDOW - SYNC_S) as u32;
 
-            while head < tail && q_pos[head % Q_SIZE] < min_pos {
+            while head < tail && q_pos[head & Q_MASK] < min_pos {
                 head += 1;
             }
 
             if head < tail {
-                let m_pos = q_pos[head % Q_SIZE];
+                let m_pos = q_pos[head & Q_MASK];
                 if m_pos <= max_pos {
                     
                     
@@ -688,12 +698,13 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     }
 }
 
+#[inline(always)]
 fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, out: &mut Vec<Hit>) {
     let freq_filter = idx.freq_filter() as usize;
+    let offsets = idx.offsets();
+    let seeds = idx.seeds();
     for &(h, r_pos) in mins {
         let bucket = (h >> SHIFT) as usize;
-        let offsets = idx.offsets();
-        let seeds = idx.seeds();
         let start = offsets[bucket] as usize;
         let end = offsets
             .get(bucket + 1)
@@ -709,8 +720,7 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, 
         let weight = CONFIG.seed_weight;
 
         let target_hash = (h & 0xFFFF) as u64;
-        for i in start..end {
-            let seed = seeds[i];
+        for &seed in &seeds[start..end] {
             if (seed >> 48) == target_hash {
                 let rid = ((seed >> 32) & 0xFFFF) as u32;
                 let pos = seed as u32;
@@ -724,6 +734,7 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, 
     }
 }
 
+#[inline(always)]
 fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
     if candidates.is_empty() {
         return (ChainRes::default(), ChainRes::default());
@@ -817,6 +828,7 @@ fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
     (best_chain, ChainRes::default())
 }
 
+#[inline(always)]
 fn extend_left(read: &[u8], ref_seq: &[u8], r_start: usize, g_start: usize) -> (usize, usize) {
     let mut mismatches = 0;
     
@@ -851,6 +863,7 @@ fn extend_left(read: &[u8], ref_seq: &[u8], r_start: usize, g_start: usize) -> (
     (best_len, best_mismatches)
 }
 
+#[inline(always)]
 fn extend_right(read: &[u8], ref_seq: &[u8], r_start: usize, g_start: usize) -> (usize, usize) {
     let mut mismatches = 0;
     
@@ -890,6 +903,7 @@ fn extend_right(read: &[u8], ref_seq: &[u8], r_start: usize, g_start: usize) -> 
     (best_len, best_mismatches)
 }
 
+#[inline(always)]
 fn push_cigar(cigar: &mut Vec<u32>, len: u32, op: u32) {
     if len == 0 {
         return;
@@ -903,6 +917,7 @@ fn push_cigar(cigar: &mut Vec<u32>, len: u32, op: u32) {
     cigar.push((len << 4) | op);
 }
 
+#[inline(always)]
 pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
     let mut span = 0;
     for &c in cigar {
