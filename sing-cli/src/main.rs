@@ -117,9 +117,14 @@ fn main() -> Result<()> {
             }
 
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-            let threads = threads.unwrap_or(max_hw).min(max_hw).max(1);
-            let batch_size = threads * 256;
-            let batch_cap = threads * 16;
+            let total_threads = threads.unwrap_or(max_hw).min(max_hw).max(2);
+            
+            let worker_threads = ((total_threads - 1) * 3) / 4;  
+            let reader_threads = total_threads - 1 - worker_threads;  
+            let reader_threads = reader_threads.max(1);  
+            
+            let batch_size = 4096;
+            let batch_cap = worker_threads * 16;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
@@ -131,7 +136,8 @@ fn main() -> Result<()> {
             let paired_mode = r2.is_some();
             let mut reader_handles = Vec::new();
 
-            eprintln!("Mapping started with {} threads...", threads);
+            eprintln!("Mapping started with {} threads (readers: {}, workers: {}, writer: 1)...", 
+                      total_threads, reader_threads, worker_threads);
             let total_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mapped_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -144,7 +150,6 @@ fn main() -> Result<()> {
                 let pairs: Vec<(PathBuf, PathBuf)> = r1.into_iter().zip(r2.into_iter()).collect();
                 let pair_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-                let reader_threads = (threads / 2).max(1);
                 for _ in 0..reader_threads {
                     let pairs = pairs.clone();
                     let pair_idx = pair_idx.clone();
@@ -221,7 +226,6 @@ fn main() -> Result<()> {
             } else {
                 let r1_paths = r1.clone();
                 let r1_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let reader_threads = (threads / 2).max(1);
                 for _ in 0..reader_threads {
                     let r1_paths = r1_paths.clone();
                     let r1_idx = r1_idx.clone();
@@ -290,7 +294,7 @@ fn main() -> Result<()> {
             }
 
             let idx_writer = idx.clone();
-            let max_write_merge = std::cmp::min(std::cmp::max(threads * 1024 * 1024, 8 * 1024 * 1024), 64 * 1024 * 1024);
+            let max_write_merge = std::cmp::min(std::cmp::max(worker_threads * 1024 * 1024, 8 * 1024 * 1024), 64 * 1024 * 1024);
             let writer = thread::spawn(move || {
                 let mut out: Box<dyn Write> = match output {
                     Some(p) => Box::new(BufWriter::with_capacity(16 * 1024 * 1024, File::create(p).unwrap())),
@@ -318,7 +322,7 @@ fn main() -> Result<()> {
             });
 
             let mut handles = Vec::new();
-            for _ in 0..threads {
+            for _ in 0..worker_threads {
                 let rx = rx.clone();
                 let w_tx = w_tx.clone();
                 let recycle_tx = recycle_tx.clone();

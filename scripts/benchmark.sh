@@ -41,6 +41,7 @@ fi
 
 COVERAGE_LIST=(3 5 10)
 MUT_RATES=(0.001 0.01)
+THREADS=4
 
 OUTPUT_CSV="benchmark_results_f1.${MODE}.csv"
 
@@ -265,7 +266,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         echo "1. Running Sing..."
         START=$(date +%s%N)
-        if ./target/release/sing map -t 8 "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" -o "sing.${MODE}.sam"; then
+        if ./target/release/sing map -t "$THREADS" "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" -o "sing.${MODE}.sam"; then
             END=$(date +%s%N)
             TIME_SING=$(( (END - START) / 1000000 ))
         else
@@ -275,7 +276,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         echo "2. Running Minimap2..."
         START=$(date +%s%N)
-        if minimap2 -t 8 -ax sr "$REF_DECOMP" "$R1" "$R2" > "minimap.${MODE}.sam" 2>/dev/null; then
+        if minimap2 -t "$THREADS" -ax sr "$REF_DECOMP" "$R1" "$R2" > "minimap.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_MM=$(( (END - START) / 1000000 ))
         else
@@ -286,7 +287,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         echo "3. Running Columba..."
         START=$(date +%s%N)
         if command -v columba &> /dev/null; then
-             if columba -t 8 -r "$REF_DECOMP" -f "$R1" -F "$R2" -o "columba.${MODE}.sam" > /dev/null 2>&1; then
+             if columba -t "$THREADS" -r "$REF_DECOMP" -f "$R1" -F "$R2" -o "columba.${MODE}.sam" > /dev/null 2>&1; then
                  END=$(date +%s%N)
                  TIME_COL=$(( (END - START) / 1000000 ))
              else
@@ -300,7 +301,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         
         echo "4. Running BWA-MEM2..."
         START=$(date +%s%N)
-        if bwa-mem2 mem -t 8 "$REF_DECOMP" "$R1" "$R2" > "bwa.${MODE}.sam" 2>/dev/null; then
+        if bwa-mem2 mem -t "$THREADS" "$REF_DECOMP" "$R1" "$R2" > "bwa.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_BWA=$(( (END - START) / 1000000 ))
         else
@@ -310,7 +311,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         echo "5. Running Bowtie2..."
         START=$(date +%s%N)
-        if bowtie2 -p 8 -x "$REF_DECOMP" -1 "$R1" -2 "$R2" > "bowtie2.${MODE}.sam" 2>/dev/null; then
+        if bowtie2 -p "$THREADS" -x "$REF_DECOMP" -1 "$R1" -2 "$R2" > "bowtie2.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_BT2=$(( (END - START) / 1000000 ))
         else
