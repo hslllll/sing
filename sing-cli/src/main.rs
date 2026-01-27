@@ -117,13 +117,11 @@ fn main() -> Result<()> {
             }
 
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-            let total_threads = threads.unwrap_or(max_hw).max(2);
+            let worker_threads = threads.unwrap_or(max_hw).max(1);
             
-            let worker_threads = ((total_threads - 1) * 3) / 4;  
-            let reader_threads = total_threads - 1 - worker_threads;  
-            let reader_threads = reader_threads.max(1);  
+            let reader_threads = (worker_threads / 4).max(1).min(4);
             
-            let batch_size = 4096;
+            let batch_size = worker_threads * 256;
             let batch_cap = worker_threads * 16;
 
             eprintln!("Loading index from {:?}...", index);
@@ -136,8 +134,8 @@ fn main() -> Result<()> {
             let paired_mode = r2.is_some();
             let mut reader_handles = Vec::new();
 
-            eprintln!("Mapping started with {} threads (readers: {}, workers: {}, writer: 1)...", 
-                      total_threads, reader_threads, worker_threads);
+            eprintln!("Mapping with {} worker threads ({} readers, 1 writer)...", 
+                      worker_threads, reader_threads);
             let total_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mapped_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
