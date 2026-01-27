@@ -105,8 +105,8 @@ fn main() -> Result<()> {
 
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let threads = threads.min(max_hw);
-            let batch_size = threads * 512;
-            let batch_cap = threads * 4;
+            let batch_size = threads * 1024;
+            let batch_cap = threads * 8;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
