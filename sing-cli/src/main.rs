@@ -421,17 +421,19 @@ fn format_sam<I: IndexLike>(
     } else {
         flag |= 0x80;
     }
-    let is_mapped = res.is_some();
-    let is_mate_mapped = mate_res.is_some();
-    let (final_seq, final_qual) = oriented_bases(seq, qual, res);
-    if let Some(r) = res {
+    let valid_res = res.as_ref().filter(|r| (r.ref_id as usize) < idx.ref_count());
+    let valid_mate = mate_res.as_ref().filter(|m| (m.ref_id as usize) < idx.ref_count());
+    let is_mapped = valid_res.is_some();
+    let is_mate_mapped = valid_mate.is_some();
+    let (final_seq, final_qual) = oriented_bases(seq, qual, &valid_res.cloned());
+    if let Some(r) = valid_res {
         if r.is_rev {
             flag |= 0x10;
         }
     } else {
         flag |= 0x4;
     }
-    if let Some(m) = mate_res {
+    if let Some(m) = valid_mate {
         if m.is_rev {
             flag |= 0x20;
         }
@@ -445,7 +447,7 @@ fn format_sam<I: IndexLike>(
     let mut pos = 0;
     let mut mapq = 0;
     let mut cigar_ref: Option<&Vec<u32>> = None;
-    if let Some(r) = res {
+    if let Some(r) = valid_res {
         rname = idx.ref_name(r.ref_id as usize);
         pos = r.pos + 1;
         mapq = r.mapq;
@@ -453,9 +455,9 @@ fn format_sam<I: IndexLike>(
     }
     let mut rnext = "*";
     let mut pnext = 0;
-    if let Some(m) = mate_res {
+    if let Some(m) = valid_mate {
         pnext = m.pos + 1;
-        if let Some(r) = res {
+        if let Some(r) = valid_res {
             if m.ref_id == r.ref_id {
                 rnext = "=";
             } else {
@@ -475,7 +477,7 @@ fn format_sam<I: IndexLike>(
     out.extend_from_slice(&final_seq);
     out.push(b'\t');
     out.extend_from_slice(&final_qual);
-    if let Some(r) = res {
+    if let Some(r) = valid_res {
         write!(out, "\tNM:i:{}\tAS:i:{}", r.nm, r.as_score).unwrap();
         if !r.md.is_empty() {
             write!(out, "\tMD:Z:{}", r.md).unwrap();
@@ -496,20 +498,21 @@ fn format_sam_single<I: IndexLike>(
     out.extend_from_slice(name.as_bytes());
     out.push(b'\t');
     let mut flag = 0u16;
-    if res.is_none() {
+    let valid_res = res.as_ref().filter(|r| (r.ref_id as usize) < idx.ref_count());
+    if valid_res.is_none() {
         flag |= 0x4;
     }
-    if let Some(r) = res {
+    if let Some(r) = valid_res {
         if r.is_rev {
             flag |= 0x10;
         }
     }
-    let (final_seq, final_qual) = oriented_bases(seq, qual, res);
+    let (final_seq, final_qual) = oriented_bases(seq, qual, &valid_res.cloned());
     let mut rname = "*";
     let mut pos = 0;
     let mut mapq = 0;
     let mut cigar_ref: Option<&Vec<u32>> = None;
-    if let Some(r) = res {
+    if let Some(r) = valid_res {
         rname = idx.ref_name(r.ref_id as usize);
         pos = r.pos + 1;
         mapq = r.mapq;
@@ -525,7 +528,7 @@ fn format_sam_single<I: IndexLike>(
     out.extend_from_slice(&final_seq);
     out.push(b'\t');
     out.extend_from_slice(&final_qual);
-    if let Some(r) = res {
+    if let Some(r) = valid_res {
         write!(out, "\tNM:i:{}\tAS:i:{}", r.nm, r.as_score).unwrap();
         if !r.md.is_empty() {
             write!(out, "\tMD:Z:{}", r.md).unwrap();

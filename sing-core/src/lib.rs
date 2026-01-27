@@ -1339,12 +1339,15 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         }
         let hits = &candidates[chain.start..chain.end];
         let ref_id = (hits[0].id_strand >> 1) as i32;
+        if ref_id < 0 || (ref_id as usize) >= idx.ref_count() {
+            return None;
+        }
         let is_rev = (hits[0].id_strand & 1) == 1;
         let target_seq = if is_rev { rev } else { seq };
         let ref_seq = idx.ref_seq(ref_id as usize);
 
         let (cigar, pos) = gen_cigar(hits, target_seq, ref_seq, dp_buf, trace_buf);
-        if pos < 0 {
+        if pos < 0 || (pos as usize) >= ref_seq.len() {
             return None;
         }
 
