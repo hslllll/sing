@@ -4,7 +4,6 @@ use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
 use memmap2::MmapOptions;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::ops::Range;
@@ -702,14 +701,20 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, 
     let offsets = idx.offsets();
     let seeds = idx.seeds();
     let offsets_len = offsets.len();
+    let mut last_bucket = usize::MAX;
+    let mut start = 0usize;
+    let mut end = 0usize;
     for &(h, r_pos) in mins {
         let bucket = (h >> SHIFT) as usize;
-        let start = unsafe { *offsets.get_unchecked(bucket) } as usize;
-        let end = if bucket + 1 < offsets_len {
-            (unsafe { *offsets.get_unchecked(bucket + 1) }) as usize
-        } else {
-            seeds.len()
-        };
+        if bucket != last_bucket {
+            start = unsafe { *offsets.get_unchecked(bucket) } as usize;
+            end = if bucket + 1 < offsets_len {
+                (unsafe { *offsets.get_unchecked(bucket + 1) }) as usize
+            } else {
+                seeds.len()
+            };
+            last_bucket = bucket;
+        }
 
         let count = end - start;
 
@@ -742,76 +747,38 @@ fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
     }
 
     let bin_width = (WINDOW as i32).max(1);
-    let mut counts: HashMap<(u32, i32), u32> = HashMap::with_capacity(candidates.len() / 2 + 1);
-    for hit in candidates.iter() {
-        let bin = hit.diag.div_euclid(bin_width);
-        *counts.entry((hit.id_strand, bin)).or_insert(0) += 1;
-    }
+    candidates.sort_unstable_by(|a, b| {
+        let a_key = (a.id_strand, a.diag.div_euclid(bin_width));
+        let b_key = (b.id_strand, b.diag.div_euclid(bin_width));
+        a_key.cmp(&b_key)
+    });
 
-    let mut best_key: Option<(u32, i32)> = None;
-    let mut second_key: Option<(u32, i32)> = None;
-    let mut best_count = 0u32;
-    let mut second_count = 0u32;
-    for (&key, &count) in counts.iter() {
-        if count > best_count {
-            second_count = best_count;
-            second_key = best_key;
-            best_count = count;
-            best_key = Some(key);
-        } else if count > second_count {
-            second_count = count;
-            second_key = Some(key);
-        }
-    }
+    let mut best = ChainRes::default();
+    let mut second = ChainRes::default();
 
-    if best_count == 0 {
-        return (ChainRes::default(), ChainRes::default());
-    }
-
-    let mut reordered = Vec::with_capacity(candidates.len());
-
-    if let Some(key) = best_key {
-        for hit in candidates.iter() {
-            let bin = hit.diag.div_euclid(bin_width);
-            if (hit.id_strand, bin) == key {
-                reordered.push(*hit);
+    let mut i = 0usize;
+    while i < candidates.len() {
+        let key = (candidates[i].id_strand, candidates[i].diag.div_euclid(bin_width));
+        let start = i;
+        let mut end = i + 1;
+        while end < candidates.len() {
+            let next_key = (candidates[end].id_strand, candidates[end].diag.div_euclid(bin_width));
+            if next_key != key {
+                break;
             }
+            end += 1;
         }
+        let score = (end - start) as i32;
+        if score > best.score {
+            second = best;
+            best = ChainRes { score, start, end };
+        } else if score > second.score {
+            second = ChainRes { score, start, end };
+        }
+        i = end;
     }
 
-    if let Some(key) = second_key {
-        for hit in candidates.iter() {
-            let bin = hit.diag.div_euclid(bin_width);
-            if (hit.id_strand, bin) == key {
-                reordered.push(*hit);
-            }
-        }
-    }
-
-    for hit in candidates.iter() {
-        let bin = hit.diag.div_euclid(bin_width);
-        let key = (hit.id_strand, bin);
-        if Some(key) != best_key && Some(key) != second_key {
-            reordered.push(*hit);
-        }
-    }
-
-    *candidates = reordered;
-
-    let best_start = 0usize;
-    let best_end = best_count as usize;
-
-    let second_start = best_end;
-    let second_end = second_start + second_count as usize;
-
-    let best_chain = ChainRes { score: best_count as i32, start: best_start, end: best_end };
-    let second_chain = if second_count > 0 && second_end > second_start {
-        ChainRes { score: second_count as i32, start: second_start, end: second_end }
-    } else {
-        ChainRes::default()
-    };
-
-    (best_chain, second_chain)
+    (best, second)
 }
 
 
@@ -958,6 +925,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     candidates.clear();
 
     get_syncmers(seq, mins);
+    mins.sort_unstable_by_key(|(h, _)| (*h >> SHIFT) as u32);
     collect_candidates(idx, mins, false, candidates);
 
     rev.clear();
@@ -973,6 +941,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         _ => b'N',
     }));
     get_syncmers(rev, mins);
+    mins.sort_unstable_by_key(|(h, _)| (*h >> SHIFT) as u32);
     collect_candidates(idx, mins, true, candidates);
 
     if candidates.is_empty() {
