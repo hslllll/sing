@@ -129,7 +129,6 @@ fn main() -> Result<()> {
 
             let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = unbounded();
             let (recycle_tx, recycle_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = unbounded();
-            let (w_tx, w_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = unbounded();
             let paired_mode = r2.is_some();
             let mut reader_handles = Vec::new();
 
@@ -308,29 +307,16 @@ fn main() -> Result<()> {
                 writeln!(out, "@RG\tID:sing\tSM:song\tPL:ILLUMINA")?;
                 writeln!(out, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION)?;
             }
-            
-            
-            let mut writer_handles = Vec::new();
-            for _ in 0..reader_threads {
-                let w_rx = w_rx.clone();
-                let writer = shared_writer.clone();
-                
-                writer_handles.push(thread::spawn(move || {
-                    while let Ok(chunk) = w_rx.recv() {
-                        let mut out = writer.lock().unwrap();
-                        out.write_all(&chunk).unwrap();
-                    }
-                }));
-            }
 
             let mut handles = Vec::new();
             for _ in 0..worker_threads {
                 let rx = rx.clone();
-                let w_tx = w_tx.clone();
                 let recycle_tx = recycle_tx.clone();
                 let idx = idx.clone();
                 let total_reads = total_reads.clone();
                 let mapped_reads = mapped_reads.clone();
+                let writer = shared_writer.clone();
+                
                 handles.push(thread::spawn(move || {
                     let mut state = State::new();
                     let mut rev_buf = Vec::new();
@@ -406,7 +392,13 @@ fn main() -> Result<()> {
                                 format_sam_single(&mut output_chunk, name, s1, q1, &a1, &idx);
                             }
                         }
-                        try_send_retry(&w_tx, output_chunk);
+                        
+                        
+                        {
+                            let mut out = writer.lock().unwrap();
+                            out.write_all(&output_chunk).unwrap();
+                        }
+                        
                         try_send_retry(&recycle_tx, batch);
                     }
                 }));
@@ -420,13 +412,9 @@ fn main() -> Result<()> {
             for h in handles {
                 h.join().unwrap();
             }
-            drop(w_tx);
-            
-            for h in writer_handles {
-                h.join().unwrap();
-            }
             
             
+            shared_writer.lock().unwrap().flush().unwrap();
             shared_writer.lock().unwrap().flush().unwrap();
 
             let total = total_reads.load(std::sync::atomic::Ordering::Relaxed);
