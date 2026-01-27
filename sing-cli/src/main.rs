@@ -290,11 +290,11 @@ fn main() -> Result<()> {
             }
 
             let idx_writer = idx.clone();
-            let max_write_merge = std::cmp::min(std::cmp::max(worker_threads * 512 * 1024, 4 * 1024 * 1024), 32 * 1024 * 1024);
+            let max_write_merge = std::cmp::min(std::cmp::max(worker_threads * 256 * 1024, 4 * 1024 * 1024), 16 * 1024 * 1024);
             let writer = thread::spawn(move || {
                 let mut out: Box<dyn Write> = match output {
-                    Some(p) => Box::new(BufWriter::with_capacity(8 * 1024 * 1024, File::create(p).unwrap())),
-                    None => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout())),
+                    Some(p) => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p).unwrap())),
+                    None => Box::new(BufWriter::with_capacity(2 * 1024 * 1024, std::io::stdout())),
                 };
 
                 writeln!(out, "@HD\tVN:1.6\tSO:unsorted").unwrap();
