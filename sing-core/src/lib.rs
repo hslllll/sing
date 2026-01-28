@@ -7,8 +7,8 @@ use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
-const WINDOW: usize = 16;
-const SYNC_S: usize = 4;
+const WINDOW: usize = 20;
+const SYNC_S: usize = 2;
 const WINDOW_I32: i32 = WINDOW as i32;
 const SYNC_S_I32: i32 = SYNC_S as i32;
 const MATCH_SCORE: i32 = if WINDOW_I32 / 10 > 1 { WINDOW_I32 / 10 } else { 1 };
