@@ -852,9 +852,50 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
 }
 
 #[inline(always)]
-fn hough_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> Option<(Vec<u32>, i32, usize)> {
-    if hits.len() < 8 {
-        return None;
+fn gen_cigar_simple(read_seq: &[u8], ref_seq: &[u8], diag: i32) -> (Vec<u32>, i32, usize) {
+    let mut cigar = Vec::with_capacity(8);
+    let read_len = read_seq.len();
+    let ref_len = ref_seq.len();
+
+    let (leading_clip, ref_start) = if diag < 0 {
+        ((-diag) as usize, 0usize)
+    } else {
+        (0usize, diag as usize)
+    };
+
+    if leading_clip >= read_len || ref_start >= ref_len {
+        push_cigar(&mut cigar, read_len as u32, 4);
+        return (cigar, ref_start as i32, 0);
+    }
+
+    let max_align_len = read_len - leading_clip;
+    let ref_avail = ref_len.saturating_sub(ref_start);
+    let aligned_len = max_align_len.min(ref_avail);
+    let trailing_clip = read_len - leading_clip - aligned_len;
+
+    if leading_clip > 0 {
+        push_cigar(&mut cigar, leading_clip as u32, 4);
+    }
+    if aligned_len > 0 {
+        push_cigar(&mut cigar, aligned_len as u32, 0);
+    }
+    if trailing_clip > 0 {
+        push_cigar(&mut cigar, trailing_clip as u32, 4);
+    }
+
+    (cigar, ref_start as i32, aligned_len)
+}
+
+#[inline(always)]
+fn hough_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> (Vec<u32>, i32, usize) {
+    let diag_sum: i64 = hits
+        .iter()
+        .map(|h| (h.ref_pos as i64) - (h.read_pos as i64))
+        .sum();
+    let diag = (diag_sum / hits.len() as i64) as i32;
+
+    if hits.len() < 4 {
+        return gen_cigar_simple(read_seq, ref_seq, diag);
     }
 
     let bin = (WINDOW as i32 / 2).max(1);
@@ -886,7 +927,7 @@ fn hough_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> Option<(V
     }
 
     if best.0 < 4 || second.0 < 3 {
-        return None;
+        return gen_cigar_simple(read_seq, ref_seq, diag);
     }
 
     let best_diag = diags[best.1..best.2]
@@ -902,7 +943,7 @@ fn hough_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> Option<(V
 
     let diag_diff = (second_diag - best_diag) as i32;
     if diag_diff.abs() < 3 {
-        return None;
+        return gen_cigar_simple(read_seq, ref_seq, diag);
     }
 
     let best_mid = (best.1 + best.2) / 2;
@@ -917,7 +958,7 @@ fn hough_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> Option<(V
     let g_split = (r_split as i32 + (best_diag as i32)).max(0) as usize;
 
     if r_split >= read_seq.len() || g_split >= ref_seq.len() {
-        return None;
+        return gen_cigar_simple(read_seq, ref_seq, diag);
     }
 
     let read_len = read_seq.len();
@@ -943,7 +984,7 @@ fn hough_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> Option<(V
     let aligned_len = r_split + tail;
     let ref_start = (best_diag as i32).max(0);
 
-    Some((cigar, ref_start, aligned_len))
+    (cigar, ref_start, aligned_len)
 }
 
 fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32]) -> (i32, String, i32) {
@@ -1060,7 +1101,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         let target_seq = if is_rev { rev } else { seq };
         let ref_seq = idx.ref_seq(ref_id as usize);
 
-        let (cigar, pos, aligned_len) = hough_indel_cigar(hits, target_seq, ref_seq)?;
+        let (cigar, pos, aligned_len) = hough_indel_cigar(hits, target_seq, ref_seq);
         if pos < 0 || (pos as usize) >= ref_seq.len() {
             return None;
         }
