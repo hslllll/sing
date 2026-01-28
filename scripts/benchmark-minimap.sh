@@ -42,7 +42,7 @@ else
     exit 1
 fi
 
-COVERAGE_LIST=(3 5 10)
+READS_N=10000
 MUT_RATES=(0.001 0.01)
 THREADS=4
 
@@ -227,11 +227,10 @@ if [ ! -f "$OUTPUT_CSV" ]; then
     echo "Exp_ID,Tool,Time_ms,TotalReads,TP,FP,FN,Precision,Recall,F1,Mode" > "$OUTPUT_CSV"
 fi
 
-for COVERAGE in "${COVERAGE_LIST[@]}"; do
-    for MUT_RATE in "${MUT_RATES[@]}"; do
-        EXP_ID="Cov_${COVERAGE}_Mut_${MUT_RATE}.${MODE}"
+for MUT_RATE in "${MUT_RATES[@]}"; do
+        EXP_ID="N_${READS_N}_Mut_${MUT_RATE}.${MODE}"
         echo "================================================="
-        echo "Running: $EXP_ID (Cov: $COVERAGE, Mut: $MUT_RATE)"
+        echo "Running: $EXP_ID (N: $READS_N, Mut: $MUT_RATE)"
         echo "================================================="
 
         R1="sim_${EXP_ID}.bwa.read1.fastq.gz"
@@ -240,7 +239,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         if [ -f "$R1" ] && [ -f "$R2" ]; then
             echo "Simulated reads exist. Skipping dwgsim."
         else
-            dwgsim -C "$COVERAGE" -1 150 -2 150 -R 0 -X 0 -r "$MUT_RATE" -y 0 -H "$REF_DECOMP" "sim_${EXP_ID}" > /dev/null 2>&1
+            dwgsim -N "$READS_N" -1 150 -2 150 -R 0 -X 0 -r "$MUT_RATE" -y 0 -H "$REF_DECOMP" "sim_${EXP_ID}" > /dev/null 2>&1
         fi
 
 
@@ -268,7 +267,6 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         rm "minimap.${MODE}.sam"
         echo ""
-    done
 done
 
 echo "Benchmark Complete. Results saved in $OUTPUT_CSV"
