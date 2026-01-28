@@ -23,27 +23,8 @@ pub struct Config {
     pub cluster_window: usize,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            window: 12,
-            sync_s: 5,
-            match_score: 2,
-            mismatch_pen: -3,
-            gap_open: -4,
-            gap_ext: -1,
-            x_drop: 40,
-            maxindel: 8,
-            min_identity: 0.5,
-            downsample_threshold: 60,
-            diag_band: 48,
-            cluster_window: 96,
-        }
-    }
-}
-
 pub static CONFIG: Config = Config {
-    window: 12,
+    window: 20,
     sync_s: 5,
     match_score: 2,
     mismatch_pen: -3,
@@ -53,7 +34,7 @@ pub static CONFIG: Config = Config {
     maxindel: 8,
     min_identity: 0.5,
     downsample_threshold: 60,
-    diag_band: 48,
+    diag_band: 64,
     cluster_window: 96,
 };
 
