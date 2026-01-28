@@ -32,9 +32,9 @@ pub static CONFIG: Config = Config {
     gap_open: -4,
     gap_ext: -1,
     x_drop: 40,
-    max_hits: 500,
+    max_hits: 60,
     maxindel: 8,
-    min_identity: 0.5,
+    min_identity: 0.85,
     downsample_threshold: 60,
     diag_band: 64,
     cluster_window: 96,
@@ -42,7 +42,7 @@ pub static CONFIG: Config = Config {
 
 const WINDOW: usize = CONFIG.window;
 const SYNC_S: usize = CONFIG.sync_s;
-const FREQ_FILTER_ROOT: f64 = 4.0;
+const FREQ_FILTER_ROOT: f64 = 3.0;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
@@ -896,6 +896,15 @@ fn extend_left(
                     }
                     continue;
                 }
+                
+                let x = r_val ^ g_val;
+                let match_bytes = (x.leading_zeros() / 8) as usize;
+                if match_bytes > 0 {
+                    score += cfg.match_score * match_bytes as i32;
+                    match_run += match_bytes as u32;
+                    rp -= match_bytes;
+                    gp -= match_bytes;
+                }
             }
         }
 
@@ -995,6 +1004,15 @@ fn extend_right(
                         best_match_run = match_run;
                     }
                     continue;
+                }
+
+                let x = r_val ^ g_val;
+                let match_bytes = (x.trailing_zeros() / 8) as usize;
+                if match_bytes > 0 {
+                    score += cfg.match_score * match_bytes as i32;
+                    match_run += match_bytes as u32;
+                    rp += match_bytes;
+                    gp += match_bytes;
                 }
              }
         }
@@ -1130,8 +1148,26 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     candidates.clear();
     let max_hits = cfg.max_hits;
     let mut repetitive = false;
+    
+    let offsets = idx.offsets();
+    let offsets_len = offsets.len();
+    let seeds_len = idx.seeds().len() as u32;
+
+    let sort_mins = |mins: &mut Vec<(u32, u32)>| {
+        mins.sort_unstable_by_key(|&(h, _)| {
+            let bucket = (h >> SHIFT) as usize;
+            let start = unsafe { *offsets.get_unchecked(bucket) };
+            let end = if bucket + 1 < offsets_len {
+                unsafe { *offsets.get_unchecked(bucket + 1) }
+            } else {
+                seeds_len
+            };
+            end.wrapping_sub(start)
+        });
+    };
+
     get_syncmers(seq, mins);
-    mins.sort_unstable_by_key(|(h, _)| (*h >> SHIFT) as u32);
+    sort_mins(mins);
     if collect_candidates(idx, mins, false, max_hits, candidates) {
         repetitive = true;
     }
@@ -1142,7 +1178,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         _ => b'N',
     }));
     get_syncmers(rev, mins);
-    mins.sort_unstable_by_key(|(h, _)| (*h >> SHIFT) as u32);
+    sort_mins(mins);
     if collect_candidates(idx, mins, true, max_hits, candidates) {
         repetitive = true;
     }
@@ -1153,7 +1189,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let total_seeds = candidates.len();
     let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_window);
     let c1_count = c1_end - c1_start;
-    if c1_count == 0 {
+    if c1_count < 3 {
         return Vec::new();
     }
     let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_window);

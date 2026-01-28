@@ -8,6 +8,8 @@ target
 
 Cargo.lock
 
+Brassica*
+
 *.sam
 *.bam
 *.svg
