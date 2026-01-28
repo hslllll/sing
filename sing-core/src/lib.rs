@@ -26,7 +26,7 @@ pub struct Config {
 
 pub static CONFIG: Config = Config {
     window: 31,
-    sync_s: 18,
+    sync_s: 16,
     match_score: 2,
     mismatch_pen: -4,
     gap_open: -4,
