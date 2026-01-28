@@ -336,13 +336,11 @@ fn main() -> Result<()> {
                                 Vec::new()
                             };
 
-                            let (a1, a2) = if is_paired {
-                                let mut best_pair = (None, None);
-                                let mut best_score = i32::MIN;
-                                let mut found_concordant = false;
+                            let (final_a1, final_a2) = if is_paired {
+                                let mut valid_pairs = Vec::with_capacity(4);
 
-                                for res1 in &a1_candidates {
-                                    for res2 in &a2_candidates {
+                                for (i, res1) in a1_candidates.iter().enumerate() {
+                                    for (j, res2) in a2_candidates.iter().enumerate() {
                                         if res1.ref_id == res2.ref_id && res1.is_rev != res2.is_rev {
                                             let span1 = cigar_ref_span(&res1.cigar);
                                             let span2 = cigar_ref_span(&res2.cigar);
@@ -354,24 +352,39 @@ fn main() -> Result<()> {
 
                                             if dist < 2000 {
                                                 let score = res1.as_score + res2.as_score;
-                                                if score > best_score {
-                                                    best_score = score;
-                                                    best_pair = (Some(res1), Some(res2));
-                                                    found_concordant = true;
-                                                }
+                                                valid_pairs.push((score, i, j));
                                             }
                                         }
                                     }
                                 }
 
-                                if found_concordant {
-                                    (best_pair.0.cloned(), best_pair.1.cloned())
+                                if !valid_pairs.is_empty() {
+                                    valid_pairs.sort_by(|a, b| b.0.cmp(&a.0));
+                                    let (best_score, i, j) = valid_pairs[0];
+                                    let mut best_res1 = a1_candidates[i].clone();
+                                    let mut best_res2 = a2_candidates[j].clone();
+
+                                    let mapq = if valid_pairs.len() > 1 {
+                                        let (second_score, _, _) = valid_pairs[1];
+                                        let diff = best_score - second_score;
+                                        if diff > 30 { 60 } else { (diff * 2) as u8 }
+                                    } else {
+                                        60
+                                    };
+                                    
+                                    best_res1.mapq = mapq;
+                                    best_res2.mapq = mapq;
+                                    
+                                    (Some(best_res1), Some(best_res2))
                                 } else {
                                     (a1_candidates.first().cloned(), a2_candidates.first().cloned())
                                 }
                             } else {
                                 (a1_candidates.first().cloned(), None)
                             };
+
+                            let a1 = final_a1;
+                            let a2 = final_a2;
 
                             total_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if a1.is_some() {

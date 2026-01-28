@@ -16,6 +16,7 @@ pub struct Config {
     pub gap_open: i32,
     pub gap_ext: i32,
     pub x_drop: i32,
+    pub max_hits: usize,
     pub maxindel: usize,
     pub min_identity: f32,
     pub downsample_threshold: u32,
@@ -31,6 +32,7 @@ pub static CONFIG: Config = Config {
     gap_open: -4,
     gap_ext: -1,
     x_drop: 40,
+    max_hits: 500,
     maxindel: 8,
     min_identity: 0.5,
     downsample_threshold: 60,
@@ -40,7 +42,7 @@ pub static CONFIG: Config = Config {
 
 const WINDOW: usize = CONFIG.window;
 const SYNC_S: usize = CONFIG.sync_s;
-const FREQ_FILTER_ROOT: f64 = 5.0;
+const FREQ_FILTER_ROOT: f64 = 4.0;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
@@ -856,6 +858,8 @@ fn find_densest_cluster(hits: &[Hit], band: i32, window: usize) -> (usize, usize
     (best_start, best_end, hits.get(median_idx).map_or(0, |h| h.diag))
 }
 
+const CASE_MASK: u64 = 0x2020202020202020;
+
 #[inline(always)]
 fn extend_left(
     read: &[u8],
@@ -874,6 +878,27 @@ fn extend_left(
     let mut best_match_run = 0;
 
     while rp > 0 && gp > 0 {
+        if rp >= 8 && gp >= 8 {
+            unsafe {
+                let r_val = std::ptr::read_unaligned(read.as_ptr().add(rp - 8) as *const u64) | CASE_MASK;
+                let g_val = std::ptr::read_unaligned(rseq.as_ptr().add(gp - 8) as *const u64) | CASE_MASK;
+                if r_val == g_val {
+                    score += cfg.match_score * 8;
+                    match_run += 8;
+                    rp -= 8;
+                    gp -= 8;
+                    if score > max_score {
+                        max_score = score;
+                        best_rp = rp;
+                        best_gp = gp;
+                        best_cigar_len = cigar.len();
+                        best_match_run = match_run;
+                    }
+                    continue;
+                }
+            }
+        }
+
         let rb = read[rp - 1];
         let gb = rseq[gp - 1];
         if rb.eq_ignore_ascii_case(&gb) {
@@ -953,6 +978,27 @@ fn extend_right(
     let mut best_match_run = 0;
 
     while rp < rlen && gp < glen {
+        if rlen - rp >= 8 && glen - gp >= 8 {
+             unsafe {
+                let r_val = std::ptr::read_unaligned(read.as_ptr().add(rp) as *const u64) | CASE_MASK;
+                let g_val = std::ptr::read_unaligned(rseq.as_ptr().add(gp) as *const u64) | CASE_MASK;
+                if r_val == g_val {
+                    rp += 8;
+                    gp += 8;
+                    score += cfg.match_score * 8;
+                    match_run += 8;
+                    if score > max_score {
+                        max_score = score;
+                        best_rp = rp;
+                        best_gp = gp;
+                        best_cigar_len = cigar.len();
+                        best_match_run = match_run;
+                    }
+                    continue;
+                }
+             }
+        }
+
         let rb = read[rp];
         let gb = rseq[gp];
         if rb.eq_ignore_ascii_case(&gb) {
@@ -1082,7 +1128,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let State { mins, candidates } = state;
     let cfg = &CONFIG;
     candidates.clear();
-    let max_hits = ((seq.len() * SYNC_S + WINDOW - 1) / WINDOW).max(16);
+    let max_hits = cfg.max_hits;
     let mut repetitive = false;
     get_syncmers(seq, mins);
     mins.sort_unstable_by_key(|(h, _)| (*h >> SHIFT) as u32);
