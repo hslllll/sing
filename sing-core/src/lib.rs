@@ -870,6 +870,9 @@ fn extend_left(
     let mut match_run = 0u32;
     let mut best_rp = rp;
     let mut best_gp = gp;
+    let mut best_cigar_len = 0;
+    let mut best_match_run = 0;
+
     while rp > 0 && gp > 0 {
         let rb = read[rp - 1];
         let gb = rseq[gp - 1];
@@ -915,13 +918,16 @@ fn extend_left(
             max_score = score;
             best_rp = rp;
             best_gp = gp;
+            best_cigar_len = cigar.len();
+            best_match_run = match_run;
         }
         if score < max_score - cfg.x_drop {
             break;
         }
     }
-    if match_run > 0 {
-        cigar.push((match_run << 4) | 0);
+    cigar.truncate(best_cigar_len);
+    if best_match_run > 0 {
+        cigar.push((best_match_run << 4) | 0);
     }
     cigar.reverse();
     (max_score, best_rp, best_gp, cigar)
@@ -943,6 +949,9 @@ fn extend_right(
     let mut match_run = 0u32;
     let mut best_rp = rp;
     let mut best_gp = gp;
+    let mut best_cigar_len = 0;
+    let mut best_match_run = 0;
+
     while rp < rlen && gp < glen {
         let rb = read[rp];
         let gb = rseq[gp];
@@ -988,13 +997,16 @@ fn extend_right(
             max_score = score;
             best_rp = rp;
             best_gp = gp;
+            best_cigar_len = cigar.len();
+            best_match_run = match_run;
         }
         if score < max_score - cfg.x_drop {
             break;
         }
     }
-    if match_run > 0 {
-        cigar.push((match_run << 4) | 0);
+    cigar.truncate(best_cigar_len);
+    if best_match_run > 0 {
+        cigar.push((best_match_run << 4) | 0);
     }
     (max_score, best_rp, best_gp, cigar)
 }
