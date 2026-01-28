@@ -274,7 +274,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         echo "1. Running Sing..."
         START=$(date +%s%N)
-        if ./target/release/sing map -t "$THREADS" "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" -o "sing.${MODE}.sam"; then
+        if ./target/release/sing map -t "$THREADS" "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" > "sing.${MODE}.sam"; then
             END=$(date +%s%N)
             TIME_SING=$(( (END - START) / 1000000 ))
         else
@@ -295,7 +295,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         echo "3. Running Columba..."
         START=$(date +%s%N)
         if command -v columba &> /dev/null; then
-             if columba -t "$THREADS" -r "$REF_DECOMP" -f "$R1" -F "$R2" -o "columba.${MODE}.sam" > /dev/null 2>&1; then
+             if columba -t "$THREADS" -r "$REF_DECOMP" -f "$R1" -F "$R2" > "columba.${MODE}.sam" 2> /dev/null; then
                  END=$(date +%s%N)
                  TIME_COL=$(( (END - START) / 1000000 ))
              else

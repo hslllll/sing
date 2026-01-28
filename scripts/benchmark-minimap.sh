@@ -246,7 +246,7 @@ for MUT_RATE in "${MUT_RATES[@]}"; do
 
         echo "1. Running Sing..."
         START=$(date +%s%N)
-        if ./target/release/sing map -t "$THREADS" "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" -o "sing.${MODE}.sam"; then
+        if ./target/release/sing map -t "$THREADS" "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" > "sing.${MODE}.sam"; then
             END=$(date +%s%N)
             TIME_SING=$(( (END - START) / 1000000 ))
         else
