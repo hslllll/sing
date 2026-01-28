@@ -295,7 +295,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         echo "3. Running Columba..."
         START=$(date +%s%N)
         if command -v columba &> /dev/null; then
-             if columba -t "$THREADS" -r "$REF_DECOMP" -f "$R1" -F "$R2" > "columba.${MODE}.sam" 2> /dev/null; then
+             if columba -t "$THREADS" -r "$REF_DECOMP" -f "$R1" -F "$R2" -o "columba.${MODE}.sam" > /dev/null 2>&1; then
                  END=$(date +%s%N)
                  TIME_COL=$(( (END - START) / 1000000 ))
              else
