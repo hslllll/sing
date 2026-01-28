@@ -121,7 +121,7 @@ fn main() -> Result<()> {
             
             let reader_threads = (worker_threads / 4).max(1).min(8);
             
-            let batch_size = worker_threads * 64;
+            let batch_size = worker_threads * 1024;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
@@ -309,6 +309,20 @@ fn main() -> Result<()> {
                 writeln!(out, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION)?;
             }
 
+            let writer_threads = (worker_threads / 2).max(1);
+            let (wtx, wrx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(writer_threads * 8);
+            let mut writer_handles = Vec::new();
+            for _ in 0..writer_threads {
+                let wrx = wrx.clone();
+                let writer = shared_writer.clone();
+                writer_handles.push(thread::spawn(move || {
+                    while let Ok(chunk) = wrx.recv() {
+                        let mut out = writer.lock().unwrap();
+                        out.write_all(&chunk).unwrap();
+                    }
+                }));
+            }
+
             let mut handles = Vec::new();
             for _ in 0..worker_threads {
                 let rx = rx.clone();
@@ -316,7 +330,7 @@ fn main() -> Result<()> {
                 let idx = idx.clone();
                 let total_reads = total_reads.clone();
                 let mapped_reads = mapped_reads.clone();
-                let writer = shared_writer.clone();
+                let wtx = wtx.clone();
                 
                 handles.push(thread::spawn(move || {
                     let mut state = State::new();
@@ -445,10 +459,7 @@ fn main() -> Result<()> {
                         }
                         
                         
-                        {
-                            let mut out = writer.lock().unwrap();
-                            out.write_all(&output_chunk).unwrap();
-                        }
+                        let _ = wtx.send(output_chunk);
                         
                         try_send_retry(&recycle_tx, batch);
                     }
@@ -465,6 +476,10 @@ fn main() -> Result<()> {
                 h.join().unwrap();
             }
             drop(recycle_tx);  
+            drop(wtx);
+            for h in writer_handles {
+                h.join().unwrap();
+            }
             
             
             shared_writer.lock().unwrap().flush().unwrap();
