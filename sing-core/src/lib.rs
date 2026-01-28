@@ -1078,7 +1078,7 @@ fn compute_nm(read: &[u8], rseq: &[u8], pos: i32, cigar: &[u32]) -> i32 {
     nm
 }
 
-pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec<u8>) -> Option<AlignmentResult> {
+pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec<u8>) -> Vec<AlignmentResult> {
     let State { mins, candidates } = state;
     let cfg = &CONFIG;
     candidates.clear();
@@ -1101,14 +1101,14 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         repetitive = true;
     }
     if candidates.is_empty() {
-        return None;
+        return Vec::new();
     }
     candidates.sort_unstable_by(|a, b| (a.id_strand, a.diag).cmp(&(b.id_strand, b.diag)));
     let total_seeds = candidates.len();
     let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_window);
     let c1_count = c1_end - c1_start;
     if c1_count == 0 {
-        return None;
+        return Vec::new();
     }
     let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_window);
     let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_window);
@@ -1153,6 +1153,8 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm, md: String::new(), as_score }, e - s))
     };
 
+    let mut results = Vec::with_capacity(2);
+
     let mut other_count = second_count;
     if let Some((mut res, primary_len)) = attempt((c1_start, c1_end, anchor_diag)) {
         let mapq = if repetitive {
@@ -1162,26 +1164,25 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
             (frac * 60.0).round().min(60.0) as u8
         };
         res.mapq = mapq;
-        return Some(res);
+        results.push(res);
     }
 
-    if second_count == 0 {
-        return None;
+    if second_count > 0 {
+        if let Some((mut res, primary_len)) = attempt(second_range) {
+            other_count = c1_count;
+            let mapq = if repetitive {
+                0u8
+            } else {
+                let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
+                (frac * 60.0).round().min(60.0) as u8
+            };
+            res.mapq = mapq;
+            results.push(res);
+        }
     }
 
-    if let Some((mut res, primary_len)) = attempt(second_range) {
-        other_count = c1_count;
-        let mapq = if repetitive {
-            0u8
-        } else {
-            let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
-            (frac * 60.0).round().min(60.0) as u8
-        };
-        res.mapq = mapq;
-        return Some(res);
-    }
-
-    None
+    results.sort_by(|a, b| b.as_score.cmp(&a.as_score));
+    results
 }
 
 pub fn write_cigar_string(cigar: &[u32], out: &mut Vec<u8>) {

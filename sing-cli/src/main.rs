@@ -328,12 +328,49 @@ fn main() -> Result<()> {
                             let q1 = &batch.quals1[i];
                             let name = &batch.names[i];
 
-                            let a1 = align(s1, &idx, &mut state, &mut rev_buf);
+                            let a1_candidates = align(s1, &idx, &mut state, &mut rev_buf);
                             let is_paired = !batch.seqs2[i].is_empty();
-                            let a2 = if is_paired {
+                            let a2_candidates = if is_paired {
                                 align(&batch.seqs2[i], &idx, &mut state, &mut rev_buf)
                             } else {
-                                None
+                                Vec::new()
+                            };
+
+                            let (a1, a2) = if is_paired {
+                                let mut best_pair = (None, None);
+                                let mut best_score = i32::MIN;
+                                let mut found_concordant = false;
+
+                                for res1 in &a1_candidates {
+                                    for res2 in &a2_candidates {
+                                        if res1.ref_id == res2.ref_id && res1.is_rev != res2.is_rev {
+                                            let span1 = cigar_ref_span(&res1.cigar);
+                                            let span2 = cigar_ref_span(&res2.cigar);
+                                            let end1 = res1.pos + span1;
+                                            let end2 = res2.pos + span2;
+                                            let left = res1.pos.min(res2.pos);
+                                            let right = end1.max(end2);
+                                            let dist = right - left;
+
+                                            if dist < 2000 {
+                                                let score = res1.as_score + res2.as_score;
+                                                if score > best_score {
+                                                    best_score = score;
+                                                    best_pair = (Some(res1), Some(res2));
+                                                    found_concordant = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if found_concordant {
+                                    (best_pair.0.cloned(), best_pair.1.cloned())
+                                } else {
+                                    (a1_candidates.first().cloned(), a2_candidates.first().cloned())
+                                }
+                            } else {
+                                (a1_candidates.first().cloned(), None)
                             };
 
                             total_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

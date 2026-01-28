@@ -328,7 +328,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
 
         python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_BWA" "$TIME_COL" "$TIME_SING" "$TIME_BT2" "$MODE" | tee -a "$OUTPUT_CSV"
 
-        rm "minimap.${MODE}.sam" "bwa.${MODE}.sam" "columba.${MODE}.sam" "sing.${MODE}.sam" "bowtie2.${MODE}.sam"
+        rm "minimap.${MODE}.sam" "bwa.${MODE}.sam" "columba.${MODE}.sam" "bowtie2.${MODE}.sam"
         echo ""
     done
 done
