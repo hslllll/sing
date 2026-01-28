@@ -22,9 +22,9 @@ const CHAIN_BIN_WIDTH: i32 = if WINDOW_I32 > 0 { WINDOW_I32 } else { 1 };
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
-    (std::f64::consts::PI - 3.0).to_bits(),
-    (std::f64::consts::SQRT_2 - 1.0).to_bits(),
-    (1.7320508075688772f64 - 1.0).to_bits(),
+    (std::f64::consts::PI - 3f64).to_bits(),
+    (std::f64::consts::SQRT_2 - 1f64).to_bits(),
+    (1.7320508075688772f64 - 1f64).to_bits(),
 ];
 
 const BASE_LUT: [i8; 256] = {
