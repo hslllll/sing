@@ -25,19 +25,19 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
-    window: 24,
-    sync_s: 14,
+    window: 31,
+    sync_s: 18,
     match_score: 2,
     mismatch_pen: -4,
     gap_open: -4,
     gap_ext: -2,
     x_drop: 50,
-    max_hits: 200,
+    max_hits: 100,
     maxindel: 20,
     min_identity: 0.8,
     downsample_threshold: 60,
     diag_band: 80,
-    cluster_window: 100,
+    cluster_window: 20,
 };
 
 const WINDOW: usize = CONFIG.window;
