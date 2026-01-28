@@ -7,7 +7,7 @@ use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
-const WINDOW: usize = 20;
+const WINDOW: usize = 16;
 const SYNC_S: usize = 4;
 
 const BASES: [u64; 4] = [
