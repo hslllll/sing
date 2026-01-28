@@ -861,6 +861,29 @@ fn find_densest_cluster(hits: &[Hit], band: i32, window: usize) -> (usize, usize
 const CASE_MASK: u64 = 0x2020202020202020;
 
 #[inline(always)]
+fn normalize_n(b: u8) -> u8 {
+    match b {
+        b'N' | b'n' => b'A',
+        _ => b,
+    }
+}
+
+#[inline(always)]
+fn eq_for_align(a: u8, b: u8) -> bool {
+    normalize_n(a).eq_ignore_ascii_case(&normalize_n(b))
+}
+
+#[inline(always)]
+fn is_n(b: u8) -> bool {
+    b == b'N' || b == b'n'
+}
+
+#[inline(always)]
+fn has_n_u64(v: u64) -> bool {
+    v.to_le_bytes().iter().any(|&b| b == b'n')
+}
+
+#[inline(always)]
 fn extend_left(
     read: &[u8],
     rseq: &[u8],
@@ -882,35 +905,37 @@ fn extend_left(
             unsafe {
                 let r_val = std::ptr::read_unaligned(read.as_ptr().add(rp - 8) as *const u64) | CASE_MASK;
                 let g_val = std::ptr::read_unaligned(rseq.as_ptr().add(gp - 8) as *const u64) | CASE_MASK;
-                if r_val == g_val {
-                    score += cfg.match_score * 8;
-                    match_run += 8;
-                    rp -= 8;
-                    gp -= 8;
-                    if score > max_score {
-                        max_score = score;
-                        best_rp = rp;
-                        best_gp = gp;
-                        best_cigar_len = cigar.len();
-                        best_match_run = match_run;
+                if !has_n_u64(r_val) && !has_n_u64(g_val) {
+                    if r_val == g_val {
+                        score += cfg.match_score * 8;
+                        match_run += 8;
+                        rp -= 8;
+                        gp -= 8;
+                        if score > max_score {
+                            max_score = score;
+                            best_rp = rp;
+                            best_gp = gp;
+                            best_cigar_len = cigar.len();
+                            best_match_run = match_run;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                
-                let x = r_val ^ g_val;
-                let match_bytes = (x.leading_zeros() / 8) as usize;
-                if match_bytes > 0 {
-                    score += cfg.match_score * match_bytes as i32;
-                    match_run += match_bytes as u32;
-                    rp -= match_bytes;
-                    gp -= match_bytes;
+
+                    let x = r_val ^ g_val;
+                    let match_bytes = (x.leading_zeros() / 8) as usize;
+                    if match_bytes > 0 {
+                        score += cfg.match_score * match_bytes as i32;
+                        match_run += match_bytes as u32;
+                        rp -= match_bytes;
+                        gp -= match_bytes;
+                    }
                 }
             }
         }
 
         let rb = read[rp - 1];
         let gb = rseq[gp - 1];
-        if rb.eq_ignore_ascii_case(&gb) {
+        if eq_for_align(rb, gb) {
             score += cfg.match_score;
             match_run += 1;
             rp -= 1;
@@ -932,7 +957,7 @@ fn extend_left(
                 score = del_score;
                 let mut glen = 1usize;
                 while glen < CONFIG.maxindel && gp > glen && score + cfg.gap_ext > max_score - cfg.x_drop {
-                    if gp > glen && rp > 0 && read[rp - 1].eq_ignore_ascii_case(&rseq[gp - glen - 1]) {
+                    if gp > glen && rp > 0 && eq_for_align(read[rp - 1], rseq[gp - glen - 1]) {
                         break;
                     }
                     glen += 1;
@@ -991,35 +1016,37 @@ fn extend_right(
              unsafe {
                 let r_val = std::ptr::read_unaligned(read.as_ptr().add(rp) as *const u64) | CASE_MASK;
                 let g_val = std::ptr::read_unaligned(rseq.as_ptr().add(gp) as *const u64) | CASE_MASK;
-                if r_val == g_val {
-                    rp += 8;
-                    gp += 8;
-                    score += cfg.match_score * 8;
-                    match_run += 8;
-                    if score > max_score {
-                        max_score = score;
-                        best_rp = rp;
-                        best_gp = gp;
-                        best_cigar_len = cigar.len();
-                        best_match_run = match_run;
+                if !has_n_u64(r_val) && !has_n_u64(g_val) {
+                    if r_val == g_val {
+                        rp += 8;
+                        gp += 8;
+                        score += cfg.match_score * 8;
+                        match_run += 8;
+                        if score > max_score {
+                            max_score = score;
+                            best_rp = rp;
+                            best_gp = gp;
+                            best_cigar_len = cigar.len();
+                            best_match_run = match_run;
+                        }
+                        continue;
                     }
-                    continue;
-                }
 
-                let x = r_val ^ g_val;
-                let match_bytes = (x.trailing_zeros() / 8) as usize;
-                if match_bytes > 0 {
-                    score += cfg.match_score * match_bytes as i32;
-                    match_run += match_bytes as u32;
-                    rp += match_bytes;
-                    gp += match_bytes;
+                    let x = r_val ^ g_val;
+                    let match_bytes = (x.trailing_zeros() / 8) as usize;
+                    if match_bytes > 0 {
+                        score += cfg.match_score * match_bytes as i32;
+                        match_run += match_bytes as u32;
+                        rp += match_bytes;
+                        gp += match_bytes;
+                    }
                 }
              }
         }
 
         let rb = read[rp];
         let gb = rseq[gp];
-        if rb.eq_ignore_ascii_case(&gb) {
+        if eq_for_align(rb, gb) {
             score += cfg.match_score;
             match_run += 1;
             rp += 1;
@@ -1041,7 +1068,7 @@ fn extend_right(
                 score = del_score;
                 let mut dlen = 1usize;
                 while dlen < 8 && gp + dlen < glen && score + cfg.gap_ext > max_score - cfg.x_drop {
-                    if rp < rlen && read[rp].eq_ignore_ascii_case(&rseq[gp + dlen]) {
+                    if rp < rlen && eq_for_align(read[rp], rseq[gp + dlen]) {
                         break;
                     }
                     dlen += 1;
@@ -1126,8 +1153,12 @@ fn compute_nm(read: &[u8], rseq: &[u8], pos: i32, cigar: &[u32]) -> i32 {
         match op {
             0 => {
                 for _ in 0..len {
-                    if ri < rseq.len() && qi < read.len() && !read[qi].eq_ignore_ascii_case(&rseq[ri]) {
-                        nm += 1;
+                    if ri < rseq.len() && qi < read.len() {
+                        let rb = read[qi];
+                        let gb = rseq[ri];
+                        if is_n(rb) || is_n(gb) || !rb.eq_ignore_ascii_case(&gb) {
+                            nm += 1;
+                        }
                     }
                     ri += 1;
                     qi += 1;
