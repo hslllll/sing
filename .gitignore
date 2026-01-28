@@ -38,5 +38,5 @@ GRCh*
 *.tsv
 *vcf*
 
-*.py
+analyze_benchmark.py
 perf*

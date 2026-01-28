@@ -150,6 +150,7 @@ def load_sam_and_build_truth(filepaths):
                     flag = int(parts[1])
                     rname = parts[2]
                     pos = int(parts[3])
+                    mapq = int(parts[4])
 
                     read_num = 2 if (flag & 128) else 1
                     
@@ -167,7 +168,7 @@ def load_sam_and_build_truth(filepaths):
                     
                     q_base = qname.split('/')[0]
                     
-                    if (flag & 4):
+                    if (flag & 4) or mapq == 0:
                         tool_results[tool_name][(q_base, read_num)] = None
                     else:
                         tool_results[tool_name][(q_base, read_num)] = (rname, pos)

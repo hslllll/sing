@@ -20,6 +20,8 @@ pub struct Config {
     pub maxindel: usize,
     pub min_identity: f32,
     pub downsample_threshold: u32,
+    pub pair_max_dist: i32,
+    pub require_concordant_pair: bool,
     pub diag_band: i32,
     pub cluster_window: usize,
 }
@@ -35,6 +37,9 @@ pub static CONFIG: Config = Config {
     
     max_hits: 5000,       
     downsample_threshold: 10, 
+
+    pair_max_dist: 1000,
+    require_concordant_pair: true,
 
     maxindel: 20,
     min_identity: 0.85,  

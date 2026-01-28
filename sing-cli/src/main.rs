@@ -8,7 +8,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use needletail::parse_fastx_file;
 use sing_core::{
     align, build_index_from_sequences, cigar_ref_span, oriented_bases, write_cigar_string, AlignmentResult, Index,
-    IndexLike, MemoryIndex, State,
+    IndexLike, MemoryIndex, State, CONFIG,
 };
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -364,7 +364,7 @@ fn main() -> Result<()> {
                                             let right = end1.max(end2);
                                             let dist = right - left;
 
-                                            if dist < 2000 {
+                                            if dist < CONFIG.pair_max_dist {
                                                 let score = res1.as_score + res2.as_score;
                                                 valid_pairs.push((score, i, j));
                                             }
@@ -390,6 +390,8 @@ fn main() -> Result<()> {
                                     best_res2.mapq = mapq;
                                     
                                     (Some(best_res1), Some(best_res2))
+                                } else if CONFIG.require_concordant_pair {
+                                    (None, None)
                                 } else {
                                     (a1_candidates.first().cloned(), a2_candidates.first().cloned())
                                 }
@@ -431,7 +433,7 @@ fn main() -> Result<()> {
                                             tlen = -dist;
                                         }
 
-                                        if res1.is_rev != res2.is_rev && dist.abs() < 2000 {
+                                        if res1.is_rev != res2.is_rev && dist.abs() < CONFIG.pair_max_dist {
                                             proper_pair = true;
                                         }
                                     }
