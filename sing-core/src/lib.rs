@@ -14,7 +14,7 @@ const SYNC_S_I32: i32 = SYNC_S as i32;
 const MATCH_SCORE: i32 = if WINDOW_I32 / 10 > 1 { WINDOW_I32 / 10 } else { 1 };
 const MISMATCH_PEN: i32 = if SYNC_S_I32 / 10 > 1 { -(SYNC_S_I32 / 10) } else { -1 };
 const MIN_IDENTITY: f32 = {
-    let v = 0.5 + (SYNC_S as f32) / (WINDOW as f32);
+    let v = 0.2 + (SYNC_S as f32) / (WINDOW as f32);
     if v > 1.0 { 1.0 } else { v }
 };
 const DOWNSAMPLE_THRESHOLD: u32 = (SYNC_S * WINDOW) as u32;
