@@ -16,6 +16,7 @@ pub struct Config {
     pub gap_open: i32,
     pub gap_ext: i32,
     pub x_drop: i32,
+    pub maxindel: usize,
     pub min_identity: f32,
     pub downsample_threshold: u32,
     pub diag_band: i32,
@@ -28,14 +29,15 @@ impl Default for Config {
             window: 12,
             sync_s: 5,
             match_score: 2,
-            mismatch_pen: -4,
+            mismatch_pen: -3,
             gap_open: -4,
-            gap_ext: -2,
-            x_drop: 50,
-            min_identity: 0.6,
+            gap_ext: -1,
+            x_drop: 40,
+            maxindel: 8,
+            min_identity: 0.5,
             downsample_threshold: 60,
-            diag_band: 16,
-            cluster_window: 32,
+            diag_band: 48,
+            cluster_window: 96,
         }
     }
 }
@@ -44,14 +46,15 @@ pub static CONFIG: Config = Config {
     window: 12,
     sync_s: 5,
     match_score: 2,
-    mismatch_pen: -4,
+    mismatch_pen: -3,
     gap_open: -4,
-    gap_ext: -2,
-    x_drop: 50,
-    min_identity: 0.6,
+    gap_ext: -1,
+    x_drop: 40,
+    maxindel: 8,
+    min_identity: 0.5,
     downsample_threshold: 60,
-    diag_band: 16,
-    cluster_window: 32,
+    diag_band: 48,
+    cluster_window: 96,
 };
 
 const WINDOW: usize = CONFIG.window;
@@ -910,7 +913,7 @@ fn extend_left(
             } else if del_score >= ins_score && gp > 0 {
                 score = del_score;
                 let mut glen = 1usize;
-                while glen < 3 && gp > glen && score + cfg.gap_ext > max_score - cfg.x_drop {
+                while glen < CONFIG.maxindel && gp > glen && score + cfg.gap_ext > max_score - cfg.x_drop {
                     if gp > glen && rp > 0 && read[rp - 1].eq_ignore_ascii_case(&rseq[gp - glen - 1]) {
                         break;
                     }
@@ -983,7 +986,7 @@ fn extend_right(
             } else if del_score >= ins_score && gp < glen {
                 score = del_score;
                 let mut dlen = 1usize;
-                while dlen < 3 && gp + dlen < glen && score + cfg.gap_ext > max_score - cfg.x_drop {
+                while dlen < 8 && gp + dlen < glen && score + cfg.gap_ext > max_score - cfg.x_drop {
                     if rp < rlen && read[rp].eq_ignore_ascii_case(&rseq[gp + dlen]) {
                         break;
                     }
@@ -1018,7 +1021,7 @@ fn extend_right(
 #[inline(always)]
 fn greedy_extend(
     hits: &[Hit],
-    _anchor_diag: i32,
+    anchor_diag: i32,
     read: &[u8],
     rseq: &[u8],
     cfg: &Config,
@@ -1027,7 +1030,14 @@ fn greedy_extend(
     let anchor_idx = hits.len() / 2;
     let anchor = &hits[anchor_idx.min(hits.len().saturating_sub(1))];
     let a_rp = anchor.read_pos as usize;
-    let a_gp = anchor.ref_pos as usize;
+    let mut a_gp = if anchor_diag >= 0 {
+        anchor_diag as usize + a_rp
+    } else {
+        a_rp.saturating_sub((-anchor_diag) as usize)
+    };
+    if a_gp >= rseq.len() {
+        a_gp = rseq.len().saturating_sub(1);
+    }
     let (l_score, l_rp, l_gp, l_cigar) = extend_left(read, rseq, a_rp, a_gp, cfg);
     let (r_score, r_rp, _, r_cigar) = extend_right(read, rseq, a_rp, a_gp, cfg);
     let mut cigar = Vec::with_capacity(l_cigar.len() + r_cigar.len() + 2);
@@ -1107,44 +1117,78 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     if c1_count == 0 {
         return None;
     }
-    let hits = &candidates[c1_start..c1_end];
-    let ref_id = (hits[0].id_strand >> 1) as i32;
-    if (ref_id as usize) >= idx.ref_count() {
-        return None;
-    }
-    let is_rev = (hits[0].id_strand & 1) == 1;
-    let target_seq = if is_rev { rev.as_slice() } else { seq };
-    let ref_seq = idx.ref_seq(ref_id as usize);
-    let (cigar, pos, as_score, aligned_len) = greedy_extend(hits, anchor_diag, target_seq, ref_seq, cfg);
-    if aligned_len == 0 || pos < 0 || (pos as usize) >= ref_seq.len() {
-        return None;
-    }
-    let nm = compute_nm(target_seq, ref_seq, pos, &cigar);
-    let identity = 1.0 - (nm as f32 / aligned_len.max(1) as f32);
-    if identity < cfg.min_identity {
-        return None;
-    }
-    let mut second_count = 0usize;
-    if c1_end < candidates.len() {
-        let (s2_start, s2_end, _) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_window);
-        second_count = s2_end - s2_start;
-    }
-    let mapq = if repetitive {
-        0u8
+    let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_window);
+    let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_window);
+    let pre_count = pre_end.saturating_sub(pre_start);
+    let post_count = post_end.saturating_sub(post_start);
+    let (second_range, second_count) = if pre_count >= post_count {
+        if pre_count > 0 {
+            ((pre_start, pre_end, pre_diag), pre_count)
+        } else {
+            ((0, 0, 0), 0)
+        }
     } else {
-        let frac = (c1_count.saturating_sub(second_count)) as f32 / total_seeds.max(1) as f32;
-        (frac * 60.0).round().min(60.0) as u8
+        if post_count > 0 {
+            ((c1_end + post_start, c1_end + post_end, post_diag), post_count)
+        } else {
+            ((0, 0, 0), 0)
+        }
     };
-    Some(AlignmentResult {
-        ref_id,
-        pos,
-        is_rev,
-        mapq,
-        cigar,
-        nm,
-        md: String::new(),
-        as_score,
-    })
+
+    let attempt = |range: (usize, usize, i32)| -> Option<(AlignmentResult, usize)> {
+        let (s, e, diag) = range;
+        if e <= s {
+            return None;
+        }
+        let hits = &candidates[s..e];
+        let ref_id = (hits[0].id_strand >> 1) as i32;
+        if (ref_id as usize) >= idx.ref_count() {
+            return None;
+        }
+        let is_rev = (hits[0].id_strand & 1) == 1;
+        let target_seq = if is_rev { rev.as_slice() } else { seq };
+        let ref_seq = idx.ref_seq(ref_id as usize);
+        let (cigar, pos, as_score, aligned_len) = greedy_extend(hits, diag, target_seq, ref_seq, cfg);
+        if aligned_len == 0 || pos < 0 || (pos as usize) >= ref_seq.len() {
+            return None;
+        }
+        let nm = compute_nm(target_seq, ref_seq, pos, &cigar);
+        let identity = 1.0 - (nm as f32 / aligned_len.max(1) as f32);
+        if identity < cfg.min_identity {
+            return None;
+        }
+        Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm, md: String::new(), as_score }, e - s))
+    };
+
+    let mut other_count = second_count;
+    if let Some((mut res, primary_len)) = attempt((c1_start, c1_end, anchor_diag)) {
+        let mapq = if repetitive {
+            0u8
+        } else {
+            let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
+            (frac * 60.0).round().min(60.0) as u8
+        };
+        res.mapq = mapq;
+        return Some(res);
+    }
+
+    if second_count == 0 {
+        return None;
+    }
+
+    if let Some((mut res, primary_len)) = attempt(second_range) {
+        other_count = c1_count;
+        let mapq = if repetitive {
+            0u8
+        } else {
+            let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
+            (frac * 60.0).round().min(60.0) as u8
+        };
+        res.mapq = mapq;
+        return Some(res);
+    }
+
+    None
 }
 
 pub fn write_cigar_string(cigar: &[u32], out: &mut Vec<u8>) {
