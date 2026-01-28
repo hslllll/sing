@@ -1,5 +1,3 @@
-
-
 use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
 use memmap2::MmapOptions;
@@ -10,7 +8,7 @@ use std::ops::Range;
 use std::path::Path;
 
 const WINDOW: usize = 20;
-const SYNC_S: usize = 2;
+const SYNC_S: usize = 4;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
@@ -514,29 +512,52 @@ where
     
     let mut kept_counts = vec![0u32; 1 << RADIX];
     let mut kept_buckets = 0u64;
-    let mut total_seeds_kept = 0u64;
     for (i, &count) in global_counts.iter().enumerate() {
         if count as usize <= freq_filter {
             kept_counts[i] = count;
             if count > 0 {
                 kept_buckets += 1;
-                total_seeds_kept += count as u64;
+            }
+        }
+    }
+
+    let downsample_threshold = (SYNC_S * WINDOW) as u32;
+    let mut downsample_counts = vec![0u32; kept_counts.len()];
+    let mut seen = vec![0u32; kept_counts.len()];
+    for seq in &ref_seqs {
+        get_syncmers(seq, &mut mins);
+        for (h, _) in mins.iter() {
+            let bucket = (*h as u64 >> SHIFT) as usize;
+            if kept_counts[bucket] == 0 {
+                continue;
+            }
+            let count = kept_counts[bucket];
+            if count > downsample_threshold {
+                let step = (count / downsample_threshold).max(2);
+                let s = seen[bucket];
+                if s % step == 0 {
+                    downsample_counts[bucket] += 1;
+                }
+                seen[bucket] = s.wrapping_add(1);
+            } else {
+                downsample_counts[bucket] += 1;
             }
         }
     }
 
     
-    let mut offsets = Vec::with_capacity(kept_counts.len());
+    let mut offsets = Vec::with_capacity(downsample_counts.len());
     let mut current_offset = 0u32;
-    for count in &kept_counts {
+    for count in &downsample_counts {
         offsets.push(current_offset);
         current_offset += *count;
     }
 
     
     
-    let mut seeds = vec![0u64; total_seeds_kept as usize];
+    let mut seeds = vec![0u64; current_offset as usize];
     let mut write_pos = offsets.clone();
+    let mut seen = vec![0u32; kept_counts.len()];
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for (h, p) in mins.iter() {
@@ -544,6 +565,16 @@ where
             let bucket = (hash64 >> SHIFT) as usize;
             if kept_counts[bucket] == 0 {
                 continue;
+            }
+            let count = kept_counts[bucket];
+            if count > downsample_threshold {
+                let step = (count / downsample_threshold).max(2);
+                let s = seen[bucket];
+                if s % step != 0 {
+                    seen[bucket] = s.wrapping_add(1);
+                    continue;
+                }
+                seen[bucket] = s.wrapping_add(1);
             }
             let hash16 = (hash64 & 0xFFFF) as u64;
             let packed = (hash16 << 48) | ((rid as u64) << 32) | (*p as u64);
@@ -696,7 +727,13 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
 }
 
 #[inline(always)]
-fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, out: &mut Vec<Hit>) {
+fn collect_candidates<I: IndexLike>(
+    idx: &I,
+    mins: &[(u32, u32)],
+    is_rev: bool,
+    max_hits: usize,
+    out: &mut Vec<Hit>,
+) -> bool {
     let freq_filter = idx.freq_filter() as usize;
     let offsets = idx.offsets();
     let seeds = idx.seeds();
@@ -734,10 +771,14 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u32, u32)], is_rev: bool, 
                 let diag = (pos as i32) - (r_pos as i32);
 
                 out.push(Hit { id_strand, diag, read_pos: r_pos, ref_pos: pos });
+                if out.len() >= max_hits {
+                    return true;
+                }
             }
             i += 1;
         }
     }
+    false
 }
 
 #[inline(always)]
@@ -969,9 +1010,14 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
 
     candidates.clear();
 
+    let max_hits = ((seq.len() * SYNC_S + WINDOW - 1) / WINDOW).max(16);
+    let mut repetitive = false;
+
     get_syncmers(seq, mins);
     mins.sort_unstable_by_key(|(h, _)| (*h >> SHIFT) as u32);
-    collect_candidates(idx, mins, false, candidates);
+    if collect_candidates(idx, mins, false, max_hits, candidates) {
+        repetitive = true;
+    }
 
     rev.clear();
     rev.extend(seq.iter().rev().map(|b| match b {
@@ -987,7 +1033,9 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     }));
     get_syncmers(rev, mins);
     mins.sort_unstable_by_key(|(h, _)| (*h >> SHIFT) as u32);
-    collect_candidates(idx, mins, true, candidates);
+    if collect_candidates(idx, mins, true, max_hits, candidates) {
+        repetitive = true;
+    }
 
     if candidates.is_empty() {
         return None;
@@ -1056,6 +1104,9 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         let diff = best_count.saturating_sub(second_count) as f32;
         let frac = diff / (best_count as f32);
         best_res.mapq = (frac * (u8::MAX as f32)).round() as u8;
+    }
+    if repetitive {
+        best_res.mapq = 0;
     }
 
     Some(best_res)
