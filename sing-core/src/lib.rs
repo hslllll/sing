@@ -9,7 +9,8 @@ use std::path::Path;
 
 #[derive(Clone, Copy)]
 pub struct Config {
-    pub window: usize,
+    pub hash_window: usize,
+    pub minimizer_window: usize,
     pub sync_s: usize,
     pub match_score: i32,
     pub mismatch_pen: i32,
@@ -27,8 +28,9 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
-    window: 24,          
-    sync_s: 16,          
+    hash_window: 16,
+    minimizer_window: 21,
+    sync_s: 15,          
     match_score: 2,
     mismatch_pen: -2,    
     gap_open: -2,        
@@ -48,7 +50,8 @@ pub static CONFIG: Config = Config {
     cluster_window: 10,  
 };
 
-const WINDOW: usize = CONFIG.window;
+const HASH_WINDOW: usize = CONFIG.hash_window;
+const MINIMIZER_WINDOW: usize = CONFIG.minimizer_window;
 const SYNC_S: usize = CONFIG.sync_s;
 const FREQ_FILTER_ROOT: f64 = 2.5;
 
@@ -79,10 +82,10 @@ const fn rot(val: u64, n: u32) -> u64 {
 }
 
 const REMOVE: [u64; 4] = [
-    rot(BASES[0], (WINDOW as u32 * ROT) % 64),
-    rot(BASES[1], (WINDOW as u32 * ROT) % 64),
-    rot(BASES[2], (WINDOW as u32 * ROT) % 64),
-    rot(BASES[3], (WINDOW as u32 * ROT) % 64),
+    rot(BASES[0], (HASH_WINDOW as u32 * ROT) % 64),
+    rot(BASES[1], (HASH_WINDOW as u32 * ROT) % 64),
+    rot(BASES[2], (HASH_WINDOW as u32 * ROT) % 64),
+    rot(BASES[3], (HASH_WINDOW as u32 * ROT) % 64),
 ];
 
 const REMOVE_S: [u64; 4] = [
@@ -658,7 +661,7 @@ fn base_to_index(b: u8) -> Option<usize> {
 #[inline(always)]
 pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     out.clear();
-    if seq.len() < WINDOW || WINDOW < SYNC_S {
+    if seq.len() < HASH_WINDOW || HASH_WINDOW < SYNC_S {
         return;
     }
 
@@ -671,9 +674,9 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
 
     let mut h_k = 0u64;
     let mut h_s = 0u64;
-    let mut base_buf_k = [0usize; WINDOW];
+    let mut base_buf_k = [0usize; HASH_WINDOW];
     let mut base_buf_s = [0usize; SYNC_S];
-    let mut ambig_buf_k = [0u8; WINDOW];
+    let mut ambig_buf_k = [0u8; HASH_WINDOW];
     let mut ambig_buf_s = [0u8; SYNC_S];
     let mut ambig_k = 0i32;
     let mut ambig_s = 0i32;
@@ -684,7 +687,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
             None => (0usize, 1u8),
         };
 
-        let k_slot = i % WINDOW;
+        let k_slot = i % HASH_WINDOW;
         let prev_idx_k = base_buf_k[k_slot];
         let prev_ambig_k = ambig_buf_k[k_slot];
         base_buf_k[k_slot] = base_idx;
@@ -698,7 +701,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
         ambig_buf_s[s_slot] = ambig;
         ambig_s += ambig as i32 - prev_ambig_s as i32;
 
-        if i + 1 <= WINDOW {
+        if i + 1 <= HASH_WINDOW {
             h_k = h_k.rotate_left(ROT) ^ BASES[base_idx];
         } else {
             h_k = h_k.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx_k];
@@ -732,10 +735,10 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
             tail += 1;
         }
 
-        if i + 1 >= WINDOW && ambig_k == 0 {
-            let k_pos = i + 1 - WINDOW;
+        if i + 1 >= HASH_WINDOW && ambig_k == 0 {
+            let k_pos = i + 1 - HASH_WINDOW;
             let min_pos = k_pos as u32;
-            let max_pos = (k_pos + WINDOW - SYNC_S) as u32;
+            let max_pos = (k_pos + MINIMIZER_WINDOW - SYNC_S) as u32;
 
             while head < tail && q_pos[head & Q_MASK] < min_pos {
                 head += 1;
