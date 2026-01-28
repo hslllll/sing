@@ -82,7 +82,7 @@ if [ ! -f "${INDEX_PREFIX}.idx" ]; then
     ./target/release/sing build "$REF_DECOMP" "${INDEX_PREFIX}.idx"
 fi
 
-cat << 'EOF' > analyze_benchmark.py
+cat << 'EOF' > analyze_benchmark_minimap.py
 import sys
 import re
 import math
@@ -264,7 +264,7 @@ for MUT_RATE in "${MUT_RATES[@]}"; do
             echo "Minimap2 Failed"
         fi
 
-        python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_SING" "$MODE" | tee -a "$OUTPUT_CSV"
+        python3 analyze_benchmark_minimap.py "$EXP_ID" "$TIME_MM" "$TIME_SING" "$MODE" | tee -a "$OUTPUT_CSV"
 
         rm "minimap.${MODE}.sam"
         echo ""

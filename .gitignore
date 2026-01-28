@@ -39,4 +39,5 @@ GRCh*
 *vcf*
 
 analyze_benchmark.py
+analyze_benchmark_minimap.py
 perf*
