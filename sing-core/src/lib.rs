@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::path::Path;
 
 const WINDOW: usize = 20;
-const SYNC_S: usize = 4;
+const SYNC_S: usize = 5;
 const WINDOW_I32: i32 = WINDOW as i32;
 const SYNC_S_I32: i32 = SYNC_S as i32;
 const MATCH_SCORE: i32 = if WINDOW_I32 / 10 > 1 { WINDOW_I32 / 10 } else { 1 };
@@ -19,6 +19,7 @@ const MIN_IDENTITY: f32 = {
 };
 const DOWNSAMPLE_THRESHOLD: u32 = (SYNC_S * WINDOW) as u32;
 const CHAIN_BIN_WIDTH: i32 = if WINDOW_I32 > 0 { WINDOW_I32 } else { 1 };
+const FREQ_FILTER_ROOT: f64 = 5.0;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
@@ -501,7 +502,7 @@ where
     }
 
     let total_bases: u64 = ref_seqs.iter().map(|s| s.len() as u64).sum();
-    let freq_filter = (total_bases as f64).powf(1.0 / 5.0) as usize;
+    let freq_filter = (total_bases as f64).powf(1.0 / FREQ_FILTER_ROOT) as usize;
     let freq_filter = std::cmp::max(1, freq_filter);
     eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
 
@@ -895,6 +896,16 @@ fn gen_cigar_simple(read_seq: &[u8], ref_seq: &[u8], diag: i32) -> (Vec<u32>, i3
 }
 
 #[inline(always)]
+fn robust_diag(sorted: &[(u32, i32)], start: usize, end: usize) -> i32 {
+    let n = sorted.len();
+    let e = end.min(n);
+    if e <= start { return sorted[start].1; }
+    let mut ds: Vec<i32> = sorted[start..e].iter().map(|(_, d)| *d).collect();
+    ds.sort_unstable();
+    ds[ds.len() / 2]
+}
+
+#[inline(always)]
 fn chaining_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> (Vec<u32>, i32, usize) {
     let diag_sum: i64 = hits
         .iter()
@@ -912,91 +923,92 @@ fn chaining_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> (Vec<u
         .collect();
     sorted.sort_unstable_by_key(|(r, _)| *r);
 
-    let mut best_idx = None;
-    let mut best_jump = 0i32;
-    for i in 1..sorted.len() {
-        let jump = (sorted[i].1 - sorted[i - 1].1).abs();
-        if jump > best_jump {
-            best_jump = jump;
-            best_idx = Some(i);
-        }
-    }
-
-    let split = match best_idx {
-        Some(i) if best_jump >= 3 && i >= 2 && (sorted.len() - i) >= 2 => i,
-        _ => return gen_cigar_simple(read_seq, ref_seq, diag),
-    };
-
-    let left_diag = sorted[..split].iter().map(|(_, d)| *d as i64).sum::<i64>() / split as i64;
-    let right_diag = sorted[split..].iter().map(|(_, d)| *d as i64).sum::<i64>() / (sorted.len() - split) as i64;
-    let indel = (right_diag - left_diag) as i32;
-    if indel == 0 {
-        return gen_cigar_simple(read_seq, ref_seq, diag);
-    }
-
     let read_len = read_seq.len();
     let ref_len = ref_seq.len();
 
-    let (leading_clip, ref_start) = if left_diag < 0 {
-        ((-left_diag) as usize, 0usize)
+    let n_start = (sorted.len() / 10).max(3).min(sorted.len());
+    let start_diag = robust_diag(&sorted, 0, n_start);
+
+    let (leading_clip, ref_start) = if start_diag < 0 {
+        ((-start_diag) as usize, 0usize)
     } else {
-        (0usize, left_diag as usize)
+        (0usize, start_diag as usize)
     };
 
     if leading_clip >= read_len || ref_start >= ref_len {
         return gen_cigar_simple(read_seq, ref_seq, diag);
     }
 
-    let r_split = sorted[split - 1].0 as usize;
-    if r_split <= leading_clip {
-        return gen_cigar_simple(read_seq, ref_seq, diag);
-    }
-
-    let left_aln = r_split - leading_clip;
-    let g_split = ref_start.saturating_add(left_aln);
-    if g_split >= ref_len {
-        return gen_cigar_simple(read_seq, ref_seq, diag);
-    }
-
-    let mut cigar = Vec::with_capacity(8);
+    let mut cigar = Vec::with_capacity(16);
     if leading_clip > 0 {
         push_cigar(&mut cigar, leading_clip as u32, 4);
     }
-    if left_aln > 0 {
-        push_cigar(&mut cigar, left_aln as u32, 0);
+
+    let mut aligned_len = 0usize;
+    let mut curr_diag = sorted[0].1;
+    let mut last_r = sorted[0].0 as usize;
+    let mut seg_start_r = last_r;
+    let mut g_pos = ref_start + (seg_start_r - leading_clip);
+    let min_seg = 2usize;
+
+    for i in 1..sorted.len() {
+        let r = sorted[i].0 as usize;
+        let d = sorted[i].1;
+        let jump = (d - curr_diag).abs();
+        if jump >= 3 && r > seg_start_r + min_seg {
+            let seg_len = r.saturating_sub(seg_start_r);
+            if seg_len > 0 {
+                push_cigar(&mut cigar, seg_len as u32, 0);
+                aligned_len += seg_len;
+                g_pos = g_pos.saturating_add(seg_len);
+            }
+            if d > curr_diag {
+                let del = (d - curr_diag) as usize;
+                push_cigar(&mut cigar, del as u32, 2);
+                g_pos = g_pos.saturating_add(del);
+            } else {
+                let ins = (curr_diag - d) as usize;
+                push_cigar(&mut cigar, ins as u32, 1);
+            }
+            curr_diag = d;
+            seg_start_r = r;
+        }
+        last_r = r;
     }
 
-    if indel > 0 {
-        push_cigar(&mut cigar, indel as u32, 2);
+    let seg_len = last_r.saturating_sub(seg_start_r) + 1;
+    if seg_len > 0 {
+        push_cigar(&mut cigar, seg_len as u32, 0);
+        aligned_len += seg_len;
+        g_pos = g_pos.saturating_add(seg_len);
+    }
+
+    let n_end = (sorted.len() / 10).max(3);
+    let end_start = sorted.len().saturating_sub(n_end);
+    let end_diag = robust_diag(&sorted, end_start, sorted.len());
+
+    let last_hit_r = sorted[sorted.len() - 1].0 as usize;
+    let expected_read_end = if end_diag < 0 {
+        (ref_len as i32 + end_diag) as usize
     } else {
-        push_cigar(&mut cigar, (-indel) as u32, 1);
+        ref_len + last_hit_r - (end_diag as usize)
+    }.min(read_len);
+
+    let r_pos_after = leading_clip + aligned_len;
+    let trailing_clip = read_len.saturating_sub(expected_read_end.max(r_pos_after));
+
+    if r_pos_after < expected_read_end && g_pos < ref_len {
+        let tail = (expected_read_end - r_pos_after).min(ref_len - g_pos);
+        if tail > 0 {
+            push_cigar(&mut cigar, tail as u32, 0);
+            aligned_len += tail;
+        }
     }
 
-    let r_pos_after = if indel < 0 {
-        r_split + (-indel as usize)
-    } else {
-        r_split
-    };
-    let g_pos_after = if indel > 0 {
-        g_split + (indel as usize)
-    } else {
-        g_split
-    };
-
-    if r_pos_after >= read_len || g_pos_after >= ref_len {
-        return (cigar, ref_start as i32, left_aln);
-    }
-
-    let tail = (read_len - r_pos_after).min(ref_len - g_pos_after);
-    if tail > 0 {
-        push_cigar(&mut cigar, tail as u32, 0);
-    }
-    let trailing_clip = read_len.saturating_sub(r_pos_after + tail);
     if trailing_clip > 0 {
         push_cigar(&mut cigar, trailing_clip as u32, 4);
     }
 
-    let aligned_len = left_aln + tail;
     (cigar, ref_start as i32, aligned_len)
 }
 
