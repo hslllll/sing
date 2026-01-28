@@ -25,24 +25,24 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
-    window: 20,
-    sync_s: 5,
+    window: 24,
+    sync_s: 14,
     match_score: 2,
-    mismatch_pen: -3,
+    mismatch_pen: -4,
     gap_open: -4,
-    gap_ext: -1,
-    x_drop: 40,
-    max_hits: 60,
-    maxindel: 8,
-    min_identity: 0.85,
+    gap_ext: -2,
+    x_drop: 50,
+    max_hits: 200,
+    maxindel: 20,
+    min_identity: 0.8,
     downsample_threshold: 60,
-    diag_band: 64,
-    cluster_window: 96,
+    diag_band: 80,
+    cluster_window: 100,
 };
 
 const WINDOW: usize = CONFIG.window;
 const SYNC_S: usize = CONFIG.sync_s;
-const FREQ_FILTER_ROOT: f64 = 3.0;
+const FREQ_FILTER_ROOT: f64 = 2.5;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
