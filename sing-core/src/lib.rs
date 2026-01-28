@@ -590,8 +590,6 @@ where
         offsets.push(current_offset);
         current_offset += *count;
     }
-
-    
     
     let mut seeds = vec![0u64; current_offset as usize];
     let mut write_pos = offsets.clone();
