@@ -9,6 +9,16 @@ use std::path::Path;
 
 const WINDOW: usize = 16;
 const SYNC_S: usize = 4;
+const WINDOW_I32: i32 = WINDOW as i32;
+const SYNC_S_I32: i32 = SYNC_S as i32;
+const MATCH_SCORE: i32 = if WINDOW_I32 / 10 > 1 { WINDOW_I32 / 10 } else { 1 };
+const MISMATCH_PEN: i32 = if SYNC_S_I32 / 10 > 1 { -(SYNC_S_I32 / 10) } else { -1 };
+const MIN_IDENTITY: f32 = {
+    let v = 0.5 + (SYNC_S as f32) / (WINDOW as f32);
+    if v > 1.0 { 1.0 } else { v }
+};
+const DOWNSAMPLE_THRESHOLD: u32 = (SYNC_S * WINDOW) as u32;
+const CHAIN_BIN_WIDTH: i32 = if WINDOW_I32 > 0 { WINDOW_I32 } else { 1 };
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
@@ -55,9 +65,7 @@ pub const SHIFT: usize = 32 - RADIX;
 
 #[inline(always)]
 fn scoring_params() -> (i32, i32) {
-    let match_score = (WINDOW as i32 / 10).max(1);
-    let mismatch_pen = -((SYNC_S as i32 / 10).max(1));
-    (match_score, mismatch_pen)
+    (MATCH_SCORE, MISMATCH_PEN)
 }
 
 #[derive(Debug, Clone)]
@@ -521,7 +529,7 @@ where
         }
     }
 
-    let downsample_threshold = (SYNC_S * WINDOW) as u32;
+    let downsample_threshold = DOWNSAMPLE_THRESHOLD;
     let mut downsample_counts = vec![0u32; kept_counts.len()];
     let mut seen = vec![0u32; kept_counts.len()];
     for seq in &ref_seqs {
@@ -787,7 +795,7 @@ fn find_top_chains(candidates: &mut Vec<Hit>) -> (ChainRes, ChainRes) {
         return (ChainRes::default(), ChainRes::default());
     }
 
-    let bin_width = (WINDOW as i32).max(1);
+    let bin_width = CHAIN_BIN_WIDTH;
     candidates.sort_unstable_by(|a, b| {
         let a_key = (a.id_strand, a.diag.div_euclid(bin_width));
         let b_key = (b.id_strand, b.diag.div_euclid(bin_width));
@@ -887,7 +895,7 @@ fn gen_cigar_simple(read_seq: &[u8], ref_seq: &[u8], diag: i32) -> (Vec<u32>, i3
 }
 
 #[inline(always)]
-fn hough_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> (Vec<u32>, i32, usize) {
+fn chaining_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> (Vec<u32>, i32, usize) {
     let diag_sum: i64 = hits
         .iter()
         .map(|h| (h.ref_pos as i64) - (h.read_pos as i64))
@@ -898,93 +906,98 @@ fn hough_indel_cigar(hits: &[Hit], read_seq: &[u8], ref_seq: &[u8]) -> (Vec<u32>
         return gen_cigar_simple(read_seq, ref_seq, diag);
     }
 
-    let bin = (WINDOW as i32 / 2).max(1);
-    let mut diags: Vec<(i32, u32, u32)> = hits
+    let mut sorted: Vec<(u32, i32)> = hits
         .iter()
-        .map(|h| ((h.ref_pos as i32) - (h.read_pos as i32), h.read_pos, h.ref_pos))
+        .map(|h| (h.read_pos, (h.ref_pos as i32) - (h.read_pos as i32)))
         .collect();
+    sorted.sort_unstable_by_key(|(r, _)| *r);
 
-    diags.sort_unstable_by_key(|(d, _, _)| d.div_euclid(bin));
-
-    let mut best = (0i32, 0usize, 0usize);
-    let mut second = (0i32, 0usize, 0usize);
-    let mut i = 0usize;
-    while i < diags.len() {
-        let key = diags[i].0.div_euclid(bin);
-        let start = i;
-        let mut end = i + 1;
-        while end < diags.len() && diags[end].0.div_euclid(bin) == key {
-            end += 1;
+    let mut best_idx = None;
+    let mut best_jump = 0i32;
+    for i in 1..sorted.len() {
+        let jump = (sorted[i].1 - sorted[i - 1].1).abs();
+        if jump > best_jump {
+            best_jump = jump;
+            best_idx = Some(i);
         }
-        let count = (end - start) as i32;
-        if count > best.0 {
-            second = best;
-            best = (count, start, end);
-        } else if count > second.0 {
-            second = (count, start, end);
-        }
-        i = end;
     }
 
-    if best.0 < 4 || second.0 < 3 {
-        return gen_cigar_simple(read_seq, ref_seq, diag);
-    }
-
-    let best_diag = diags[best.1..best.2]
-        .iter()
-        .map(|(d, _, _)| *d as i64)
-        .sum::<i64>()
-        / (best.2 - best.1) as i64;
-    let second_diag = diags[second.1..second.2]
-        .iter()
-        .map(|(d, _, _)| *d as i64)
-        .sum::<i64>()
-        / (second.2 - second.1) as i64;
-
-    let diag_diff = (second_diag - best_diag) as i32;
-    if diag_diff.abs() < 3 {
-        return gen_cigar_simple(read_seq, ref_seq, diag);
-    }
-
-    let best_mid = (best.1 + best.2) / 2;
-    let second_mid = (second.1 + second.2) / 2;
-    let (first, _second) = if diags[best_mid].1 <= diags[second_mid].1 {
-        (best, second)
-    } else {
-        (second, best)
+    let split = match best_idx {
+        Some(i) if best_jump >= 3 && i >= 2 && (sorted.len() - i) >= 2 => i,
+        _ => return gen_cigar_simple(read_seq, ref_seq, diag),
     };
 
-    let r_split = diags[first.2 - 1].1 as usize;
-    let g_split = (r_split as i32 + (best_diag as i32)).max(0) as usize;
-
-    if r_split >= read_seq.len() || g_split >= ref_seq.len() {
+    let left_diag = sorted[..split].iter().map(|(_, d)| *d as i64).sum::<i64>() / split as i64;
+    let right_diag = sorted[split..].iter().map(|(_, d)| *d as i64).sum::<i64>() / (sorted.len() - split) as i64;
+    let indel = (right_diag - left_diag) as i32;
+    if indel == 0 {
         return gen_cigar_simple(read_seq, ref_seq, diag);
     }
 
     let read_len = read_seq.len();
     let ref_len = ref_seq.len();
 
-    let mut cigar = Vec::with_capacity(8);
-    if r_split > 0 {
-        push_cigar(&mut cigar, r_split as u32, 0);
-    }
-
-    if diag_diff > 0 {
-        push_cigar(&mut cigar, diag_diff as u32, 2);
+    let (leading_clip, ref_start) = if left_diag < 0 {
+        ((-left_diag) as usize, 0usize)
     } else {
-        push_cigar(&mut cigar, (-diag_diff) as u32, 1);
+        (0usize, left_diag as usize)
+    };
+
+    if leading_clip >= read_len || ref_start >= ref_len {
+        return gen_cigar_simple(read_seq, ref_seq, diag);
     }
 
-    let r_rest = read_len.saturating_sub(r_split);
-    let g_rest = ref_len.saturating_sub(g_split);
-    let tail = r_rest.min(g_rest);
+    let r_split = sorted[split - 1].0 as usize;
+    if r_split <= leading_clip {
+        return gen_cigar_simple(read_seq, ref_seq, diag);
+    }
+
+    let left_aln = r_split - leading_clip;
+    let g_split = ref_start.saturating_add(left_aln);
+    if g_split >= ref_len {
+        return gen_cigar_simple(read_seq, ref_seq, diag);
+    }
+
+    let mut cigar = Vec::with_capacity(8);
+    if leading_clip > 0 {
+        push_cigar(&mut cigar, leading_clip as u32, 4);
+    }
+    if left_aln > 0 {
+        push_cigar(&mut cigar, left_aln as u32, 0);
+    }
+
+    if indel > 0 {
+        push_cigar(&mut cigar, indel as u32, 2);
+    } else {
+        push_cigar(&mut cigar, (-indel) as u32, 1);
+    }
+
+    let r_pos_after = if indel < 0 {
+        r_split + (-indel as usize)
+    } else {
+        r_split
+    };
+    let g_pos_after = if indel > 0 {
+        g_split + (indel as usize)
+    } else {
+        g_split
+    };
+
+    if r_pos_after >= read_len || g_pos_after >= ref_len {
+        return (cigar, ref_start as i32, left_aln);
+    }
+
+    let tail = (read_len - r_pos_after).min(ref_len - g_pos_after);
     if tail > 0 {
         push_cigar(&mut cigar, tail as u32, 0);
     }
-    let aligned_len = r_split + tail;
-    let ref_start = (best_diag as i32).max(0);
+    let trailing_clip = read_len.saturating_sub(r_pos_after + tail);
+    if trailing_clip > 0 {
+        push_cigar(&mut cigar, trailing_clip as u32, 4);
+    }
 
-    (cigar, ref_start, aligned_len)
+    let aligned_len = left_aln + tail;
+    (cigar, ref_start as i32, aligned_len)
 }
 
 fn compute_metrics(read_seq: &[u8], ref_seq: &[u8], start_pos: i32, cigar: &[u32]) -> (i32, String, i32) {
@@ -1083,7 +1096,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     }
 
     let (c1, c2) = find_top_chains(candidates);
-    let min_identity = (0.5 + (SYNC_S as f32) / (WINDOW as f32)).min(1.0);
+    let min_identity = MIN_IDENTITY;
     let evaluate = |chain: &ChainRes,
                     seq: &[u8],
                     rev: &[u8],
@@ -1101,7 +1114,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         let target_seq = if is_rev { rev } else { seq };
         let ref_seq = idx.ref_seq(ref_id as usize);
 
-        let (cigar, pos, aligned_len) = hough_indel_cigar(hits, target_seq, ref_seq);
+        let (cigar, pos, aligned_len) = chaining_indel_cigar(hits, target_seq, ref_seq);
         if pos < 0 || (pos as usize) >= ref_seq.len() {
             return None;
         }
