@@ -7,7 +7,7 @@ use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
-const WINDOW: usize = 20;
+const WINDOW: usize = 12;
 const SYNC_S: usize = 5;
 const WINDOW_I32: i32 = WINDOW as i32;
 const SYNC_S_I32: i32 = SYNC_S as i32;
