@@ -9,6 +9,7 @@ target
 Cargo.lock
 
 Brassica*
+Zea*
 
 *.sam
 *.bam
