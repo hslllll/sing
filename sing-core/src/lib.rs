@@ -53,7 +53,7 @@ pub static CONFIG: Config = Config {
 const HASH_WINDOW: usize = CONFIG.hash_window;
 const MINIMIZER_WINDOW: usize = CONFIG.minimizer_window;
 const SYNC_S: usize = CONFIG.sync_s;
-const FREQ_FILTER_ROOT: f64 = 2.5;
+const FREQ_FILTER_ROOT: f64 = 5.0;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
