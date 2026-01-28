@@ -4,11 +4,12 @@ eval "$(micromamba shell hook --shell=bash)"
 micromamba activate tools
 
 if [ -z "$1" ]; then
-    echo "Usage: ./gatk-sim.sh [y|a|m|h]"
+    echo "Usage: ./gatk-sim.sh [y|a|m|h|b]"
     echo "  y : Yeast"
     echo "  a : Arabidopsis"
     echo "  m : Maize"
     echo "  h : Human"
+    echo "  b : Brassica rapa"
     exit 1
 fi
 
@@ -40,6 +41,9 @@ case $MODE in
     h) SPECIES="human"; GENOME_SIZE=3.2e9
        REF_NAME="GRCh38_latest_genomic.fna"
        REF_URL="https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers/GRCh38_latest_genomic.fna.gz" ;;
+    b) SPECIES="brassica"; GENOME_SIZE=400000000
+       REF_NAME="Brassica_rapa.Brapa_1.0.dna.toplevel.fa"
+       REF_URL="https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/release-57/fasta/brassica_rapa/dna/Brassica_rapa.Brapa_1.0.dna.toplevel.fa.gz" ;;
     *) echo "Error: Unknown mode"; exit 1 ;;
 esac
 
