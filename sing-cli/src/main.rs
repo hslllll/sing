@@ -121,7 +121,7 @@ fn main() -> Result<()> {
             
             let reader_threads = (worker_threads / 4).max(1).min(8);
             
-            let batch_size = worker_threads * 32;
+            let batch_size = worker_threads * 64;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
