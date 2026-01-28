@@ -38,7 +38,7 @@ pub static CONFIG: Config = Config {
     x_drop: 20,
     
     max_hits: 5000,       
-    downsample_threshold: 10, 
+    downsample_threshold: 5000, 
 
     pair_max_dist: 1000,
     require_concordant_pair: true,
