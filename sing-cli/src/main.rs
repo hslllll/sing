@@ -119,7 +119,7 @@ fn main() -> Result<()> {
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let worker_threads = threads.unwrap_or(max_hw).max(1);
             
-            let reader_threads = (worker_threads / 2).max(1);
+            let reader_threads = (worker_threads / 4).min(1);
             
             let batch_size = (reader_threads * 2048).max(4096).min(65536);
 
@@ -307,10 +307,13 @@ fn main() -> Result<()> {
 
             let writer_queue_cap = worker_threads * 64;
             let (wtx, wrx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(writer_queue_cap);
+            let (recycle_out_tx, recycle_out_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(writer_queue_cap);
             let writer_handle = thread::spawn(move || {
                 let mut out = writer;
-                while let Ok(chunk) = wrx.recv() {
+                while let Ok(mut chunk) = wrx.recv() {
                     out.write_all(&chunk).unwrap();
+                    chunk.clear();
+                    let _ = recycle_out_tx.try_send(chunk);
                 }
                 out.flush().unwrap();
             });
@@ -323,12 +326,21 @@ fn main() -> Result<()> {
                 let total_reads = total_reads.clone();
                 let mapped_reads = mapped_reads.clone();
                 let wtx = wtx.clone();
+                let recycle_out_rx = recycle_out_rx.clone();
                 
                 handles.push(thread::spawn(move || {
                     let mut state = State::new();
                     let mut rev_buf = Vec::new();
                     while let Ok(batch) = rx.recv() {
-                        let mut output_chunk = Vec::with_capacity(batch.count * 800);
+                        let mut output_chunk = match recycle_out_rx.try_recv() {
+                            Ok(mut chunk) => {
+                                chunk.clear();
+                                chunk
+                            }
+                            Err(_) => Vec::with_capacity(batch.count * 800),
+                        };
+                        let mut batch_total = 0usize;
+                        let mut batch_mapped = 0usize;
                         for i in 0..batch.count {
                             let s1 = &batch.seqs1[i];
                             let q1 = &batch.quals1[i];
@@ -394,14 +406,14 @@ fn main() -> Result<()> {
                             let a1 = final_a1;
                             let a2 = final_a2;
 
-                            total_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            batch_total += 1;
                             if a1.is_some() {
-                                mapped_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                batch_mapped += 1;
                             }
                             if is_paired {
-                                total_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                batch_total += 1;
                                 if a2.is_some() {
-                                    mapped_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    batch_mapped += 1;
                                 }
                             }
 
@@ -453,6 +465,13 @@ fn main() -> Result<()> {
                         }
                         
                         
+                        if batch_total > 0 {
+                            total_reads.fetch_add(batch_total, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if batch_mapped > 0 {
+                            mapped_reads.fetch_add(batch_mapped, std::sync::atomic::Ordering::Relaxed);
+                        }
+
                         let _ = wtx.send(output_chunk);
                         
                         try_send_retry(&recycle_tx, batch);
