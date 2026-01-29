@@ -876,6 +876,25 @@ fn collect_candidates<I: IndexLike>(
             let mut seed_ptr = seeds_ptr.add(start);
             let end_ptr = seeds_ptr.add(end);
             
+            let bulk_end = seed_ptr.add((count / 8) * 8);
+            while seed_ptr < bulk_end {
+                for i in 0..8 {
+                    let seed = *seed_ptr.add(i);
+                    if (seed >> 48) == target_hash {
+                        let rid = ((seed >> 32) & 0xFFFF) as u32;
+                        let pos = seed as u32;
+                        let id_strand = (rid << 1) | (is_rev as u32);
+                        let diag = (pos as i32) - (r_pos as i32);
+                        
+                        out.push(Hit { id_strand, diag, read_pos: r_pos, ref_pos: pos });
+                        if out.len() >= max_hits {
+                            return true;
+                        }
+                    }
+                }
+                seed_ptr = seed_ptr.add(8);
+            }
+            
             while seed_ptr < end_ptr {
                 let seed = *seed_ptr;
                 if (seed >> 48) == target_hash {
