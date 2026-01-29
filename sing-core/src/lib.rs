@@ -37,17 +37,17 @@ pub static CONFIG: Config = Config {
     gap_ext: -1,
     x_drop: 20,
     
-    max_hits: 40000,       
-    downsample_threshold: 10000, 
+    max_hits: 10000,       
+    downsample_threshold: 5000, 
 
     pair_max_dist: 1000,
     require_concordant_pair: true,
 
     maxindel: 20,
-    min_identity: 0.7,  
+    min_identity: 0.8,  
     
-    diag_band: 20,
-    cluster_window: 10,
+    diag_band: 15,
+    cluster_window: 8,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
