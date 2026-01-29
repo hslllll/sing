@@ -21,7 +21,6 @@ pub struct Config {
     pub maxindel: usize,
     pub min_identity: f32,
     pub pair_max_dist: i32,
-    pub require_concordant_pair: bool,
     pub diag_band: i32,
     pub cluster_window: usize,
 }
@@ -35,15 +34,10 @@ pub static CONFIG: Config = Config {
     gap_open: -2,        
     gap_ext: -1,
     x_drop: 10,
-    
-    max_hits: 4000,       
-
+    max_hits: 400,       
     pair_max_dist: 1000,
-    require_concordant_pair: true,
-
     maxindel: 20,
     min_identity: 0.8,  
-    
     diag_band: 15,
     cluster_window: 8,
 };
