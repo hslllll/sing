@@ -37,7 +37,7 @@ pub static CONFIG: Config = Config {
     gap_ext: -1,
     x_drop: 20,
     
-    max_hits: 500,       
+    max_hits: 4000,       
     downsample_threshold: 5000, 
 
     pair_max_dist: 1000,
@@ -53,7 +53,6 @@ pub static CONFIG: Config = Config {
 const HASH_WINDOW: usize = CONFIG.hash_window;
 const MINIMIZER_WINDOW: usize = CONFIG.minimizer_window;
 const SYNC_S: usize = CONFIG.sync_s;
-const FREQ_FILTER_ROOT: f64 = 3.0;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
@@ -532,101 +531,93 @@ where
     }
 
     let total_bases: u64 = ref_seqs.iter().map(|s| s.len() as u64).sum();
-    let freq_filter = (total_bases as f64).powf(1.0 / FREQ_FILTER_ROOT) as usize;
-    let freq_filter = std::cmp::max(1, freq_filter);
-    eprintln!("Dynamic freq_filter set to: {} (Genome size: {} bp)", freq_filter, total_bases);
+    let max_hits = CONFIG.max_hits;
+    
+    eprintln!("Building sort-based index: {} bp, max_hits={}", total_bases, max_hits);
 
-    
-    
-    let mut global_counts = vec![0u32; 1 << RADIX];
+    // Step 1: Collect all minimizers
+    let mut all_seeds: Vec<(u32, u32, u32)> = Vec::new(); // (hash, rid, pos)
     let mut mins = Vec::new();
-    for seq in &ref_seqs {
-        get_syncmers(seq, &mut mins);
-        for (h, _) in mins.iter() {
-            let bucket = (*h as u64 >> SHIFT) as usize;
-            global_counts[bucket] += 1;
-        }
-    }
-
     
-    let mut kept_counts = vec![0u32; 1 << RADIX];
-    let mut kept_buckets = 0u64;
-    for (i, &count) in global_counts.iter().enumerate() {
-        if count as usize <= freq_filter {
-            kept_counts[i] = count;
-            if count > 0 {
-                kept_buckets += 1;
-            }
-        }
-    }
-
-    let downsample_threshold = CONFIG.downsample_threshold;
-    let mut downsample_counts = vec![0u32; kept_counts.len()];
-    let mut seen = vec![0u32; kept_counts.len()];
-    for seq in &ref_seqs {
-        get_syncmers(seq, &mut mins);
-        for (h, _) in mins.iter() {
-            let bucket = (*h as u64 >> SHIFT) as usize;
-            if kept_counts[bucket] == 0 {
-                continue;
-            }
-            let count = kept_counts[bucket];
-            if count > downsample_threshold {
-                let step = (count / downsample_threshold).max(2);
-                let s = seen[bucket];
-                if s % step == 0 {
-                    downsample_counts[bucket] += 1;
-                }
-                seen[bucket] = s.wrapping_add(1);
-            } else {
-                downsample_counts[bucket] += 1;
-            }
-        }
-    }
-
-    
-    let mut offsets = Vec::with_capacity(downsample_counts.len());
-    let mut current_offset = 0u32;
-    for count in &downsample_counts {
-        offsets.push(current_offset);
-        current_offset += *count;
-    }
-    
-    let mut seeds = vec![0u64; current_offset as usize];
-    let mut write_pos = offsets.clone();
-    let mut seen = vec![0u32; kept_counts.len()];
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
-        for (h, p) in mins.iter() {
-            let hash64 = *h as u64;
-            let bucket = (hash64 >> SHIFT) as usize;
-            if kept_counts[bucket] == 0 {
-                continue;
-            }
-            let count = kept_counts[bucket];
-            if count > downsample_threshold {
-                let step = (count / downsample_threshold).max(2);
-                let s = seen[bucket];
-                if s % step != 0 {
-                    seen[bucket] = s.wrapping_add(1);
-                    continue;
-                }
-                seen[bucket] = s.wrapping_add(1);
-            }
-            let hash16 = (hash64 & 0xFFFF) as u64;
-            let packed = (hash16 << 48) | ((rid as u64) << 32) | (*p as u64);
-            let pos = write_pos[bucket] as usize;
-            seeds[pos] = packed;
-            write_pos[bucket] += 1;
+        for &(h, p) in mins.iter() {
+            all_seeds.push((h, rid as u32, p));
         }
     }
+    
+    eprintln!("  Collected {} raw seeds", all_seeds.len());
 
-    eprintln!("Indexing statistics:");
-    eprintln!("  Total seeds (all buckets): {}", global_counts.iter().map(|&c| c as u64).sum::<u64>());
-    eprintln!("  Buckets kept: {} / {}", kept_buckets, kept_counts.len());
-    eprintln!("  Total seeds kept: {}", seeds.len());
+    // Step 2: Sort by hash to count frequencies
+    all_seeds.sort_unstable_by_key(|k| k.0);
+    eprintln!("  Sorted seeds");
 
-    Ok(Index { offsets, seeds, freq_filter: freq_filter as u32, genome_size: total_bases, ref_seqs, ref_names })
+    // Step 3: Filter by frequency
+    let mut kept_seeds = Vec::new();
+    let mut i = 0;
+    let mut kept = 0usize;
+    let mut filtered = 0usize;
+    
+    while i < all_seeds.len() {
+        let hash = all_seeds[i].0;
+        let mut j = i;
+        while j < all_seeds.len() && all_seeds[j].0 == hash {
+            j += 1;
+        }
+        
+        let freq = j - i;
+        if freq <= max_hits {
+            kept_seeds.extend_from_slice(&all_seeds[i..j]);
+            kept += freq;
+        } else {
+            filtered += freq;
+        }
+        i = j;
+    }
+    
+    eprintln!("  Kept {} seeds, filtered {} seeds", kept, filtered);
+
+    // Step 4: Group by bucket and build index
+    let mut offsets = vec![0u32; 1 << RADIX];
+    let mut final_seeds = Vec::with_capacity(kept_seeds.len());
+    
+    // Sort by bucket
+    kept_seeds.sort_unstable_by_key(|k| k.0 >> SHIFT);
+    
+    let mut write_offset = 0u32;
+    let mut last_bucket = 0usize;
+    
+    for &(h, rid, pos) in &kept_seeds {
+        let bucket = (h >> SHIFT) as usize;
+        
+        // Fill offsets for empty buckets
+        while last_bucket <= bucket {
+            offsets[last_bucket] = write_offset;
+            last_bucket += 1;
+        }
+        
+        let hash16 = (h & 0xFFFF) as u64;
+        let seed = (hash16 << 48) | ((rid as u64) << 32) | (pos as u64);
+        final_seeds.push(seed);
+        write_offset += 1;
+    }
+    
+    // Fill remaining offsets
+    while last_bucket < offsets.len() {
+        offsets[last_bucket] = write_offset;
+        last_bucket += 1;
+    }
+    
+    eprintln!("  Index built: {} seeds", final_seeds.len());
+
+    Ok(Index {
+        offsets,
+        seeds: final_seeds,
+        freq_filter: max_hits as u32,
+        genome_size: total_bases,
+        ref_seqs,
+        ref_names,
+    })
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -764,77 +755,74 @@ fn collect_candidates<I: IndexLike>(
     max_hits: usize,
     out: &mut Vec<Hit>,
 ) -> bool {
-    let freq_filter = idx.freq_filter() as usize;
     let offsets = idx.offsets();
     let seeds = idx.seeds();
-    let offsets_len = offsets.len();
-    let seeds_ptr = seeds.as_ptr();
-    let seeds_len = seeds.len();
     
-    let mut last_bucket = usize::MAX;
-    let mut start = 0usize;
-    let mut end = 0usize;
+    let mut repetitive = false;
     
     for &(h, r_pos) in mins {
         let bucket = (h >> SHIFT) as usize;
-        if bucket != last_bucket {
-            start = offsets[bucket] as usize;
-            end = if bucket + 1 < offsets_len {
-                offsets[bucket + 1] as usize
-            } else {
-                seeds_len
-            };
-            last_bucket = bucket;
-        }
-
-        let count = end - start;
-        if count > freq_filter {
+        
+        if bucket >= offsets.len() {
             continue;
         }
-
-        let target_hash = (h & 0xFFFF) as u64;
         
-        unsafe {
-            let mut seed_ptr = seeds_ptr.add(start);
-            let end_ptr = seeds_ptr.add(end);
+        let start = offsets[bucket] as usize;
+        let end = if bucket + 1 < offsets.len() {
+            offsets[bucket + 1] as usize
+        } else {
+            seeds.len()
+        };
+        
+        if start >= end || end > seeds.len() {
+            continue;
+        }
+        
+        let target_hash = (h & 0xFFFF) as u64;
+        let bucket_seeds = &seeds[start..end];
+        
+        // Binary search for first occurrence of target_hash
+        let pos = bucket_seeds.partition_point(|&s| (s >> 48) < target_hash);
+        
+        if pos >= bucket_seeds.len() {
+            continue;
+        }
+        
+        // Collect all seeds with matching hash
+        let mut count = 0;
+        let mut idx_in_bucket = pos;
+        
+        while idx_in_bucket < bucket_seeds.len() {
+            let seed = bucket_seeds[idx_in_bucket];
+            let seed_hash = seed >> 48;
             
-            let bulk_end = seed_ptr.add((count / 8) * 8);
-            while seed_ptr < bulk_end {
-                for i in 0..8 {
-                    let seed = *seed_ptr.add(i);
-                    if (seed >> 48) == target_hash {
-                        let rid = ((seed >> 32) & 0xFFFF) as u32;
-                        let pos = seed as u32;
-                        let id_strand = (rid << 1) | (is_rev as u32);
-                        let diag = (pos as i32) - (r_pos as i32);
-                        
-                        out.push(Hit { id_strand, diag, read_pos: r_pos, ref_pos: pos });
-                        if out.len() >= max_hits {
-                            return true;
-                        }
-                    }
-                }
-                seed_ptr = seed_ptr.add(8);
+            if seed_hash != target_hash {
+                break;
             }
             
-            while seed_ptr < end_ptr {
-                let seed = *seed_ptr;
-                if (seed >> 48) == target_hash {
-                    let rid = ((seed >> 32) & 0xFFFF) as u32;
-                    let pos = seed as u32;
-                    let id_strand = (rid << 1) | (is_rev as u32);
-                    let diag = (pos as i32) - (r_pos as i32);
-                    
-                    out.push(Hit { id_strand, diag, read_pos: r_pos, ref_pos: pos });
-                    if out.len() >= max_hits {
-                        return true;
-                    }
-                }
-                seed_ptr = seed_ptr.add(1);
+            let ref_id = ((seed >> 32) & 0xFFFF) as u32;
+            let ref_pos = (seed & 0xFFFFFFFF) as u32;
+            let id_strand = (ref_id << 1) | (if is_rev { 1 } else { 0 });
+            let diag = (ref_pos as i32).wrapping_sub(r_pos as i32);
+            
+            out.push(Hit {
+                id_strand,
+                diag,
+                read_pos: r_pos,
+                ref_pos,
+            });
+            
+            count += 1;
+            idx_in_bucket += 1;
+            
+            if count > max_hits {
+                repetitive = true;
+                break;
             }
         }
     }
-    false
+    
+    repetitive
 }
 
 #[inline(always)]
