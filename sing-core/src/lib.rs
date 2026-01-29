@@ -26,20 +26,20 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
-    hash_window: 16,
-    minimizer_window: 21,
-    sync_s: 15,          
+    hash_window: 15,
+    minimizer_window: 19,
+    sync_s: 14,
     match_score: 2,
-    mismatch_pen: -2,    
-    gap_open: -2,        
+    mismatch_pen: -2,
+    gap_open: -2,
     gap_ext: -1,
     x_drop: 5,
-    max_hits: 4000,       
+    max_hits: 200,
     pair_max_dist: 1000,
-    maxindel: 5,
-    min_identity: 0.8,  
-    diag_band: 5,
-    cluster_window: 5,
+    maxindel: 7,
+    min_identity: 0.85,
+    diag_band: 8,
+    cluster_window: 4,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -1214,9 +1214,13 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let mut repetitive = false;
 
     get_syncmers(seq, mins);
+    eprintln!("[FWD] Found {} syncmers, seq_len={}", mins.len(), seq.len());
+    
     if collect_candidates(idx, mins, false, max_hits, candidates) {
         repetitive = true;
     }
+    eprintln!("[FWD] Collected {} candidates", candidates.len());
+    
     rev.clear();
     rev.extend(seq.iter().rev().map(|b| match b {
         b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A',
@@ -1224,14 +1228,23 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         _ => b'N',
     }));
     get_syncmers(rev, mins);
+    eprintln!("[REV] Found {} syncmers", mins.len());
+    
+    let before_rev = candidates.len();
     if collect_candidates(idx, mins, true, max_hits, candidates) {
         repetitive = true;
     }
+    eprintln!("[REV] Added {} candidates (total: {})", candidates.len() - before_rev, candidates.len());
+    
     if candidates.is_empty() {
+        eprintln!("[FAIL] No candidates");
         return Vec::new();
     }
 
-    if repetitive { return Vec::new(); }
+    if repetitive { 
+        eprintln!("[FAIL] Repetitive hits");
+        return Vec::new(); 
+    }
 
     candidates.sort_unstable_by(|a, b| match a.id_strand.cmp(&b.id_strand) {
         std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
@@ -1240,15 +1253,20 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let total_seeds = candidates.len();
     let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_window);
     let c1_count = c1_end - c1_start;
+    eprintln!("[CLUSTER] Primary: {}/{} seeds, diag={}", c1_count, total_seeds, anchor_diag);
+    
     if c1_count < 3 {
+        eprintln!("[FAIL] Primary cluster too small: {}", c1_count);
         return Vec::new();
     }
     
     if !span_check(&candidates[c1_start..c1_end], cfg) {
+        eprintln!("[FAIL] Span check failed");
         return Vec::new();
     }
     
     if !is_collinear(&candidates[c1_start..c1_end], cfg) {
+        eprintln!("[FAIL] Collinearity check failed");
         return Vec::new();
     }
 
@@ -1256,6 +1274,8 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_window);
     let pre_count = pre_end.saturating_sub(pre_start);
     let post_count = post_end.saturating_sub(post_start);
+    eprintln!("[CLUSTER] Pre: {}, Post: {}", pre_count, post_count);
+    
     let (second_range, second_count) = if pre_count >= post_count {
         if pre_count > 0 {
             ((pre_start, pre_end, pre_diag), pre_count)
@@ -1273,45 +1293,61 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let attempt = |range: (usize, usize, i32)| -> Option<(AlignmentResult, usize)> {
         let (s, e, diag) = range;
         if e <= s {
+            eprintln!("[ATTEMPT] Empty range");
             return None;
         }
         let hits = &candidates[s..e];
+        eprintln!("[ATTEMPT] {} hits, diag={}", hits.len(), diag);
         
         if !span_check(hits, cfg) {
+            eprintln!("[ATTEMPT] Span check failed");
             return None;
         }
         
         let ref_id = (hits[0].id_strand >> 1) as i32;
         if (ref_id as usize) >= idx.ref_count() {
+            eprintln!("[ATTEMPT] Invalid ref_id: {}", ref_id);
             return None;
         }
         let is_rev = (hits[0].id_strand & 1) == 1;
         let target_seq = if is_rev { rev.as_slice() } else { seq };
         let ref_seq = idx.ref_seq(ref_id as usize);
+        eprintln!("[ATTEMPT] ref_id={}, is_rev={}, ref_len={}", ref_id, is_rev, ref_seq.len());
+        
         let (cigar, pos, as_score, aligned_len, nm) = greedy_extend(hits, diag, target_seq, ref_seq, cfg);
+        eprintln!("[EXTEND] pos={}, as_score={}, aligned_len={}, nm={}", pos, as_score, aligned_len, nm);
+        
         if aligned_len == 0 || pos < 0 || (pos as usize) >= ref_seq.len() {
+            eprintln!("[ATTEMPT] Invalid alignment: len={}, pos={}", aligned_len, pos);
             return None;
         }
         let identity = 1.0 - (nm as f32 / aligned_len.max(1) as f32);
+        eprintln!("[ATTEMPT] identity={:.3} (min={})", identity, cfg.min_identity);
+        
         if identity < cfg.min_identity {
+            eprintln!("[ATTEMPT] Identity too low");
             return None;
         }
+        eprintln!("[SUCCESS] Alignment accepted");
         Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm: nm as i32, md: String::new(), as_score, paired: false, proper_pair: false }, e - s))
     };
 
     let mut results = Vec::with_capacity(2);
 
     let mut other_count = second_count;
+    eprintln!("[PRIMARY] Attempting primary alignment ({}..{})", c1_start, c1_end);
     if let Some((mut res, primary_len)) = attempt((c1_start, c1_end, anchor_diag)) {
         let mapq = {
             let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
             (frac * 60.0).round().min(60.0) as u8
         };
         res.mapq = mapq;
+        eprintln!("[PRIMARY] SUCCESS - mapq={}", mapq);
         results.push(res);
     }
 
     if second_count > 0 {
+        eprintln!("[SECONDARY] Attempting secondary alignment");
         if let Some((mut res, primary_len)) = attempt(second_range) {
             other_count = c1_count;
             let mapq = {
@@ -1319,9 +1355,14 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
                 (frac * 60.0).round().min(60.0) as u8
             };
             res.mapq = mapq;
+            eprintln!("[SECONDARY] SUCCESS - mapq={}", mapq);
             results.push(res);
+        } else {
+            eprintln!("[SECONDARY] FAILED");
         }
     }
+
+    eprintln!("[FINAL] {} alignments", results.len());
 
     results.sort_by(|a, b| b.as_score.cmp(&a.as_score));
     results

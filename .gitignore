@@ -41,3 +41,5 @@ GRCh*
 analyze_benchmark.py
 analyze_benchmark_minimap.py
 perf*
+
+log
