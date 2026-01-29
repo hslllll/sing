@@ -1227,6 +1227,8 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         return Vec::new();
     }
 
+    if repetitive { return Vec::new(); }
+    
     candidates.sort_unstable_by(|a, b| match a.id_strand.cmp(&b.id_strand) {
         std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
         other => other,
@@ -1283,9 +1285,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
 
     let mut other_count = second_count;
     if let Some((mut res, primary_len)) = attempt((c1_start, c1_end, anchor_diag)) {
-        let mapq = if repetitive {
-            0u8
-        } else {
+        let mapq = {
             let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
             (frac * 60.0).round().min(60.0) as u8
         };
@@ -1296,9 +1296,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     if second_count > 0 {
         if let Some((mut res, primary_len)) = attempt(second_range) {
             other_count = c1_count;
-            let mapq = if repetitive {
-                0u8
-            } else {
+            let mapq = {
                 let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
                 (frac * 60.0).round().min(60.0) as u8
             };
