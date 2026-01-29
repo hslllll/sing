@@ -846,44 +846,51 @@ fn collect_candidates<I: IndexLike>(
     let offsets = idx.offsets();
     let seeds = idx.seeds();
     let offsets_len = offsets.len();
+    let seeds_ptr = seeds.as_ptr();
+    let seeds_len = seeds.len();
+    
     let mut last_bucket = usize::MAX;
     let mut start = 0usize;
     let mut end = 0usize;
+    
     for &(h, r_pos) in mins {
         let bucket = (h >> SHIFT) as usize;
         if bucket != last_bucket {
-            start = unsafe { *offsets.get_unchecked(bucket) } as usize;
+            start = offsets[bucket] as usize;
             end = if bucket + 1 < offsets_len {
-                (unsafe { *offsets.get_unchecked(bucket + 1) }) as usize
+                offsets[bucket + 1] as usize
             } else {
-                seeds.len()
+                seeds_len
             };
             last_bucket = bucket;
         }
 
         let count = end - start;
-
         if count > freq_filter {
             continue;
         }
 
         let target_hash = (h & 0xFFFF) as u64;
-        let mut i = start;
-        while i < end {
-            let seed = unsafe { *seeds.get_unchecked(i) };
-            if (seed >> 48) == target_hash {
-                let rid = ((seed >> 32) & 0xFFFF) as u32;
-                let pos = seed as u32;
-
-                let id_strand = (rid << 1) | (is_rev as u32);
-                let diag = (pos as i32) - (r_pos as i32);
-
-                out.push(Hit { id_strand, diag, read_pos: r_pos, ref_pos: pos });
-                if out.len() >= max_hits {
-                    return true;
+        
+        unsafe {
+            let mut seed_ptr = seeds_ptr.add(start);
+            let end_ptr = seeds_ptr.add(end);
+            
+            while seed_ptr < end_ptr {
+                let seed = *seed_ptr;
+                if (seed >> 48) == target_hash {
+                    let rid = ((seed >> 32) & 0xFFFF) as u32;
+                    let pos = seed as u32;
+                    let id_strand = (rid << 1) | (is_rev as u32);
+                    let diag = (pos as i32) - (r_pos as i32);
+                    
+                    out.push(Hit { id_strand, diag, read_pos: r_pos, ref_pos: pos });
+                    if out.len() >= max_hits {
+                        return true;
+                    }
                 }
+                seed_ptr = seed_ptr.add(1);
             }
-            i += 1;
         }
     }
     false
@@ -1285,7 +1292,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     if candidates.is_empty() {
         return Vec::new();
     }
-    // Fast radix sort by (id_strand, diag)
+    
     radix_sort_candidates(candidates, sort_buffer);
     let total_seeds = candidates.len();
     let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_window);
