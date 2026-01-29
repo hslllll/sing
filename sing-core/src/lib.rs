@@ -36,7 +36,7 @@ pub static CONFIG: Config = Config {
     x_drop: 10,
     max_hits: 400,       
     pair_max_dist: 1000,
-    maxindel: 20,
+    maxindel: 10,
     min_identity: 0.8,  
     diag_band: 15,
     cluster_window: 8,
@@ -1169,6 +1169,31 @@ fn span_check(hits: &[Hit], cfg: &Config) -> bool {
     span_diff < cfg.maxindel as i32
 }
 
+#[inline(always)]
+fn is_collinear(hits: &[Hit], cfg: &Config) -> bool {
+    if hits.len() < 2 { return true; }
+
+    let first_seed = &hits[0];
+    
+    let base_diag = (first_seed.ref_pos as i64) - (first_seed.read_pos as i64);
+    
+    let mut min_diff = 0;
+    let mut max_diff = 0;
+
+    for seed in hits.iter().skip(1) {
+        let cur_diag = (seed.ref_pos as i64) - (seed.read_pos as i64);
+        let diff = cur_diag - base_diag;
+
+        if diff < min_diff { min_diff = diff; }
+        if diff > max_diff { max_diff = diff; }
+
+        if max_diff - min_diff > cfg.maxindel as i64 {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec<u8>) -> Vec<AlignmentResult> {
     let State { mins, candidates } = state;
     let cfg = &CONFIG;
@@ -1211,6 +1236,10 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         return Vec::new();
     }
     
+    if !is_collinear(&candidates[c1_start..c1_end], cfg) {
+        return Vec::new();
+    }
+
     let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_window);
     let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_window);
     let pre_count = pre_end.saturating_sub(pre_start);
