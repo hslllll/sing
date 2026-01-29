@@ -25,6 +25,7 @@ pub struct Config {
     pub require_concordant_pair: bool,
     pub diag_band: i32,
     pub cluster_window: usize,
+    pub sort_top_k: usize,
 }
 
 pub static CONFIG: Config = Config {
@@ -48,6 +49,7 @@ pub static CONFIG: Config = Config {
     
     diag_band: 15,
     cluster_window: 8,
+    sort_top_k: 32,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -1263,7 +1265,15 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let bucket_sizes = idx.bucket_sizes();
 
     let sort_mins = |mins: &mut Vec<(u32, u32)>| {
-        mins.sort_unstable_by_key(|&(h, _)| {
+        let k = cfg.sort_top_k.min(mins.len());
+        if k == 0 {
+            return;
+        }
+        mins.select_nth_unstable_by_key(k - 1, |&(h, _)| {
+            let bucket = (h >> SHIFT) as usize;
+            bucket_sizes[bucket]
+        });
+        mins[..k].sort_unstable_by_key(|&(h, _)| {
             let bucket = (h >> SHIFT) as usize;
             bucket_sizes[bucket]
         });
