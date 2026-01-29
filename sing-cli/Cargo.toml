@@ -11,6 +11,6 @@ path = "src/main.rs"
 anyhow = "1.0"
 clap = { version = "4.4", features = ["derive"] }
 crossbeam-channel = "0.5"
-needletail = { version = "0.6", features = ["compression"] }
+needletail = { version = "0.6", features = ["flate2"] }
 sing-core = { path = "../sing-core" }
 mimalloc = { version = "0.1", default-features = false }
