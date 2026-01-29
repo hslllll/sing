@@ -382,6 +382,7 @@ fn main() -> Result<()> {
                                     let mut best_res1 = a1_candidates[i].clone();
                                     let mut best_res2 = a2_candidates[j].clone();
 
+                                    // Set paired flag (0x1) and properly matched pair flag (0x2)
                                     let mapq = if valid_pairs.len() > 1 {
                                         let (second_score, _, _) = valid_pairs[1];
                                         let diff = best_score - second_score;
@@ -392,12 +393,15 @@ fn main() -> Result<()> {
                                     
                                     best_res1.mapq = mapq;
                                     best_res2.mapq = mapq;
+                                    best_res1.paired = true;
+                                    best_res2.paired = true;
+                                    best_res1.proper_pair = true;
+                                    best_res2.proper_pair = true;
                                     
                                     (Some(best_res1), Some(best_res2))
-                                } else if CONFIG.require_concordant_pair {
-                                    (None, None)
                                 } else {
-                                    (a1_candidates.first().cloned(), a2_candidates.first().cloned())
+                                    // Paired-end mode requires concordant pair
+                                    (None, None)
                                 }
                             } else {
                                 (a1_candidates.first().cloned(), None)
@@ -547,6 +551,12 @@ fn format_sam<I: IndexLike>(
     }
     if proper_pair && is_mapped && is_mate_mapped {
         flag |= 0x2;
+    }
+    // Also check the proper_pair flag from the result itself
+    if let Some(r) = valid_res {
+        if r.proper_pair {
+            flag |= 0x2;
+        }
     }
     let mut rname = "*";
     let mut pos = 0;

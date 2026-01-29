@@ -36,7 +36,7 @@ pub static CONFIG: Config = Config {
     gap_ext: -1,
     x_drop: 20,
     
-    max_hits: 500,       
+    max_hits: 100,       
 
     pair_max_dist: 1000,
     require_concordant_pair: true,
@@ -513,6 +513,8 @@ pub struct AlignmentResult {
     pub nm: i32,
     pub md: String,
     pub as_score: i32,
+    pub paired: bool,
+    pub proper_pair: bool,
 }
 
 pub fn build_index_from_sequences<I, S>(records: I) -> Result<Index>
@@ -1270,7 +1272,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         if identity < cfg.min_identity {
             return None;
         }
-        Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm, md: String::new(), as_score }, e - s))
+        Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm, md: String::new(), as_score, paired: false, proper_pair: false }, e - s))
     };
 
     let mut results = Vec::with_capacity(2);
