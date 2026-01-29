@@ -362,8 +362,7 @@ pub struct MemoryIndex {
     offsets_len: usize,
     seeds_ptr: *const u64,
     seeds_len: usize,
-    bucket_sizes_ptr: *const u16,
-    bucket_sizes_len: usize,
+    bucket_sizes: Vec<u16>,
     freq_filter: u32,
     genome_size: u64,
     ref_seq_ranges: Vec<Range<usize>>,
@@ -477,16 +476,10 @@ impl MemoryIndex {
             .filter(|&end| end <= data.len())
             .ok_or_else(|| anyhow::anyhow!("read bucket_sizes: unexpected EOF"))?;
         
-        // Allocate aligned Vec instead of using try_cast_slice to avoid alignment issues
-        let mut bucket_sizes_vec = Vec::with_capacity(bucket_sizes_len);
+        let mut bucket_sizes = Vec::with_capacity(bucket_sizes_len);
         for chunk in data[pos..bucket_sizes_bytes].chunks_exact(2) {
-            bucket_sizes_vec.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+            bucket_sizes.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
-        
-        // Leak to get a stable pointer (safe because MemoryIndex owns the data lifetime)
-        let bucket_sizes_slice = bucket_sizes_vec.leak();
-        let bucket_sizes_ptr = bucket_sizes_slice.as_ptr();
-        let bucket_sizes_len = bucket_sizes_slice.len();
 
         Ok(Self {
             buf,
@@ -494,8 +487,7 @@ impl MemoryIndex {
             offsets_len,
             seeds_ptr,
             seeds_len,
-            bucket_sizes_ptr,
-            bucket_sizes_len,
+            bucket_sizes,
             freq_filter,
             genome_size,
             ref_seq_ranges,
@@ -514,7 +506,7 @@ impl IndexLike for MemoryIndex {
     }
 
     fn bucket_sizes(&self) -> &[u16] {
-        unsafe { std::slice::from_raw_parts(self.bucket_sizes_ptr, self.bucket_sizes_len) }
+        &self.bucket_sizes
     }
 
     fn freq_filter(&self) -> u32 {
