@@ -23,7 +23,7 @@ pub struct Config {
     pub pair_max_dist: i32,
     pub require_concordant_pair: bool,
     pub diag_band: i32,
-    pub cluster_window: usize,
+    pub cluster_bin: usize,
 }
 
 pub static CONFIG: Config = Config {
@@ -45,7 +45,7 @@ pub static CONFIG: Config = Config {
     min_identity: 0.8,  
     
     diag_band: 15,
-    cluster_window: 8,
+    cluster_bin: 8,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -1227,18 +1227,69 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         return Vec::new();
     }
 
-    candidates.sort_unstable_by(|a, b| match a.id_strand.cmp(&b.id_strand) {
-        std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
-        other => other,
-    });
+    
+    {
+        let cluster_bin = cfg.cluster_bin as i32;
+        
+        
+        let mut vote_counts: Vec<(u32, i32, usize)> = Vec::new();
+        vote_counts.reserve(candidates.len().min(256)); 
+        
+        for hit in candidates.iter() {
+            let bin_idx = hit.diag / cluster_bin;
+            let mut found = false;
+            
+            
+            for entry in vote_counts.iter_mut() {
+                if entry.0 == hit.id_strand && entry.1 == bin_idx {
+                    entry.2 += 1;
+                    found = true;
+                    break;
+                }
+            }
+            
+            if !found {
+                vote_counts.push((hit.id_strand, bin_idx, 1));
+            }
+        }
+        
+        
+        let (winner_id_strand, winner_bin_idx, winner_count) = vote_counts.iter()
+            .max_by_key(|(_, _, count)| *count)
+            .copied()
+            .unwrap_or_else(|| {
+                if candidates.is_empty() {
+                    (0, 0, 0)
+                } else {
+                    (candidates[0].id_strand, candidates[0].diag / cluster_bin, 1)
+                }
+            });
+        
+        if winner_count == 0 {
+            return Vec::new();
+        }
+        
+        
+        candidates.retain(|hit| {
+            hit.id_strand == winner_id_strand && {
+                let bin_idx = hit.diag / cluster_bin;
+                (bin_idx - winner_bin_idx).abs() <= 1
+            }
+        });
+        
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+    }
+    
     let total_seeds = candidates.len();
-    let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_window);
+    let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_bin);
     let c1_count = c1_end - c1_start;
     if c1_count < 3 {
         return Vec::new();
     }
-    let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_window);
-    let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_window);
+    let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_bin);
+    let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_bin);
     let pre_count = pre_end.saturating_sub(pre_start);
     let post_count = post_end.saturating_sub(post_start);
     let (second_range, second_count) = if pre_count >= post_count {
