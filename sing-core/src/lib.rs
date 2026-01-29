@@ -34,7 +34,7 @@ pub static CONFIG: Config = Config {
     mismatch_pen: -2,    
     gap_open: -2,        
     gap_ext: -1,
-    x_drop: 20,
+    x_drop: 10,
     
     max_hits: 100,       
 
@@ -914,7 +914,7 @@ fn extend_left(
     mut rp: usize,
     mut gp: usize,
     cfg: &Config,
-) -> (i32, usize, usize, Vec<u32>) {
+) -> (i32, usize, usize, Vec<u32>, usize) {
     let mut score = 0i32;
     let mut max_score = 0i32;
     let mut cigar = Vec::with_capacity(8);
@@ -923,6 +923,8 @@ fn extend_left(
     let mut best_gp = gp;
     let mut best_cigar_len = 0;
     let mut best_match_run = 0;
+    let mut nm = 0usize;
+    let mut best_nm = 0usize;
 
     while rp > 0 && gp > 0 {
         if rp >= 8 && gp >= 8 {
@@ -941,6 +943,7 @@ fn extend_left(
                             best_gp = gp;
                             best_cigar_len = cigar.len();
                             best_match_run = match_run;
+                            best_nm = nm;
                         }
                         continue;
                     }
@@ -952,6 +955,18 @@ fn extend_left(
                         match_run += match_bytes as u32;
                         rp -= match_bytes;
                         gp -= match_bytes;
+                    }
+                    // Count mismatches in the u64 block after leading matches
+                    let remaining = 8 - match_bytes;
+                    if remaining > 0 {
+                        let x_masked = x << (match_bytes * 8);
+                        for i in 0..remaining {
+                            let byte_idx = 7 - i;
+                            let byte_mask = 0xFFu64 << (byte_idx * 8);
+                            if (x_masked & byte_mask) != 0 {
+                                nm += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -975,16 +990,19 @@ fn extend_left(
             if mm_score >= del_score && mm_score >= ins_score {
                 score = mm_score;
                 cigar.push((1 << 4) | 0);
+                nm += 1;
                 rp -= 1;
                 gp -= 1;
             } else if del_score >= ins_score && gp > 0 {
                 score = del_score;
                 let mut glen = 1usize;
+                nm += 1;
                 while glen < CONFIG.maxindel && gp > glen && score + cfg.gap_ext > max_score - cfg.x_drop {
                     if gp > glen && rp > 0 && eq_for_align(read[rp - 1], rseq[gp - glen - 1]) {
                         break;
                     }
                     glen += 1;
+                    nm += 1;
                     score += cfg.gap_ext;
                 }
                 cigar.push(((glen as u32) << 4) | 2);
@@ -992,6 +1010,7 @@ fn extend_left(
             } else if rp > 0 {
                 score = ins_score;
                 cigar.push((1 << 4) | 1);
+                nm += 1;
                 rp -= 1;
             } else {
                 break;
@@ -1003,6 +1022,7 @@ fn extend_left(
             best_gp = gp;
             best_cigar_len = cigar.len();
             best_match_run = match_run;
+            best_nm = nm;
         }
         if score < max_score - cfg.x_drop {
             break;
@@ -1013,7 +1033,7 @@ fn extend_left(
         cigar.push((best_match_run << 4) | 0);
     }
     cigar.reverse();
-    (max_score, best_rp, best_gp, cigar)
+    (max_score, best_rp, best_gp, cigar, best_nm)
 }
 
 #[inline(always)]
@@ -1023,7 +1043,7 @@ fn extend_right(
     mut rp: usize,
     mut gp: usize,
     cfg: &Config,
-) -> (i32, usize, usize, Vec<u32>) {
+) -> (i32, usize, usize, Vec<u32>, usize) {
     let rlen = read.len();
     let glen = rseq.len();
     let mut score = 0i32;
@@ -1034,6 +1054,8 @@ fn extend_right(
     let mut best_gp = gp;
     let mut best_cigar_len = 0;
     let mut best_match_run = 0;
+    let mut nm = 0usize;
+    let mut best_nm = 0usize;
 
     while rp < rlen && gp < glen {
         if rlen - rp >= 8 && glen - gp >= 8 {
@@ -1052,6 +1074,7 @@ fn extend_right(
                             best_gp = gp;
                             best_cigar_len = cigar.len();
                             best_match_run = match_run;
+                            best_nm = nm;
                         }
                         continue;
                     }
@@ -1063,6 +1086,17 @@ fn extend_right(
                         match_run += match_bytes as u32;
                         rp += match_bytes;
                         gp += match_bytes;
+                    }
+                    // Count mismatches in the u64 block after leading matches
+                    let remaining = 8 - match_bytes;
+                    if remaining > 0 {
+                        let x_masked = x >> (match_bytes * 8);
+                        for i in 0..remaining {
+                            let byte_mask = 0xFFu64 << (i * 8);
+                            if (x_masked & byte_mask) != 0 {
+                                nm += 1;
+                            }
+                        }
                     }
                 }
              }
@@ -1086,16 +1120,19 @@ fn extend_right(
             if mm_score >= del_score && mm_score >= ins_score {
                 score = mm_score;
                 cigar.push((1 << 4) | 0);
+                nm += 1;
                 rp += 1;
                 gp += 1;
             } else if del_score >= ins_score && gp < glen {
                 score = del_score;
                 let mut dlen = 1usize;
+                nm += 1;
                 while dlen < 8 && gp + dlen < glen && score + cfg.gap_ext > max_score - cfg.x_drop {
                     if rp < rlen && eq_for_align(read[rp], rseq[gp + dlen]) {
                         break;
                     }
                     dlen += 1;
+                    nm += 1;
                     score += cfg.gap_ext;
                 }
                 cigar.push(((dlen as u32) << 4) | 2);
@@ -1103,6 +1140,7 @@ fn extend_right(
             } else if rp < rlen {
                 score = ins_score;
                 cigar.push((1 << 4) | 1);
+                nm += 1;
                 rp += 1;
             } else {
                 break;
@@ -1114,6 +1152,7 @@ fn extend_right(
             best_gp = gp;
             best_cigar_len = cigar.len();
             best_match_run = match_run;
+            best_nm = nm;
         }
         if score < max_score - cfg.x_drop {
             break;
@@ -1123,7 +1162,7 @@ fn extend_right(
     if best_match_run > 0 {
         cigar.push((best_match_run << 4) | 0);
     }
-    (max_score, best_rp, best_gp, cigar)
+    (max_score, best_rp, best_gp, cigar, best_nm)
 }
 
 #[inline(always)]
@@ -1133,7 +1172,7 @@ fn greedy_extend(
     read: &[u8],
     rseq: &[u8],
     cfg: &Config,
-) -> (Vec<u32>, i32, i32, usize) {
+) -> (Vec<u32>, i32, i32, usize, usize) {
     let rlen = read.len();
     let anchor_idx = hits.len() / 2;
     let anchor = &hits[anchor_idx.min(hits.len().saturating_sub(1))];
@@ -1146,8 +1185,8 @@ fn greedy_extend(
     if a_gp >= rseq.len() {
         a_gp = rseq.len().saturating_sub(1);
     }
-    let (l_score, l_rp, l_gp, l_cigar) = extend_left(read, rseq, a_rp, a_gp, cfg);
-    let (r_score, r_rp, _, r_cigar) = extend_right(read, rseq, a_rp, a_gp, cfg);
+    let (l_score, l_rp, l_gp, l_cigar, l_nm) = extend_left(read, rseq, a_rp, a_gp, cfg);
+    let (r_score, r_rp, _, r_cigar, r_nm) = extend_right(read, rseq, a_rp, a_gp, cfg);
     let mut cigar = Vec::with_capacity(l_cigar.len() + r_cigar.len() + 2);
     if l_rp > 0 {
         cigar.push(((l_rp as u32) << 4) | 4);
@@ -1164,37 +1203,8 @@ fn greedy_extend(
     }
     let aligned = r_rp.saturating_sub(l_rp);
     let as_score = l_score + r_score;
-    (cigar, l_gp as i32, as_score, aligned)
-}
-
-fn compute_nm(read: &[u8], rseq: &[u8], pos: i32, cigar: &[u32]) -> i32 {
-    let mut nm = 0i32;
-    let mut ri = pos as usize;
-    let mut qi = 0usize;
-    for &c in cigar {
-        let len = (c >> 4) as usize;
-        let op = c & 0xF;
-        match op {
-            0 => {
-                for _ in 0..len {
-                    if ri < rseq.len() && qi < read.len() {
-                        let rb = read[qi];
-                        let gb = rseq[ri];
-                        if is_n(rb) || is_n(gb) || !rb.eq_ignore_ascii_case(&gb) {
-                            nm += 1;
-                        }
-                    }
-                    ri += 1;
-                    qi += 1;
-                }
-            }
-            1 => { nm += len as i32; qi += len; }
-            2 => { nm += len as i32; ri += len; }
-            4 => { qi += len; }
-            _ => {}
-        }
-    }
-    nm
+    let nm = l_nm + r_nm;
+    (cigar, l_gp as i32, as_score, aligned, nm)
 }
 
 pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec<u8>) -> Vec<AlignmentResult> {
@@ -1263,16 +1273,15 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         let is_rev = (hits[0].id_strand & 1) == 1;
         let target_seq = if is_rev { rev.as_slice() } else { seq };
         let ref_seq = idx.ref_seq(ref_id as usize);
-        let (cigar, pos, as_score, aligned_len) = greedy_extend(hits, diag, target_seq, ref_seq, cfg);
+        let (cigar, pos, as_score, aligned_len, nm) = greedy_extend(hits, diag, target_seq, ref_seq, cfg);
         if aligned_len == 0 || pos < 0 || (pos as usize) >= ref_seq.len() {
             return None;
         }
-        let nm = compute_nm(target_seq, ref_seq, pos, &cigar);
         let identity = 1.0 - (nm as f32 / aligned_len.max(1) as f32);
         if identity < cfg.min_identity {
             return None;
         }
-        Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm, md: String::new(), as_score, paired: false, proper_pair: false }, e - s))
+        Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm: nm as i32, md: String::new(), as_score, paired: false, proper_pair: false }, e - s))
     };
 
     let mut results = Vec::with_capacity(2);
