@@ -90,11 +90,6 @@ if [ ! -f "$REF_DECOMP.1.bt2" ]; then
     bowtie2-build -t 8 "$REF_DECOMP" "$REF_DECOMP" > /dev/null 2>&1
 fi
 
-if [ ! -f "$REF_DECOMP.bwt" ]; then
-    echo "Indexing Columba..."
-    columba_build -r "$REF_DECOMP" -f "$REF_DECOMP" > /dev/null 2>&1
-fi
-
 if [ ! -f "${INDEX_PREFIX}.idx" ]; then
     echo "Indexing Sing..."
     if command -v cargo &> /dev/null; then
@@ -212,16 +207,14 @@ def main():
     times = {
         'Minimap2': sys.argv[2],
         'BWA-MEM2': sys.argv[3],
-        'Columba':  sys.argv[4],
-        'Sing':     sys.argv[5],
-        'Bowtie2':  sys.argv[6]
+        'Sing':     sys.argv[4],
+        'Bowtie2':  sys.argv[5]
     }
-    mode = sys.argv[7]
+    mode = sys.argv[6]
 
     file_paths = {
         'Minimap2': f'minimap.{mode}.sam',
         'BWA-MEM2': f'bwa.{mode}.sam',
-        'Columba':  f'columba.{mode}.sam',
         'Sing':     f'sing.{mode}.sam',
         'Bowtie2':  f'bowtie2.{mode}.sam'
     }
@@ -232,7 +225,7 @@ def main():
     print(f"\n--- Summary: {exp_name} (Mode: {mode}) ---")
     print("Tool        | Time_ms  | Precision | Recall   | F1        | TP       | FP       | FN")
 
-    tools_ordered = ['Minimap2', 'BWA-MEM2', 'Columba', 'Sing', 'Bowtie2']
+    tools_ordered = ['Minimap2', 'BWA-MEM2', 'Sing', 'Bowtie2']
 
     for tool in tools_ordered:
         time_val = times.get(tool, "N/A")
@@ -292,22 +285,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
             echo "Minimap2 Failed"
         fi
 
-        echo "3. Running Columba..."
-        START=$(date +%s%N)
-        if command -v columba &> /dev/null; then
-             if columba -t "$THREADS" -r "$REF_DECOMP" -f <(pigz -p 8 -cd "$R1") -F <(pigz -p 8 -cd "$R2") -o "columba.${MODE}.sam" > /dev/null 2>&1; then
-                 END=$(date +%s%N)
-                 TIME_COL=$(( (END - START) / 1000000 ))
-             else
-                 TIME_COL="N/A"
-                 echo "Columba Failed"
-             fi
-        else
-            TIME_COL="N/A"
-            touch "columba.${MODE}.sam"
-        fi
-        
-        echo "4. Running BWA-MEM2..."
+        echo "3. Running BWA-MEM2..."
         START=$(date +%s%N)
         if bwa-mem2 mem -t "$THREADS" "$REF_DECOMP" <(pigz -p 8 -cd "$R1") <(pigz -p 8 -cd "$R2") > "bwa.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
@@ -317,7 +295,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
             echo "BWA Failed"
         fi
 
-        echo "5. Running Bowtie2..."
+        echo "4. Running Bowtie2..."
         START=$(date +%s%N)
         if bowtie2 -p "$THREADS" -x "$REF_DECOMP" -1 <(pigz -p 8 -cd "$R1") -2 <(pigz -p 8 -cd "$R2") > "bowtie2.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
@@ -327,9 +305,9 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
             echo "bowtie2: Failed"
         fi
 
-        python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_BWA" "$TIME_COL" "$TIME_SING" "$TIME_BT2" "$MODE" | tee -a "$OUTPUT_CSV"
+        python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_BWA" "$TIME_SING" "$TIME_BT2" "$MODE" | tee -a "$OUTPUT_CSV"
 
-        rm "minimap.${MODE}.sam" "bwa.${MODE}.sam" "columba.${MODE}.sam" "bowtie2.${MODE}.sam"
+        rm "minimap.${MODE}.sam" "bwa.${MODE}.sam" "bowtie2.${MODE}.sam"
         echo ""
     done
 done

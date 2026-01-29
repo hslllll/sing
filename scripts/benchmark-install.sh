@@ -83,24 +83,6 @@ else
     echo "bwa-mem2 already installed"
 fi
 
-echo "Installing Columba..."
-if ! command -v columba &> /dev/null; then
-    cd /tmp
-    if [ ! -d "columba" ]; then
-        git clone https://github.com/biointec/columba.git
-    fi
-    cd columba
-    
-    bash build_script.sh Vanilla
-    
-    $SUDO cp build_Vanilla/columba /usr/local/bin/
-    $SUDO cp build_Vanilla/columba_build /usr/local/bin/
-    cd ..
-    echo "Columba installed successfully"
-else
-    echo "Columba already installed"
-fi
-
 echo ""
 echo "=== Installation Complete ==="
 echo "Installed tools:"
@@ -108,8 +90,5 @@ command -v samtools && samtools --version | head -n1
 command -v dwgsim && echo "dwgsim installed" || echo "dwgsim not found"
 command -v minimap2 && minimap2 --version
 command -v bwa-mem2 && bwa-mem2 version
-command -v columba && echo "Columba installed" || echo "Columba not found"
-command -v columba_build && echo "Columba_build installed" || echo "Columba_build not found"
-
 echo ""
 echo "All mapping tools are ready for benchmarking!"
