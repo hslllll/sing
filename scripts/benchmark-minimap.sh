@@ -246,7 +246,7 @@ for MUT_RATE in "${MUT_RATES[@]}"; do
 
         echo "1. Running Sing..."
         START=$(date +%s%N)
-        if ./target/release/sing map -t "$THREADS" "${INDEX_PREFIX}.idx" -1 <(pigz -p 8 -cd "$R1") -2 <(pigz -p 8 -cd "$R2") > "sing.${MODE}.sam"; then
+        if ./target/release/sing map -t "$THREADS" "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" > "sing.${MODE}.sam"; then
             END=$(date +%s%N)
             TIME_SING=$(( (END - START) / 1000000 ))
         else
@@ -256,7 +256,7 @@ for MUT_RATE in "${MUT_RATES[@]}"; do
 
         echo "2. Running Minimap2..."
         START=$(date +%s%N)
-        if minimap2 -t "$THREADS" -ax sr "$REF_DECOMP" <(pigz -p 8 -cd "$R1") <(pigz -p 8 -cd "$R2") > "minimap.${MODE}.sam" 2>/dev/null; then
+        if minimap2 -t "$THREADS" -ax sr "$REF_DECOMP" "$R1" "$R2" > "minimap.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_MM=$(( (END - START) / 1000000 ))
         else
