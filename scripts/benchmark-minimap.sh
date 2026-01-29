@@ -42,7 +42,7 @@ else
     exit 1
 fi
 
-READS_N=30000
+READS_N=100000
 MUT_RATES=(0.001 0.01)
 THREADS=4
 

@@ -275,6 +275,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         if ./target/release/sing map -t "$THREADS" "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" > "sing.${MODE}.sam"; then
             END=$(date +%s%N)
             TIME_SING=$(( (END - START) / 1000000 ))
+            echo "$TIME_SING"
         else
             TIME_SING="N/A"
             echo "Sing Failed"
@@ -285,6 +286,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         if minimap2 -t "$THREADS" -ax sr "$REF_DECOMP" "$R1" "$R2" > "minimap.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_MM=$(( (END - START) / 1000000 ))
+            echo "$TIME_MM"
         else
             TIME_MM="N/A"
             echo "Minimap2 Failed"
@@ -295,6 +297,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         if bwa-mem2 mem -t "$THREADS" "$REF_DECOMP" "$R1" "$R2" > "bwa.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_BWA=$(( (END - START) / 1000000 ))
+            echo "$TIME_BWA"
         else
             TIME_BWA="N/A"
             echo "BWA Failed"
@@ -305,6 +308,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         if bowtie2 -p "$THREADS" -x "$REF_DECOMP" -1 "$R1" -2 "$R2" > "bowtie2.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_BT2=$(( (END - START) / 1000000 ))
+            echo "$TIME_BT2"
         else
             TIME_BT2="N/A"
             echo "bowtie2: Failed"
