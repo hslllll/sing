@@ -615,7 +615,9 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     let mut tail = 0;
 
     let mut h_k = 0u64;
+    let mut h_k_rc = 0u64;
     let mut h_s = 0u64;
+    let mut h_s_rc = 0u64;
     let mut base_buf_k = [0usize; HASH_WINDOW];
     let mut base_buf_s = [0usize; SYNC_S];
     let mut ambig_buf_k = [0u8; HASH_WINDOW];
@@ -628,6 +630,8 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
             Some(idx) => (idx, 0u8),
             None => (0usize, 1u8),
         };
+        
+        let rc_idx = 3 - base_idx;
 
         let k_slot = i % HASH_WINDOW;
         let prev_idx_k = base_buf_k[k_slot];
@@ -645,14 +649,18 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
 
         if i + 1 <= HASH_WINDOW {
             h_k = h_k.rotate_left(ROT) ^ BASES[base_idx];
+            h_k_rc = (BASES[rc_idx]).rotate_right(ROT) ^ h_k_rc;
         } else {
             h_k = h_k.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx_k];
+            h_k_rc = (BASES[rc_idx] ^ REMOVE[3 - prev_idx_k]).rotate_right(ROT) ^ h_k_rc;
         }
 
         if i + 1 <= SYNC_S {
             h_s = h_s.rotate_left(ROT) ^ BASES[base_idx];
+            h_s_rc = (BASES[rc_idx]).rotate_right(ROT) ^ h_s_rc;
         } else {
             h_s = h_s.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE_S[prev_idx_s];
+            h_s_rc = (BASES[rc_idx] ^ REMOVE_S[3 - prev_idx_s]).rotate_right(ROT) ^ h_s_rc;
         }
 
         if i + 1 < SYNC_S {
@@ -662,17 +670,19 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
         let s_pos = i + 1 - SYNC_S;
         if ambig_s == 0 {
             let s_hash = h_s.wrapping_mul(0x517cc1b727220a95);
+            let s_hash_rc = h_s_rc.wrapping_mul(0x517cc1b727220a95);
+            let canonical_hash = s_hash.min(s_hash_rc);
             let s_pos_u32 = s_pos as u32;
 
             while tail > head {
-                if q_hash[(tail - 1) & Q_MASK] >= s_hash {
+                if q_hash[(tail - 1) & Q_MASK] >= canonical_hash {
                     tail -= 1;
                 } else {
                     break;
                 }
             }
 
-            q_hash[tail & Q_MASK] = s_hash;
+            q_hash[tail & Q_MASK] = canonical_hash;
             q_pos[tail & Q_MASK] = s_pos_u32;
             tail += 1;
         }
@@ -690,8 +700,10 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
                 let m_pos = q_pos[head & Q_MASK];
                 if m_pos <= max_pos {
                     let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
+                    let k_hash_rc = h_k_rc.wrapping_mul(0x517cc1b727220a95);
+                    let canonical_hash = k_hash.min(k_hash_rc);
                     if out.last().map(|&(_, p)| p) != Some(k_pos as u32) {
-                         out.push((k_hash as u32, k_pos as u32));
+                         out.push((canonical_hash as u32, k_pos as u32));
                     }
                 }
             }
