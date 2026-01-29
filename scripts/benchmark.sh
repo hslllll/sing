@@ -261,7 +261,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         if [ -f "$R1" ] && [ -f "$R2" ]; then
             echo "Simulated reads exist. Skipping dwgsim."
         else
-            dwgsim -C "$COVERAGE" -1 150 -2 150 -R 0 -X 0 -r "$MUT_RATE" -y 0 -H "$REF_DECOMP" "sim_${EXP_ID}" > /dev/null 2>&1
+            dwgsim -C "$COVERAGE" -1 150 -2 150 -R 0 -X 0 -r "$MUT_RATE" -y 0 -H "$REF_DECOMP" "sim_${EXP_ID}"
         fi
 
 

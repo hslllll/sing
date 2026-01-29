@@ -240,7 +240,7 @@ for MUT_RATE in "${MUT_RATES[@]}"; do
         if [ -f "$R1" ] && [ -f "$R2" ]; then
             echo "Simulated reads exist. Skipping dwgsim."
         else
-            dwgsim -N "$READS_N" -1 150 -2 150 -R 0 -X 0 -r "$MUT_RATE" -y 0 -H "$REF_DECOMP" "sim_${EXP_ID}" > /dev/null 2>&1
+            dwgsim -N "$READS_N" -1 150 -2 150 -R 0 -X 0 -r "$MUT_RATE" -y 0 -H "$REF_DECOMP" "sim_${EXP_ID}"
         fi
 
 
