@@ -36,7 +36,7 @@ pub static CONFIG: Config = Config {
     gap_ext: -1,
     x_drop: 10,
     
-    max_hits: 1000,       
+    max_hits: 4000,       
 
     pair_max_dist: 1000,
     require_concordant_pair: true,
@@ -99,7 +99,6 @@ pub const SHIFT: usize = 32 - RADIX;
 pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
-    pub freq_filter: u32,
     pub genome_size: u64,
     pub ref_seqs: Vec<Vec<u8>>,
     pub ref_names: Vec<String>,
@@ -108,7 +107,6 @@ pub struct Index {
 pub trait IndexLike {
     fn offsets(&self) -> &[u32];
     fn seeds(&self) -> &[u64];
-    fn freq_filter(&self) -> u32;
     fn genome_size(&self) -> u64;
     fn ref_count(&self) -> usize;
     fn ref_seq(&self, id: usize) -> &[u8];
@@ -125,15 +123,6 @@ impl Index {
             }
             let val = u64::from_le_bytes(data[*pos..*pos + 8].try_into().unwrap());
             *pos += 8;
-            Ok(val)
-        }
-
-        fn read_u32(data: &[u8], pos: &mut usize, label: &str) -> Result<u32> {
-            if *pos + 4 > data.len() {
-                bail!("{}: unexpected EOF", label);
-            }
-            let val = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
-            *pos += 4;
             Ok(val)
         }
 
@@ -161,7 +150,6 @@ impl Index {
         }
         pos = seeds_bytes;
 
-        let freq_filter = read_u32(data, &mut pos, "read freq_filter")?;
         let genome_size = read_u64(data, &mut pos, "read genome_size")?;
 
         let ref_count = read_u64(data, &mut pos, "read ref seq count")? as usize;
@@ -185,7 +173,7 @@ impl Index {
             pos = end;
         }
 
-        Ok(Index { offsets, seeds, freq_filter, genome_size, ref_seqs, ref_names })
+        Ok(Index { offsets, seeds, genome_size, ref_seqs, ref_names })
     }
 
     pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
@@ -208,9 +196,6 @@ impl Index {
             r.read_exact(&mut buf8).context("read seed")?;
             seeds.push(u64::from_le_bytes(buf8));
         }
-
-        r.read_exact(&mut buf4).context("read freq_filter")?;
-        let freq_filter = u32::from_le_bytes(buf4);
 
         r.read_exact(&mut buf8).context("read genome_size")?;
         let genome_size = u64::from_le_bytes(buf8);
@@ -237,7 +222,7 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
-        Ok(Index { offsets, seeds, freq_filter, genome_size, ref_seqs, ref_names })
+        Ok(Index { offsets, seeds, genome_size, ref_seqs, ref_names })
     }
 
     pub fn to_writer<W: Write>(&self, mut w: W) -> Result<()> {
@@ -250,8 +235,6 @@ impl Index {
         for s in &self.seeds {
             w.write_all(&s.to_le_bytes())?;
         }
-
-        w.write_all(&self.freq_filter.to_le_bytes())?;
 
         w.write_all(&self.genome_size.to_le_bytes())?;
 
@@ -279,10 +262,6 @@ impl IndexLike for Index {
 
     fn seeds(&self) -> &[u64] {
         &self.seeds
-    }
-
-    fn freq_filter(&self) -> u32 {
-        self.freq_filter
     }
 
     fn genome_size(&self) -> u64 {
@@ -321,7 +300,6 @@ pub struct MemoryIndex {
     offsets_len: usize,
     seeds_ptr: *const u64,
     seeds_len: usize,
-    freq_filter: u32,
     genome_size: u64,
     ref_seq_ranges: Vec<Range<usize>>,
     ref_name_ranges: Vec<Range<usize>>,
@@ -362,15 +340,6 @@ impl MemoryIndex {
             Ok(val)
         }
 
-        fn read_u32(data: &[u8], pos: &mut usize, label: &str) -> Result<u32> {
-            if *pos + 4 > data.len() {
-                bail!("{}: unexpected EOF", label);
-            }
-            let val = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
-            *pos += 4;
-            Ok(val)
-        }
-
         let offsets_len = read_u64(data, &mut pos, "read offsets len")? as usize;
         let offsets_bytes = offsets_len
             .checked_mul(4)
@@ -397,7 +366,6 @@ impl MemoryIndex {
         let seeds_len = seeds_slice.len();
         pos = seeds_bytes;
 
-        let freq_filter = read_u32(data, &mut pos, "read freq_filter")?;
         let genome_size = read_u64(data, &mut pos, "read genome_size")?;
 
         let ref_count = read_u64(data, &mut pos, "read ref seq count")? as usize;
@@ -432,7 +400,6 @@ impl MemoryIndex {
             offsets_len,
             seeds_ptr,
             seeds_len,
-            freq_filter,
             genome_size,
             ref_seq_ranges,
             ref_name_ranges,
@@ -447,10 +414,6 @@ impl IndexLike for MemoryIndex {
 
     fn seeds(&self) -> &[u64] {
         unsafe { std::slice::from_raw_parts(self.seeds_ptr, self.seeds_len) }
-    }
-
-    fn freq_filter(&self) -> u32 {
-        self.freq_filter
     }
 
     fn genome_size(&self) -> u64 {
@@ -480,10 +443,6 @@ impl<T: IndexLike> IndexLike for std::sync::Arc<T> {
 
     fn seeds(&self) -> &[u64] {
         self.as_ref().seeds()
-    }
-
-    fn freq_filter(&self) -> u32 {
-        self.as_ref().freq_filter()
     }
 
     fn genome_size(&self) -> u64 {
@@ -613,7 +572,6 @@ where
     Ok(Index {
         offsets,
         seeds: final_seeds,
-        freq_filter: max_hits as u32,
         genome_size: total_bases,
         ref_seqs,
         ref_names,
