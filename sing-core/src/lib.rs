@@ -25,7 +25,6 @@ pub struct Config {
     pub require_concordant_pair: bool,
     pub diag_band: i32,
     pub cluster_window: usize,
-    pub sort_top_k: usize,
 }
 
 pub static CONFIG: Config = Config {
@@ -38,7 +37,7 @@ pub static CONFIG: Config = Config {
     gap_ext: -1,
     x_drop: 20,
     
-    max_hits: 40000,       
+    max_hits: 500,       
     downsample_threshold: 5000, 
 
     pair_max_dist: 1000,
@@ -49,13 +48,12 @@ pub static CONFIG: Config = Config {
     
     diag_band: 15,
     cluster_window: 8,
-    sort_top_k: 64,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
 const MINIMIZER_WINDOW: usize = CONFIG.minimizer_window;
 const SYNC_S: usize = CONFIG.sync_s;
-const FREQ_FILTER_ROOT: f64 = 5.0;
+const FREQ_FILTER_ROOT: f64 = 3.0;
 
 const BASES: [u64; 4] = [
     (std::f64::consts::E - 2f64).to_bits(),
@@ -642,7 +640,6 @@ pub struct Hit {
 pub struct State {
     pub mins: Vec<(u32, u32)>,
     pub candidates: Vec<Hit>,
-    pub sort_buffer: Vec<Hit>,
 }
 
 impl State {
@@ -650,83 +647,8 @@ impl State {
         Self {
             mins: Vec::with_capacity(100),
             candidates: Vec::with_capacity(1000),
-            sort_buffer: Vec::with_capacity(1000),
         }
     }
-}
-
-// Fast radix sort for Hit by (id_strand, diag)
-#[inline(never)]
-fn radix_sort_candidates(candidates: &mut [Hit], buffer: &mut Vec<Hit>) {
-    if candidates.len() <= 1 {
-        return;
-    }
-    
-    // For small arrays, pdqsort is faster
-    if candidates.len() < 256 {
-        candidates.sort_unstable_by(|a, b| {
-            match a.id_strand.cmp(&b.id_strand) {
-                std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
-                other => other,
-            }
-        });
-        return;
-    }
-
-    // Count sort by id_strand (primary key)
-    let max_id_strand = candidates.iter().map(|h| h.id_strand).max().unwrap_or(0) as usize;
-    
-    // If id_strand range is too large, fall back to pdqsort
-    if max_id_strand > 10000 {
-        candidates.sort_unstable_by(|a, b| {
-            match a.id_strand.cmp(&b.id_strand) {
-                std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
-                other => other,
-            }
-        });
-        return;
-    }
-
-    // Counting sort by id_strand
-    let mut counts = vec![0u32; max_id_strand + 1];
-    for hit in candidates.iter() {
-        counts[hit.id_strand as usize] += 1;
-    }
-
-    // Convert to cumulative offsets
-    let mut total = 0u32;
-    for count in counts.iter_mut() {
-        let c = *count;
-        *count = total;
-        total += c;
-    }
-
-    // Place hits in sorted order by id_strand
-    buffer.clear();
-    buffer.resize(candidates.len(), Hit::default());
-    for hit in candidates.iter() {
-        let idx = counts[hit.id_strand as usize] as usize;
-        buffer[idx] = *hit;
-        counts[hit.id_strand as usize] += 1;
-    }
-
-    // Now sort each id_strand group by diag
-    let mut i = 0;
-    while i < buffer.len() {
-        let id_strand = buffer[i].id_strand;
-        let mut j = i + 1;
-        while j < buffer.len() && buffer[j].id_strand == id_strand {
-            j += 1;
-        }
-        // Sort [i..j) by diag
-        if j - i > 1 {
-            buffer[i..j].sort_unstable_by_key(|h| h.diag);
-        }
-        i = j;
-    }
-
-    // Copy back
-    candidates.copy_from_slice(&buffer[..candidates.len()]);
 }
 
 #[inline(always)]
@@ -1288,7 +1210,7 @@ fn compute_nm(read: &[u8], rseq: &[u8], pos: i32, cigar: &[u32]) -> i32 {
 }
 
 pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec<u8>) -> Vec<AlignmentResult> {
-    let State { mins, candidates, sort_buffer } = state;
+    let State { mins, candidates } = state;
     let cfg = &CONFIG;
     candidates.clear();
     let max_hits = cfg.max_hits;
@@ -1311,8 +1233,11 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     if candidates.is_empty() {
         return Vec::new();
     }
-    
-    radix_sort_candidates(candidates, sort_buffer);
+
+    candidates.sort_unstable_by(|a, b| match a.id_strand.cmp(&b.id_strand) {
+        std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
+        other => other,
+    });
     let total_seeds = candidates.len();
     let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_window);
     let c1_count = c1_end - c1_start;
