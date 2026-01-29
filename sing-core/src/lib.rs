@@ -49,7 +49,7 @@ pub static CONFIG: Config = Config {
     
     diag_band: 15,
     cluster_window: 8,
-    sort_top_k: 32,
+    sort_top_k: 16,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
