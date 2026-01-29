@@ -535,8 +535,7 @@ where
     
     eprintln!("Building sort-based index: {} bp, max_hits={}", total_bases, max_hits);
 
-    // Step 1: Collect all minimizers
-    let mut all_seeds: Vec<(u32, u32, u32)> = Vec::new(); // (hash, rid, pos)
+    let mut all_seeds: Vec<(u32, u32, u32)> = Vec::new(); 
     let mut mins = Vec::new();
     
     for (rid, seq) in ref_seqs.iter().enumerate() {
@@ -548,11 +547,9 @@ where
     
     eprintln!("  Collected {} raw seeds", all_seeds.len());
 
-    // Step 2: Sort by hash to count frequencies
     all_seeds.sort_unstable_by_key(|k| k.0);
     eprintln!("  Sorted seeds");
 
-    // Step 3: Filter by frequency
     let mut kept_seeds = Vec::new();
     let mut i = 0;
     let mut kept = 0usize;
@@ -577,11 +574,9 @@ where
     
     eprintln!("  Kept {} seeds, filtered {} seeds", kept, filtered);
 
-    // Step 4: Group by bucket and build index
     let mut offsets = vec![0u32; 1 << RADIX];
     let mut final_seeds = Vec::with_capacity(kept_seeds.len());
     
-    // Sort by bucket
     kept_seeds.sort_unstable_by_key(|k| k.0 >> SHIFT);
     
     let mut write_offset = 0u32;
@@ -590,7 +585,6 @@ where
     for &(h, rid, pos) in &kept_seeds {
         let bucket = (h >> SHIFT) as usize;
         
-        // Fill offsets for empty buckets
         while last_bucket <= bucket {
             offsets[last_bucket] = write_offset;
             last_bucket += 1;
@@ -602,7 +596,6 @@ where
         write_offset += 1;
     }
     
-    // Fill remaining offsets
     while last_bucket < offsets.len() {
         offsets[last_bucket] = write_offset;
         last_bucket += 1;
@@ -750,7 +743,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
 #[inline(always)]
 fn collect_candidates<I: IndexLike>(
     idx: &I,
-    mins: &[(u32, u32)],
+    mins: &mut [(u32, u32)],
     is_rev: bool,
     max_hits: usize,
     out: &mut Vec<Hit>,
@@ -760,7 +753,9 @@ fn collect_candidates<I: IndexLike>(
     
     let mut repetitive = false;
     
-    for &(h, r_pos) in mins {
+    mins.sort_unstable_by_key(|&(h, _)| h >> SHIFT);
+    
+    for &(h, r_pos) in mins.iter() {
         let bucket = (h >> SHIFT) as usize;
         
         if bucket >= offsets.len() {
@@ -780,15 +775,22 @@ fn collect_candidates<I: IndexLike>(
         
         let target_hash = (h & 0xFFFF) as u64;
         let bucket_seeds = &seeds[start..end];
+        let bucket_size = bucket_seeds.len();
         
-        // Binary search for first occurrence of target_hash
-        let pos = bucket_seeds.partition_point(|&s| (s >> 48) < target_hash);
+        const LINEAR_THRESHOLD: usize = 32;
+        
+        let pos = if bucket_size < LINEAR_THRESHOLD {
+            bucket_seeds.iter()
+                .position(|&s| (s >> 48) >= target_hash)
+                .unwrap_or(bucket_size)
+        } else {
+            bucket_seeds.partition_point(|&s| (s >> 48) < target_hash)
+        };
         
         if pos >= bucket_seeds.len() {
             continue;
         }
         
-        // Collect all seeds with matching hash
         let mut count = 0;
         let mut idx_in_bucket = pos;
         
@@ -951,7 +953,6 @@ fn extend_left(
                         rp -= match_bytes;
                         gp -= match_bytes;
                     }
-                    // Count mismatches in the u64 block after leading matches
                     let remaining = 8 - match_bytes;
                     if remaining > 0 {
                         let x_masked = x << (match_bytes * 8);
@@ -1082,7 +1083,6 @@ fn extend_right(
                         rp += match_bytes;
                         gp += match_bytes;
                     }
-                    // Count mismatches in the u64 block after leading matches
                     let remaining = 8 - match_bytes;
                     if remaining > 0 {
                         let x_masked = x >> (match_bytes * 8);
