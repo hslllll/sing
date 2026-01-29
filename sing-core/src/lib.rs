@@ -23,7 +23,7 @@ pub struct Config {
     pub pair_max_dist: i32,
     pub require_concordant_pair: bool,
     pub diag_band: i32,
-    pub cluster_bin: usize,
+    pub cluster_window: usize,
 }
 
 pub static CONFIG: Config = Config {
@@ -45,7 +45,7 @@ pub static CONFIG: Config = Config {
     min_identity: 0.8,  
     
     diag_band: 15,
-    cluster_bin: 8,
+    cluster_window: 8,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -1227,48 +1227,18 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         return Vec::new();
     }
 
-    let cluster_bin = cfg.cluster_bin as i32;
-    let mut bin_votes: Vec<(u32, i32, usize)> = Vec::new();
-    
-    for hit in candidates.iter() {
-        let bin_idx = hit.diag / cluster_bin;
-        let key = (hit.id_strand, bin_idx);
-        
-        if let Some(entry) = bin_votes.iter_mut().find(|e| e.0 == key.0 && e.1 == key.1) {
-            entry.2 += 1;
-        } else {
-            bin_votes.push((key.0, key.1, 1));
-        }
-    }
-    
-    let (winner_id_strand, winner_bin_idx, _) = bin_votes
-        .iter()
-        .max_by_key(|e| e.2)
-        .copied()
-        .unwrap_or((0, 0, 0));
-    
-    candidates.retain(|hit| {
-        hit.id_strand == winner_id_strand 
-            && (hit.diag / cluster_bin - winner_bin_idx).abs() <= 1
-    });
-    
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
     candidates.sort_unstable_by(|a, b| match a.id_strand.cmp(&b.id_strand) {
         std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
         other => other,
     });
-    
     let total_seeds = candidates.len();
-    let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_bin);
+    let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_window);
     let c1_count = c1_end - c1_start;
     if c1_count < 3 {
         return Vec::new();
     }
-    let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_bin);
-    let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_bin);
+    let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_window);
+    let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_window);
     let pre_count = pre_end.saturating_sub(pre_start);
     let post_count = post_end.saturating_sub(post_start);
     let (second_range, second_count) = if pre_count >= post_count {
