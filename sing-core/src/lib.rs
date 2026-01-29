@@ -1160,6 +1160,21 @@ fn greedy_extend(
     (cigar, l_gp as i32, as_score, aligned, nm)
 }
 
+#[inline(always)]
+fn span_check(hits: &[Hit], cfg: &Config) -> bool {
+    if hits.is_empty() {
+        return false;
+    }
+    let first = &hits[0];
+    let last = &hits[hits.len() - 1];
+    
+    let query_span = (last.read_pos as i32) - (first.read_pos as i32);
+    let ref_span = (last.ref_pos as i32) - (first.ref_pos as i32);
+    
+    let span_diff = (ref_span - query_span).abs();
+    span_diff < cfg.maxindel as i32
+}
+
 pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec<u8>) -> Vec<AlignmentResult> {
     let State { mins, candidates } = state;
     let cfg = &CONFIG;
@@ -1197,6 +1212,11 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     if c1_count < 3 {
         return Vec::new();
     }
+    
+    if !span_check(&candidates[c1_start..c1_end], cfg) {
+        return Vec::new();
+    }
+    
     let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_window);
     let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_window);
     let pre_count = pre_end.saturating_sub(pre_start);
@@ -1221,6 +1241,11 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
             return None;
         }
         let hits = &candidates[s..e];
+        
+        if !span_check(hits, cfg) {
+            return None;
+        }
+        
         let ref_id = (hits[0].id_strand >> 1) as i32;
         if (ref_id as usize) >= idx.ref_count() {
             return None;
