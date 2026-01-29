@@ -898,11 +898,6 @@ fn eq_for_align(a: u8, b: u8) -> bool {
 }
 
 #[inline(always)]
-fn is_n(b: u8) -> bool {
-    b == b'N' || b == b'n'
-}
-
-#[inline(always)]
 fn has_n_u64(v: u64) -> bool {
     v.to_le_bytes().iter().any(|&b| b == b'n')
 }
