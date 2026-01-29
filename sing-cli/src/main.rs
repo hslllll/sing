@@ -119,7 +119,7 @@ fn main() -> Result<()> {
             let max_hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
             let worker_threads = threads.unwrap_or(max_hw).max(1);
             
-            let reader_threads = (r1.len() + r1.len()).max(1);
+            let reader_threads = (r1.len()*2).max(1);
             
             let batch_size = (reader_threads * 2048).max(4096).min(65536);
 
@@ -127,7 +127,7 @@ fn main() -> Result<()> {
             let idx = Arc::new(load_index(&index)?);
             eprintln!("Index loaded.");
 
-            let channel_cap = worker_threads * 64;
+            let channel_cap = worker_threads * 4;
             let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(channel_cap);
             let (recycle_tx, recycle_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(channel_cap);
             let paired_mode = r2.is_some();
