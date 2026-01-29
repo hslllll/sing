@@ -35,7 +35,7 @@ pub static CONFIG: Config = Config {
     gap_ext: -1,
     x_drop: 5,
     max_hits: 400,       
-    pair_max_dist: 1000,
+    pair_max_dist: 600,
     maxindel: 5,
     min_identity: 0.8,  
     diag_band: 5,
