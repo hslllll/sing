@@ -33,13 +33,13 @@ pub static CONFIG: Config = Config {
     mismatch_pen: -2,    
     gap_open: -2,        
     gap_ext: -1,
-    x_drop: 10,
+    x_drop: 5,
     max_hits: 400,       
     pair_max_dist: 1000,
-    maxindel: 10,
+    maxindel: 5,
     min_identity: 0.8,  
-    diag_band: 15,
-    cluster_window: 8,
+    diag_band: 5,
+    cluster_window: 5,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
