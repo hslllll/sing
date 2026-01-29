@@ -46,9 +46,12 @@ else
     exit 1
 fi
 
-COVERAGE_LIST=(3 5 10)
-MUT_RATES=(0.001 0.01)
-THREADS=4
+# COVERAGE_LIST=(3 5 10)
+# MUT_RATES=(0.001 0.01)
+# THREADS=4
+COVERAGE_LIST=(3)
+MUT_RATES=(0.01)
+THREADS=48
 
 OUTPUT_CSV="benchmark_results_f1.${MODE}.csv"
 
