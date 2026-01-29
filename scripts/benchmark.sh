@@ -238,10 +238,12 @@ def main():
             
             print(f"{tool:<10} | {time_val:<8} | {prec:6.2f}%   | {rec:6.2f}%   | {f1:6.2f}    | {tp:<8} | {fp:<8} | {fn:<8}")
             
-            sys.stderr.write(f"{exp_name},{tool},{time_val},{total_reads},{tp},{fp},{fn},{prec:.4f},{rec:.4f},{f1:.4f},{mode}\n")
+            csv_line = f"{exp_name},{tool},{time_val},{total_reads},{tp},{fp},{fn},{prec:.4f},{rec:.4f},{f1:.4f},{mode}"
+            print(f"CSV:{csv_line}", file=sys.stderr)
         else:
             print(f"{tool:<10} | {time_val:<8} | {'FAILED':<9} | {'-':<9} | {'-':<9} | -        | -        | -")
-            sys.stderr.write(f"{exp_name},{tool},{time_val},{total_reads},0,0,0,0,0,0,{mode}\n")
+            csv_line = f"{exp_name},{tool},{time_val},{total_reads},0,0,0,0,0,0,{mode}"
+            print(f"CSV:{csv_line}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
@@ -308,7 +310,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
             echo "bowtie2: Failed"
         fi
 
-        python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_BWA" "$TIME_SING" "$TIME_BT2" "$MODE" | tee -a "$OUTPUT_CSV"
+        python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_BWA" "$TIME_SING" "$TIME_BT2" "$MODE" 2> >(grep "^CSV:" | sed 's/^CSV://' >> "$OUTPUT_CSV")
 
         rm "minimap.${MODE}.sam" "bwa.${MODE}.sam" "bowtie2.${MODE}.sam"
         echo ""
