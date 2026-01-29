@@ -49,7 +49,7 @@ pub static CONFIG: Config = Config {
     
     diag_band: 15,
     cluster_window: 8,
-    sort_top_k: 16,
+    sort_top_k: 64,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -104,7 +104,6 @@ pub const SHIFT: usize = 32 - RADIX;
 pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
-    pub bucket_sizes: Vec<u16>,
     pub freq_filter: u32,
     pub genome_size: u64,
     pub ref_seqs: Vec<Vec<u8>>,
@@ -114,7 +113,6 @@ pub struct Index {
 pub trait IndexLike {
     fn offsets(&self) -> &[u32];
     fn seeds(&self) -> &[u64];
-    fn bucket_sizes(&self) -> &[u16];
     fn freq_filter(&self) -> u32;
     fn genome_size(&self) -> u64;
     fn ref_count(&self) -> usize;
@@ -141,15 +139,6 @@ impl Index {
             }
             let val = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
             *pos += 4;
-            Ok(val)
-        }
-
-        fn read_u16(data: &[u8], pos: &mut usize, label: &str) -> Result<u16> {
-            if *pos + 2 > data.len() {
-                bail!("{}: unexpected EOF", label);
-            }
-            let val = u16::from_le_bytes(data[*pos..*pos + 2].try_into().unwrap());
-            *pos += 2;
             Ok(val)
         }
 
@@ -201,15 +190,7 @@ impl Index {
             pos = end;
         }
 
-        // Read bucket_sizes (added for performance)
-        let bucket_sizes_len = read_u64(data, &mut pos, "read bucket_sizes len")? as usize;
-        let mut bucket_sizes = Vec::with_capacity(bucket_sizes_len);
-        for _ in 0..bucket_sizes_len {
-            let size = read_u16(data, &mut pos, "read bucket_size")?;
-            bucket_sizes.push(size);
-        }
-
-        Ok(Index { offsets, seeds, bucket_sizes, freq_filter, genome_size, ref_seqs, ref_names })
+        Ok(Index { offsets, seeds, freq_filter, genome_size, ref_seqs, ref_names })
     }
 
     pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
@@ -261,17 +242,7 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
-        // Read bucket_sizes (added for performance)
-        r.read_exact(&mut buf8).context("read bucket_sizes len")?;
-        let len = u64::from_le_bytes(buf8) as usize;
-        let mut bucket_sizes = Vec::with_capacity(len);
-        let mut buf2 = [0u8; 2];
-        for _ in 0..len {
-            r.read_exact(&mut buf2).context("read bucket_size")?;
-            bucket_sizes.push(u16::from_le_bytes(buf2));
-        }
-
-        Ok(Index { offsets, seeds, bucket_sizes, freq_filter, genome_size, ref_seqs, ref_names })
+        Ok(Index { offsets, seeds, freq_filter, genome_size, ref_seqs, ref_names })
     }
 
     pub fn to_writer<W: Write>(&self, mut w: W) -> Result<()> {
@@ -302,11 +273,6 @@ impl Index {
             w.write_all(bytes)?;
         }
 
-        // Write bucket_sizes (added for performance)
-        w.write_all(&(self.bucket_sizes.len() as u64).to_le_bytes())?;
-        for &size in &self.bucket_sizes {
-            w.write_all(&size.to_le_bytes())?;
-        }
         Ok(())
     }
 }
@@ -318,10 +284,6 @@ impl IndexLike for Index {
 
     fn seeds(&self) -> &[u64] {
         &self.seeds
-    }
-
-    fn bucket_sizes(&self) -> &[u16] {
-        &self.bucket_sizes
     }
 
     fn freq_filter(&self) -> u32 {
@@ -364,7 +326,6 @@ pub struct MemoryIndex {
     offsets_len: usize,
     seeds_ptr: *const u64,
     seeds_len: usize,
-    bucket_sizes: Vec<u16>,
     freq_filter: u32,
     genome_size: u64,
     ref_seq_ranges: Vec<Range<usize>>,
@@ -470,26 +431,12 @@ impl MemoryIndex {
             pos = end;
         }
 
-        // Read bucket_sizes (added for performance)
-        let bucket_sizes_len = read_u64(data, &mut pos, "read bucket_sizes len")? as usize;
-        let bucket_sizes_bytes = bucket_sizes_len
-            .checked_mul(2)
-            .and_then(|n| pos.checked_add(n))
-            .filter(|&end| end <= data.len())
-            .ok_or_else(|| anyhow::anyhow!("read bucket_sizes: unexpected EOF"))?;
-        
-        let mut bucket_sizes = Vec::with_capacity(bucket_sizes_len);
-        for chunk in data[pos..bucket_sizes_bytes].chunks_exact(2) {
-            bucket_sizes.push(u16::from_le_bytes([chunk[0], chunk[1]]));
-        }
-
         Ok(Self {
             buf,
             offsets_ptr,
             offsets_len,
             seeds_ptr,
             seeds_len,
-            bucket_sizes,
             freq_filter,
             genome_size,
             ref_seq_ranges,
@@ -505,10 +452,6 @@ impl IndexLike for MemoryIndex {
 
     fn seeds(&self) -> &[u64] {
         unsafe { std::slice::from_raw_parts(self.seeds_ptr, self.seeds_len) }
-    }
-
-    fn bucket_sizes(&self) -> &[u16] {
-        &self.bucket_sizes
     }
 
     fn freq_filter(&self) -> u32 {
@@ -542,10 +485,6 @@ impl<T: IndexLike> IndexLike for std::sync::Arc<T> {
 
     fn seeds(&self) -> &[u64] {
         self.as_ref().seeds()
-    }
-
-    fn bucket_sizes(&self) -> &[u16] {
-        self.as_ref().bucket_sizes()
     }
 
     fn freq_filter(&self) -> u32 {
@@ -689,16 +628,7 @@ where
     eprintln!("  Buckets kept: {} / {}", kept_buckets, kept_counts.len());
     eprintln!("  Total seeds kept: {}", seeds.len());
 
-    // Compute bucket sizes for fast sorting in align
-    let bucket_sizes: Vec<u16> = offsets.windows(2)
-        .map(|w| (w[1] - w[0]).min(u16::MAX as u32) as u16)
-        .chain(std::iter::once({
-            let last_size = (seeds.len() as u32 - offsets.last().unwrap()).min(u16::MAX as u32);
-            last_size as u16
-        }))
-        .collect();
-
-    Ok(Index { offsets, seeds, bucket_sizes, freq_filter: freq_filter as u32, genome_size: total_bases, ref_seqs, ref_names })
+    Ok(Index { offsets, seeds, freq_filter: freq_filter as u32, genome_size: total_bases, ref_seqs, ref_names })
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -1261,26 +1191,8 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     candidates.clear();
     let max_hits = cfg.max_hits;
     let mut repetitive = false;
-    
-    let bucket_sizes = idx.bucket_sizes();
-
-    let sort_mins = |mins: &mut Vec<(u32, u32)>| {
-        let k = cfg.sort_top_k.min(mins.len());
-        if k == 0 {
-            return;
-        }
-        mins.select_nth_unstable_by_key(k - 1, |&(h, _)| {
-            let bucket = (h >> SHIFT) as usize;
-            bucket_sizes[bucket]
-        });
-        mins[..k].sort_unstable_by_key(|&(h, _)| {
-            let bucket = (h >> SHIFT) as usize;
-            bucket_sizes[bucket]
-        });
-    };
 
     get_syncmers(seq, mins);
-    sort_mins(mins);
     if collect_candidates(idx, mins, false, max_hits, candidates) {
         repetitive = true;
     }
@@ -1291,7 +1203,6 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         _ => b'N',
     }));
     get_syncmers(rev, mins);
-    sort_mins(mins);
     if collect_candidates(idx, mins, true, max_hits, candidates) {
         repetitive = true;
     }
