@@ -400,8 +400,7 @@ fn main() -> Result<()> {
                                     
                                     (Some(best_res1), Some(best_res2))
                                 } else {
-                                    // Paired-end mode requires concordant pair
-                                    (None, None)
+                                    (a1_candidates.first().cloned(), a2_candidates.first().cloned())
                                 }
                             } else {
                                 (a1_candidates.first().cloned(), None)
