@@ -476,9 +476,15 @@ impl MemoryIndex {
             .and_then(|n| pos.checked_add(n))
             .filter(|&end| end <= data.len())
             .ok_or_else(|| anyhow::anyhow!("read bucket_sizes: unexpected EOF"))?;
-        let bucket_sizes_range = pos..bucket_sizes_bytes;
-        let bucket_sizes_slice = try_cast_slice::<u8, u16>(&data[bucket_sizes_range])
-            .map_err(|_| anyhow::anyhow!("read bucket_sizes: unaligned data"))?;
+        
+        // Allocate aligned Vec instead of using try_cast_slice to avoid alignment issues
+        let mut bucket_sizes_vec = Vec::with_capacity(bucket_sizes_len);
+        for chunk in data[pos..bucket_sizes_bytes].chunks_exact(2) {
+            bucket_sizes_vec.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+        
+        // Leak to get a stable pointer (safe because MemoryIndex owns the data lifetime)
+        let bucket_sizes_slice = bucket_sizes_vec.leak();
         let bucket_sizes_ptr = bucket_sizes_slice.as_ptr();
         let bucket_sizes_len = bucket_sizes_slice.len();
 
