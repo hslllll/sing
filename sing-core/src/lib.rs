@@ -1227,60 +1227,39 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         return Vec::new();
     }
 
+    let cluster_bin = cfg.cluster_bin as i32;
+    let mut bin_votes: Vec<(u32, i32, usize)> = Vec::new();
     
-    {
-        let cluster_bin = cfg.cluster_bin as i32;
+    for hit in candidates.iter() {
+        let bin_idx = hit.diag / cluster_bin;
+        let key = (hit.id_strand, bin_idx);
         
-        
-        let mut vote_counts: Vec<(u32, i32, usize)> = Vec::new();
-        vote_counts.reserve(candidates.len().min(256)); 
-        
-        for hit in candidates.iter() {
-            let bin_idx = hit.diag / cluster_bin;
-            let mut found = false;
-            
-            
-            for entry in vote_counts.iter_mut() {
-                if entry.0 == hit.id_strand && entry.1 == bin_idx {
-                    entry.2 += 1;
-                    found = true;
-                    break;
-                }
-            }
-            
-            if !found {
-                vote_counts.push((hit.id_strand, bin_idx, 1));
-            }
-        }
-        
-        
-        let (winner_id_strand, winner_bin_idx, winner_count) = vote_counts.iter()
-            .max_by_key(|(_, _, count)| *count)
-            .copied()
-            .unwrap_or_else(|| {
-                if candidates.is_empty() {
-                    (0, 0, 0)
-                } else {
-                    (candidates[0].id_strand, candidates[0].diag / cluster_bin, 1)
-                }
-            });
-        
-        if winner_count == 0 {
-            return Vec::new();
-        }
-        
-        
-        candidates.retain(|hit| {
-            hit.id_strand == winner_id_strand && {
-                let bin_idx = hit.diag / cluster_bin;
-                (bin_idx - winner_bin_idx).abs() <= 1
-            }
-        });
-        
-        if candidates.is_empty() {
-            return Vec::new();
+        if let Some(entry) = bin_votes.iter_mut().find(|e| e.0 == key.0 && e.1 == key.1) {
+            entry.2 += 1;
+        } else {
+            bin_votes.push((key.0, key.1, 1));
         }
     }
+    
+    let (winner_id_strand, winner_bin_idx, _) = bin_votes
+        .iter()
+        .max_by_key(|e| e.2)
+        .copied()
+        .unwrap_or((0, 0, 0));
+    
+    candidates.retain(|hit| {
+        hit.id_strand == winner_id_strand 
+            && (hit.diag / cluster_bin - winner_bin_idx).abs() <= 1
+    });
+    
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    candidates.sort_unstable_by(|a, b| match a.id_strand.cmp(&b.id_strand) {
+        std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
+        other => other,
+    });
     
     let total_seeds = candidates.len();
     let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_bin);
