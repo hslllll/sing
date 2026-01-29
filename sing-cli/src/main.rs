@@ -13,7 +13,7 @@ use sing_core::{
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 const PROG_NAME: &str = env!("CARGO_PKG_NAME");
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
             
             let reader_threads = (worker_threads / 2).max(1);
             
-            let batch_size = worker_threads * 1024;
+            let batch_size = (reader_threads * 2048).max(4096).min(65536);
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
@@ -291,37 +291,29 @@ fn main() -> Result<()> {
 
             let idx_writer = idx.clone();
             
-            
-            let shared_writer: Arc<Mutex<Box<dyn Write + Send>>> = match &output {
-                Some(p) => Arc::new(Mutex::new(Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p)?)))),
-                None => Arc::new(Mutex::new(Box::new(BufWriter::with_capacity(2 * 1024 * 1024, std::io::stdout())))),
+            let mut writer: Box<dyn Write + Send> = match &output {
+                Some(p) => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p)?)),
+                None => Box::new(BufWriter::with_capacity(2 * 1024 * 1024, std::io::stdout())),
             };
             
-            {
-                let mut out = shared_writer.lock().unwrap();
-                writeln!(out, "@HD\tVN:1.6\tSO:unsorted")?;
-                for i in 0..idx_writer.ref_count() {
-                    let name = idx_writer.ref_name(i);
-                    let seq = idx_writer.ref_seq(i);
-                    writeln!(out, "@SQ\tSN:{}\tLN:{}", name, seq.len())?;
-                }
-                writeln!(out, "@RG\tID:sing\tSM:song\tPL:ILLUMINA")?;
-                writeln!(out, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION)?;
+            writeln!(writer, "@HD\tVN:1.6\tSO:unsorted")?;
+            for i in 0..idx_writer.ref_count() {
+                let name = idx_writer.ref_name(i);
+                let seq = idx_writer.ref_seq(i);
+                writeln!(writer, "@SQ\tSN:{}\tLN:{}", name, seq.len())?;
             }
+            writeln!(writer, "@RG\tID:sing\tSM:song\tPL:ILLUMINA")?;
+            writeln!(writer, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION)?;
 
-            let writer_threads = (worker_threads / 2).max(1);
-            let (wtx, wrx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(writer_threads * 8);
-            let mut writer_handles = Vec::new();
-            for _ in 0..writer_threads {
-                let wrx = wrx.clone();
-                let writer = shared_writer.clone();
-                writer_handles.push(thread::spawn(move || {
-                    while let Ok(chunk) = wrx.recv() {
-                        let mut out = writer.lock().unwrap();
-                        out.write_all(&chunk).unwrap();
-                    }
-                }));
-            }
+            let writer_queue_cap = worker_threads * 64;
+            let (wtx, wrx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(writer_queue_cap);
+            let writer_handle = thread::spawn(move || {
+                let mut out = writer;
+                while let Ok(chunk) = wrx.recv() {
+                    out.write_all(&chunk).unwrap();
+                }
+                out.flush().unwrap();
+            });
 
             let mut handles = Vec::new();
             for _ in 0..worker_threads {
@@ -479,12 +471,7 @@ fn main() -> Result<()> {
             }
             drop(recycle_tx);  
             drop(wtx);
-            for h in writer_handles {
-                h.join().unwrap();
-            }
-            
-            
-            shared_writer.lock().unwrap().flush().unwrap();
+            writer_handle.join().unwrap();
 
             let total = total_reads.load(std::sync::atomic::Ordering::Relaxed);
             let mapped = mapped_reads.load(std::sync::atomic::Ordering::Relaxed);
