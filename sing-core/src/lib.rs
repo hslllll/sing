@@ -36,7 +36,7 @@ pub static CONFIG: Config = Config {
     gap_ext: -1,
     x_drop: 10,
     
-    max_hits: 100,       
+    max_hits: 1000,       
 
     pair_max_dist: 1000,
     require_concordant_pair: true,
@@ -1228,7 +1228,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     }
 
     if repetitive { return Vec::new(); }
-    
+
     candidates.sort_unstable_by(|a, b| match a.id_strand.cmp(&b.id_strand) {
         std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
         other => other,
