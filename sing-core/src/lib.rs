@@ -33,12 +33,12 @@ pub static CONFIG: Config = Config {
     mismatch_pen: -2,
     gap_open: -2,
     gap_ext: -1,
-    x_drop: 5,
+    x_drop: 15,
     max_hits: 1000,
     pair_max_dist: 1000,
-    maxindel: 7,
+    maxindel: 15,
     min_identity: 0.85,
-    diag_band: 8,
+    diag_band: 15,
     cluster_window: 4,
 };
 
@@ -721,8 +721,7 @@ fn collect_candidates<I: IndexLike>(
 ) -> bool {
     let offsets = idx.offsets();
     let seeds = idx.seeds();
-    
-    let mut repetitive = false;
+    let mut capped = false;
     
     for &(h, r_pos) in mins {
         let bucket = (h >> SHIFT) as usize;
@@ -752,7 +751,6 @@ fn collect_candidates<I: IndexLike>(
             continue;
         }
         
-        
         let mut count = 0;
         let mut idx_in_bucket = pos;
         
@@ -761,6 +759,11 @@ fn collect_candidates<I: IndexLike>(
             let seed_hash = seed >> 48;
             
             if seed_hash != target_hash {
+                break;
+            }
+
+            if count >= max_hits {
+                capped = true;
                 break;
             }
             
@@ -778,15 +781,10 @@ fn collect_candidates<I: IndexLike>(
             
             count += 1;
             idx_in_bucket += 1;
-            
-            if count > max_hits {
-                repetitive = true;
-                break;
-            }
         }
     }
     
-    repetitive
+    capped
 }
 
 #[inline(always)]
@@ -1211,13 +1209,12 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let cfg = &CONFIG;
     candidates.clear();
     let max_hits = cfg.max_hits;
-    let mut repetitive = false;
+    let mut capped = false;
+    let mut second_failed = false;
 
     get_syncmers(seq, mins);
     
-    if collect_candidates(idx, mins, false, max_hits, candidates) {
-        repetitive = true;
-    }
+    capped |= collect_candidates(idx, mins, false, max_hits, candidates);
     
     rev.clear();
     rev.extend(seq.iter().rev().map(|b| match b {
@@ -1227,16 +1224,10 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     }));
     get_syncmers(rev, mins);
     
-    if collect_candidates(idx, mins, true, max_hits, candidates) {
-        repetitive = true;
-    }
+    capped |= collect_candidates(idx, mins, true, max_hits, candidates);
     
     if candidates.is_empty() {
         return Vec::new();
-    }
-
-    if repetitive { 
-        return Vec::new(); 
     }
 
     candidates.sort_unstable_by(|a, b| match a.id_strand.cmp(&b.id_strand) {
@@ -1332,6 +1323,18 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
             res.mapq = mapq;
             results.push(res);
         } else {
+            second_failed = true;
+        }
+    }
+
+    if second_failed && !results.is_empty() {
+        let primary = &mut results[0];
+        primary.mapq = (primary.mapq / 2).max(1);
+    }
+
+    if capped {
+        for res in &mut results {
+            res.mapq = res.mapq.min(30);
         }
     }
 
