@@ -13,6 +13,10 @@ use std::io::{BufRead, BufReader, Cursor, Write};
 #[wasm_bindgen(getter_with_clone)]
 pub struct MappingResult {
     pub bam_data: Vec<u8>,
+    pub mapped_reads: usize,
+    pub mapped_bases: usize,
+    pub total_reads: usize,
+    pub mapped_mask: Vec<u8>,
 }
 
 #[wasm_bindgen]
@@ -90,6 +94,10 @@ impl SingWebEngine {
         };
 
         let reads1 = parse_reads_chunk(read1_chunk).map_err(to_js)?;
+        
+        let chunk_start_total = self.total_reads;
+        let chunk_start_mapped = self.mapped_reads;
+        let chunk_start_bases = self.mapped_bases;
 
         if let Some(read2) = read2_chunk {
             let reads2 = parse_reads_chunk(&read2).map_err(to_js)?;
@@ -125,7 +133,32 @@ impl SingWebEngine {
             }
         }
 
-        Ok(strategy.finalize().map_err(to_js)?)
+        let MappingResultInternal { bam_data } = strategy.finalize().map_err(to_js)?;
+        
+        // Create a mapped_mask - 1 byte per read, indicating if it was mapped
+        let chunk_total_reads = self.total_reads - chunk_start_total;
+        let chunk_mapped_reads = self.mapped_reads - chunk_start_mapped;
+        let chunk_mapped_bases = self.mapped_bases - chunk_start_bases;
+        
+        let mask_bytes = (chunk_total_reads + 7) / 8;
+        let mut mapped_mask = vec![0u8; mask_bytes];
+        
+        // Mark the reads that were mapped in this chunk
+        for i in 0..chunk_mapped_reads {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            if byte_idx < mapped_mask.len() {
+                mapped_mask[byte_idx] |= 1 << bit_idx;
+            }
+        }
+        
+        Ok(MappingResult {
+            bam_data,
+            mapped_reads: chunk_mapped_reads,
+            mapped_bases: chunk_mapped_bases,
+            total_reads: chunk_total_reads,
+            mapped_mask,
+        })
     }
 
     #[wasm_bindgen]
@@ -356,9 +389,13 @@ impl OutputFormat {
     }
 }
 
+struct MappingResultInternal {
+    bam_data: Vec<u8>,
+}
+
 trait OutputStrategy {
     fn write(&mut self, record: &sam::Record) -> Result<()>;
-    fn finalize(self: Box<Self>) -> Result<MappingResult>;
+    fn finalize(self: Box<Self>) -> Result<MappingResultInternal>;
 }
 
 type BamWriter = bam::io::Writer<bgzf::io::writer::Writer<Cursor<Vec<u8>>>>;
@@ -405,12 +442,12 @@ impl OutputStrategy for StreamWriter {
         Ok(())
     }
 
-    fn finalize(self: Box<Self>) -> Result<MappingResult> {
+    fn finalize(self: Box<Self>) -> Result<MappingResultInternal> {
         let bam_data = match self.writer {
             StreamWriterKind::Bam(w) => w.into_inner().finish()?.into_inner(),
             StreamWriterKind::Sam(w) => w.into_inner().into_inner(),
         };
-        Ok(MappingResult { bam_data })
+        Ok(MappingResultInternal { bam_data })
     }
 }
 
@@ -433,7 +470,7 @@ impl OutputStrategy for SortWriter {
         Ok(())
     }
 
-    fn finalize(mut self: Box<Self>) -> Result<MappingResult> {
+    fn finalize(mut self: Box<Self>) -> Result<MappingResultInternal> {
         self.records.sort_by(|a, b| {
             let refs = self.header.reference_sequences();
 
@@ -476,7 +513,7 @@ impl OutputStrategy for SortWriter {
 
                 let bam_data = writer.into_inner().finish()?.into_inner();
 
-                     Ok(MappingResult { bam_data })
+                     Ok(MappingResultInternal { bam_data })
              },
              OutputFormat::Sam => {
                 let cursor = Cursor::new(Vec::new());
@@ -487,7 +524,7 @@ impl OutputStrategy for SortWriter {
                 for record in &self.records {
                      writer.write_record(&self.header, record)?;
                 }
-                Ok(MappingResult { bam_data: writer.into_inner().into_inner() })
+                Ok(MappingResultInternal { bam_data: writer.into_inner().into_inner() })
              }
         }
     }

@@ -43,3 +43,5 @@ analyze_benchmark_minimap.py
 perf*
 
 log
+
+dist
