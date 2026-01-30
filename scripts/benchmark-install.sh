@@ -57,22 +57,30 @@ else
     echo "dwgsim already installed"
 fi
 
-echo "Installing Columba..."
-if ! command -v columba &> /dev/null; then
+echo "Installing minimap2..."
+if ! command -v minimap2 &> /dev/null; then
     cd /tmp
-    if [ ! -d "columba" ]; then
-        git clone https://github.com/biointec/columba.git
+    if [ ! -d "minimap2-2.30_x64-linux" ]; then
+        curl -L https://github.com/lh3/minimap2/releases/download/v2.30/minimap2-2.30_x64-linux.tar.bz2 | tar -jxvf -
     fi
-    cd columba
-    
-    bash build_script.sh Vanilla
-    
-    $SUDO cp build_Vanilla/columba /usr/local/bin/
-    $SUDO cp build_Vanilla/columba_build /usr/local/bin/
-    cd ..
-    echo "Columba installed successfully"
+    $SUDO cp /tmp/minimap2-2.30_x64-linux/minimap2 /usr/local/bin/
+    $SUDO chmod +x /usr/local/bin/minimap2
+    echo "minimap2 installed successfully"
 else
-    echo "Columba already installed"
+    echo "minimap2 already installed"
+fi
+
+echo "Installing bwa-mem2..."
+if ! command -v bwa-mem2 &> /dev/null || [ ! -f "/usr/local/bin/bwa-mem2.avx2" ]; then
+    cd /tmp
+    if [ ! -d "bwa-mem2-2.2.1_x64-linux" ]; then
+        curl -L https://github.com/bwa-mem2/bwa-mem2/releases/download/v2.2.1/bwa-mem2-2.2.1_x64-linux.tar.bz2 | tar jxf -
+    fi
+    $SUDO cp -f /tmp/bwa-mem2-2.2.1_x64-linux/bwa-mem2* /usr/local/bin/
+    $SUDO chmod +x /usr/local/bin/bwa-mem2*
+    echo "bwa-mem2 installed successfully"
+else
+    echo "bwa-mem2 already installed"
 fi
 
 echo ""
@@ -82,8 +90,5 @@ command -v samtools && samtools --version | head -n1
 command -v dwgsim && echo "dwgsim installed" || echo "dwgsim not found"
 command -v minimap2 && minimap2 --version
 command -v bwa-mem2 && bwa-mem2 version
-command -v columba && echo "Columba installed" || echo "Columba not found"
-command -v columba_build && echo "Columba_build installed" || echo "Columba_build not found"
-
 echo ""
 echo "All mapping tools are ready for benchmarking!"

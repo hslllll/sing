@@ -1,10 +1,6 @@
 #!/bin/bash
 set -e
 
-COLUMBA_PATH="/home/hyunsu.lim/programs/columba/build_Vanilla"
-export PATH=$PATH:/home/hyunsu/Code/columba/build_Vanilla/
-export PATH=$PATH:$COLUMBA_PATH
-
 MODE=$1
 if [ "$MODE" == "h" ]; then
     echo "Mode: Human Genome"
@@ -46,14 +42,11 @@ else
     exit 1
 fi
 
-# COVERAGE_LIST=(3 5 10)
-# MUT_RATES=(0.001 0.01)
-# THREADS=4
-COVERAGE_LIST=(3)
-MUT_RATES=(0.01)
-THREADS=48
+READS_N=100000
+MUT_RATES=(0.001 0.01)
+THREADS=4
 
-OUTPUT_CSV="benchmark_results_f1.${MODE}.csv"
+OUTPUT_CSV="benchmark_results_minimap_comparision.${MODE}.csv"
 
 check_tool() {
     if ! command -v $1 &> /dev/null; then
@@ -64,8 +57,6 @@ check_tool() {
 
 check_tool dwgsim
 check_tool minimap2
-check_tool bowtie2
-check_tool bwa-mem2
 check_tool samtools
 
 echo "=== Preparing Data & Indices ==="
@@ -83,16 +74,6 @@ if [ ! -f "$REF_DECOMP" ]; then
     cat <(pigz -p 8 -cd "$REF") > "$REF_DECOMP"
 fi
 
-if [ ! -f "$REF_DECOMP.0123" ]; then
-    echo "Indexing BWA-MEM2..."
-    bwa-mem2 index "$REF_DECOMP" > /dev/null 2>&1
-fi
-
-if [ ! -f "$REF_DECOMP.1.bt2" ]; then
-    echo "Indexing Bowtie2..."
-    bowtie2-build -t 8 "$REF_DECOMP" "$REF_DECOMP" > /dev/null 2>&1
-fi
-
 if [ ! -f "${INDEX_PREFIX}.idx" ]; then
     echo "Indexing Sing..."
     if command -v cargo &> /dev/null; then
@@ -101,7 +82,7 @@ if [ ! -f "${INDEX_PREFIX}.idx" ]; then
     ./target/release/sing build "$REF_DECOMP" "${INDEX_PREFIX}.idx"
 fi
 
-cat << 'EOF' > analyze_benchmark.py
+cat << 'EOF' > analyze_benchmark_minimap.py
 import sys
 import re
 import math
@@ -209,17 +190,13 @@ def main():
     exp_name = sys.argv[1]
     times = {
         'Minimap2': sys.argv[2],
-        'BWA-MEM2': sys.argv[3],
-        'Sing':     sys.argv[4],
-        'Bowtie2':  sys.argv[5]
+        'Sing':     sys.argv[3]
     }
-    mode = sys.argv[6]
+    mode = sys.argv[4]
 
     file_paths = {
         'Minimap2': f'minimap.{mode}.sam',
-        'BWA-MEM2': f'bwa.{mode}.sam',
         'Sing':     f'sing.{mode}.sam',
-        'Bowtie2':  f'bowtie2.{mode}.sam'
     }
 
     truth_dict, tool_results = load_sam_and_build_truth(file_paths)
@@ -228,7 +205,7 @@ def main():
     print(f"\n--- Summary: {exp_name} (Mode: {mode}) ---")
     print("Tool        | Time_ms  | Precision | Recall   | F1        | TP       | FP       | FN")
 
-    tools_ordered = ['Minimap2', 'BWA-MEM2', 'Sing', 'Bowtie2']
+    tools_ordered = ['Minimap2', 'Sing']
 
     for tool in tools_ordered:
         time_val = times.get(tool, "N/A")
@@ -253,11 +230,10 @@ if [ ! -f "$OUTPUT_CSV" ]; then
     echo "Exp_ID,Tool,Time_ms,TotalReads,TP,FP,FN,Precision,Recall,F1,Mode" > "$OUTPUT_CSV"
 fi
 
-for COVERAGE in "${COVERAGE_LIST[@]}"; do
-    for MUT_RATE in "${MUT_RATES[@]}"; do
-        EXP_ID="Cov_${COVERAGE}_Mut_${MUT_RATE}.${MODE}"
+for MUT_RATE in "${MUT_RATES[@]}"; do
+        EXP_ID="N_${READS_N}_Mut_${MUT_RATE}.${MODE}"
         echo "================================================="
-        echo "Running: $EXP_ID (Cov: $COVERAGE, Mut: $MUT_RATE)"
+        echo "Running: $EXP_ID (N: $READS_N, Mut: $MUT_RATE)"
         echo "================================================="
 
         R1="sim_${EXP_ID}.bwa.read1.fastq.gz"
@@ -282,7 +258,7 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
                 !skip { print }' "$REF_DECOMP" > "$FILTERED_REF"
                 echo "Filtered reference saved to $FILTERED_REF"
             fi
-            dwgsim -C "$COVERAGE" -1 150 -2 150 -R 0 -X 0 -r "$MUT_RATE" -y 0 -H "$FILTERED_REF" "sim_${EXP_ID}"
+            dwgsim -N "$READS_N" -1 150 -2 150 -R 0 -X 0 -r "$MUT_RATE" -y 0 -H "$FILTERED_REF" "sim_${EXP_ID}"
         fi
 
 
@@ -291,7 +267,6 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         if ./target/release/sing map -t "$THREADS" "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" > "sing.${MODE}.sam"; then
             END=$(date +%s%N)
             TIME_SING=$(( (END - START) / 1000000 ))
-            echo "$TIME_SING"
         else
             TIME_SING="N/A"
             echo "Sing Failed"
@@ -302,39 +277,15 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         if minimap2 -t "$THREADS" -ax sr "$REF_DECOMP" "$R1" "$R2" > "minimap.${MODE}.sam" 2>/dev/null; then
             END=$(date +%s%N)
             TIME_MM=$(( (END - START) / 1000000 ))
-            echo "$TIME_MM"
         else
             TIME_MM="N/A"
             echo "Minimap2 Failed"
         fi
 
-        echo "3. Running BWA-MEM2..."
-        START=$(date +%s%N)
-        if bwa-mem2 mem -t "$THREADS" "$REF_DECOMP" "$R1" "$R2" > "bwa.${MODE}.sam" 2>/dev/null; then
-            END=$(date +%s%N)
-            TIME_BWA=$(( (END - START) / 1000000 ))
-            echo "$TIME_BWA"
-        else
-            TIME_BWA="N/A"
-            echo "BWA Failed"
-        fi
+        python3 analyze_benchmark_minimap.py "$EXP_ID" "$TIME_MM" "$TIME_SING" "$MODE" 2> >(grep "^CSV:" | sed 's/^CSV://' >> "$OUTPUT_CSV")
 
-        echo "4. Running Bowtie2..."
-        START=$(date +%s%N)
-        if bowtie2 -p "$THREADS" -x "$REF_DECOMP" -1 "$R1" -2 "$R2" > "bowtie2.${MODE}.sam" 2>/dev/null; then
-            END=$(date +%s%N)
-            TIME_BT2=$(( (END - START) / 1000000 ))
-            echo "$TIME_BT2"
-        else
-            TIME_BT2="N/A"
-            echo "bowtie2: Failed"
-        fi
-
-        python3 analyze_benchmark.py "$EXP_ID" "$TIME_MM" "$TIME_BWA" "$TIME_SING" "$TIME_BT2" "$MODE" 2> >(grep "^CSV:" | sed 's/^CSV://' >> "$OUTPUT_CSV")
-
-        rm "minimap.${MODE}.sam" "bwa.${MODE}.sam" "bowtie2.${MODE}.sam"
+        rm "minimap.${MODE}.sam"
         echo ""
-    done
 done
 
 echo "Benchmark Complete. Results saved in $OUTPUT_CSV"

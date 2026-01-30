@@ -8,6 +8,9 @@ target
 
 Cargo.lock
 
+Brassica*
+Zea*
+
 *.sam
 *.bam
 *.svg
@@ -35,4 +38,8 @@ GRCh*
 *.tsv
 *vcf*
 
-*.py
+analyze_benchmark.py
+analyze_benchmark_minimap.py
+perf*
+
+log

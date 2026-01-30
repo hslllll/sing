@@ -4,11 +4,12 @@ eval "$(micromamba shell hook --shell=bash)"
 micromamba activate tools
 
 if [ -z "$1" ]; then
-    echo "Usage: ./gatk-sim.sh [y|a|m|h]"
+    echo "Usage: ./gatk-sim.sh [y|a|m|h|b]"
     echo "  y : Yeast"
     echo "  a : Arabidopsis"
     echo "  m : Maize"
     echo "  h : Human"
+    echo "  b : Brassica rapa"
     exit 1
 fi
 
@@ -40,6 +41,9 @@ case $MODE in
     h) SPECIES="human"; GENOME_SIZE=3.2e9
        REF_NAME="GRCh38_latest_genomic.fna"
        REF_URL="https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers/GRCh38_latest_genomic.fna.gz" ;;
+    b) SPECIES="brassica"; GENOME_SIZE=400000000
+       REF_NAME="Brassica_rapa.Brapa_1.0.dna.toplevel.fa"
+       REF_URL="https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/release-57/fasta/brassica_rapa/dna/Brassica_rapa.Brapa_1.0.dna.toplevel.fa.gz" ;;
     *) echo "Error: Unknown mode"; exit 1 ;;
 esac
 
@@ -48,7 +52,7 @@ SIM_PREFIX="$OUT_DIR/sim_reads"
 
 if [ ! -f "$REF" ]; then
     wget -O "${REF}.gz" "$REF_URL"
-    zcat "${REF}.gz" | sed 's/ .*//' > "$REF"
+    sed 's/ .*//' <(pigz -p 8 -cd "${REF}.gz") > "$REF"
     rm "${REF}.gz"
 fi
 
@@ -82,7 +86,7 @@ if [ ! -f "$OUT_DIR/index.sing" ]; then
 fi
 
 if [ ! -f "$OUT_DIR/sing.bam" ]; then
-    run_timed_cmd "sing" "./target/release/sing map -t $THREADS $OUT_DIR/index.sing -1 $R1 -2 $R2 > $OUT_DIR/sing.sam"
+    run_timed_cmd "sing" './target/release/sing map -t '"$THREADS"' '"$OUT_DIR"'/index.sing -1 '"$R1"' -2 '"$R2"' > '"$OUT_DIR"'/sing.sam'
     samtools sort -@ $THREADS -O BAM -o "$OUT_DIR/sing.bam" "$OUT_DIR/sing.sam"
     samtools index -@ $THREADS "$OUT_DIR/sing.bam"
 fi
@@ -95,7 +99,7 @@ if [ ! -f "${REF}.bwt.2bit.64" ]; then
 fi
 
 if [ ! -f "$OUT_DIR/bwa.bam" ]; then
-    run_timed_cmd "bwa" "bwa-mem2 mem -t $THREADS -R \"@RG\tID:bwa\tSM:${SPECIES}\tPL:ILLUMINA\" $REF $R1 $R2 > $OUT_DIR/bwa.sam"
+    run_timed_cmd "bwa" 'bwa-mem2 mem -t '"$THREADS"' -R "@RG\tID:bwa\tSM:'"${SPECIES}"'\tPL:ILLUMINA" '"$REF"' '"$R1"' '"$R2"' > '"$OUT_DIR"'/bwa.sam'
     samtools sort -@ $THREADS -O BAM -o "$OUT_DIR/bwa.bam" "$OUT_DIR/bwa.sam"
     samtools index -@ $THREADS "$OUT_DIR/bwa.bam"
 fi
@@ -104,7 +108,7 @@ SECONDS_MAP["bwa"]=$REAL_SEC
 MEM_MAP["bwa"]=$MAX_KB
 
 if [ ! -f "$OUT_DIR/mini.bam" ]; then
-    run_timed_cmd "mini" "minimap2 -t $THREADS -ax sr -R \"@RG\tID:mini\tSM:${SPECIES}\tPL:ILLUMINA\" $REF $R1 $R2 > $OUT_DIR/mini.sam"
+    run_timed_cmd "mini" 'minimap2 -t '"$THREADS"' -ax sr -R "@RG\tID:mini\tSM:'"${SPECIES}"'\tPL:ILLUMINA" '"$REF"' '"$R1"' '"$R2"' > '"$OUT_DIR"'/mini.sam'
     samtools sort -@ $THREADS -O BAM -o "$OUT_DIR/mini.bam" "$OUT_DIR/mini.sam"
     samtools index -@ $THREADS "$OUT_DIR/mini.bam"
 fi
@@ -158,9 +162,9 @@ for tool in "${TOOLS[@]}"; do
     
     bcftools isec -p "$EVAL_DIR" -Oz "$TRUTH_NORM" "$EVAL_DIR/tool.norm.vcf.gz" > /dev/null 2>&1
     
-    FN=$(zcat "$EVAL_DIR/0000.vcf.gz" | grep -v "^#" | wc -l)
-    FP=$(zcat "$EVAL_DIR/0001.vcf.gz" | grep -v "^#" | wc -l)
-    TP=$(zcat "$EVAL_DIR/0002.vcf.gz" | grep -v "^#" | wc -l)
+    FN=$(grep -v "^#" <(pigz -p 8 -cd "$EVAL_DIR/0000.vcf.gz") | wc -l)
+    FP=$(grep -v "^#" <(pigz -p 8 -cd "$EVAL_DIR/0001.vcf.gz") | wc -l)
+    TP=$(grep -v "^#" <(pigz -p 8 -cd "$EVAL_DIR/0002.vcf.gz") | wc -l)
     
     TP_MAP[$tool]=$TP
     FP_MAP[$tool]=$FP

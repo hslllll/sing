@@ -98,8 +98,10 @@ impl SingWebEngine {
             }
 
             for ((name1, seq1, qual1), (name2, seq2, qual2)) in reads1.into_iter().zip(reads2.into_iter()) {
-                let res1 = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
-                let res2 = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
+                let res1_candidates = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
+                let res2_candidates = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
+                let res1 = res1_candidates.first().cloned();
+                let res2 = res2_candidates.first().cloned();
 
                 self.total_reads += 2;
                 if res1.is_some() { self.mapped_reads += 1; self.mapped_bases += seq1.len(); }
@@ -113,7 +115,8 @@ impl SingWebEngine {
             }
         } else {
             for (name, seq, qual) in reads1 {
-                let res = align(&seq, idx, &mut self.state, &mut self.rev_buf);
+                let res_candidates = align(&seq, idx, &mut self.state, &mut self.rev_buf);
+                let res = res_candidates.first().cloned();
                 self.total_reads += 1;
                 if res.is_some() { self.mapped_reads += 1; self.mapped_bases += seq.len(); }
 
