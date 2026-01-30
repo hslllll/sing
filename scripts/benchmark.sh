@@ -266,14 +266,16 @@ for COVERAGE in "${COVERAGE_LIST[@]}"; do
         if [ -f "$R1" ] && [ -f "$R2" ]; then
             echo "Simulated reads exist. Skipping dwgsim."
         else
-            # Filter out ct, mt, and scaffold contigs
+            # Filter out ct, pt, mt, scaffold, contig contigs
             FILTERED_REF="${REF_DECOMP%.fa}.filtered.fa"
             if [ ! -f "$FILTERED_REF" ]; then
-                echo "Filtering reference genome (excluding ct/mt/scaffold contigs)..."
+                echo "Filtering reference genome (excluding ct/pt/mt/scaffold/contig contigs)..."
                 awk '/^>/ {
                     header = $0
                     lc = tolower(header)
-                    skip = (index(lc, "ct") > 0 || index(lc, "mt") > 0 || index(lc, "scaffold") > 0)
+                    skip = 0
+                    if (lc ~ /(^|[^a-z])(ct|pt|mt)([^a-z]|$)/) skip = 1
+                    if (lc ~ /scaffold/ || lc ~ /contig/) skip = 1
                     if (!skip) print header
                     next
                 }
