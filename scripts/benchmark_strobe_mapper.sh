@@ -30,20 +30,27 @@ elif [ "$MODE" == "m" ]; then
     REF_DECOMP="Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa"
     REF_URL="https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/fasta/zea_mays/dna/Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa.gz"
     INDEX_PREFIX="maize"
+elif [ "$MODE" == "b" ]; then
+    echo "Mode: Brassica rapa"
+    REF="Brassica_rapa.Brapa_1.0.dna.toplevel.fa.gz"
+    REF_DECOMP="Brassica_rapa.Brapa_1.0.dna.toplevel.fa"
+    REF_URL="https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/release-57/fasta/brassica_rapa/dna/Brassica_rapa.Brapa_1.0.dna.toplevel.fa.gz"
+    INDEX_PREFIX="brassica"
 else
-    echo "Usage: $0 [h|y|a|m]"
+    echo "Usage: $0 [h|y|a|m|b]"
     echo "  h: Human (GRCh38)"
     echo "  y: Yeast (Saccharomyces cerevisiae)"
     echo "  a: Arabidopsis thaliana (TAIR10)"
     echo "  m: Maize (Zea mays)"
+    echo "  b: Brassica rapa"
     exit 1
 fi
 
-COVERAGE_LIST=(1 5 10)
+READS_N=100000
 MUT_RATES=(0.001 0.01)
-THREADS=8
+THREADS=4
 
-OUTPUT_CSV="benchmark_results_custom.csv"
+OUTPUT_CSV="benchmark_results_custom.${MODE}.csv"
 
 check_tool() {
     if ! command -v $1 &> /dev/null; then
@@ -78,7 +85,7 @@ if [ ! -f "$REF" ]; then
 fi
 
 if [ ! -f "$REF_DECOMP" ]; then
-    gunzip -c "$REF" > "$REF_DECOMP"
+    cat <(pigz -p 8 -cd "$REF") > "$REF_DECOMP"
 fi
 
 echo "--- Indexing Phase ---"
@@ -178,18 +185,34 @@ echo "Experiment,Tool,Time_sec,Mem_kb,Precision,Recall,F1" > "$OUTPUT_CSV"
 echo "=== Starting Benchmarks ==="
 echo "Writing results to $OUTPUT_CSV"
 
-for COV in "${COVERAGE_LIST[@]}"; do
-    for MUT in "${MUT_RATES[@]}"; do
-        
-        EXP_ID="Cov_${COV}_Mut_${MUT}"
-        echo "------------------------------------------------"
-        echo "Generating Reads: Coverage=$COV, Mutation=$MUT"
-        
-        sim_prefix="sim_${EXP_ID}"
-        dwgsim -1 150 -2 150 -y 0 -r $MUT -C $COV "$REF_DECOMP" "$sim_prefix" > /dev/null 2>&1
-        
-        R1="${sim_prefix}.bwa.read1.fastq.gz"
-        R2="${sim_prefix}.bwa.read2.fastq.gz"
+for MUT in "${MUT_RATES[@]}"; do
+    EXP_ID="N_${READS_N}_Mut_${MUT}.${MODE}"
+    echo "================================================="
+    echo "Generating Reads: N=$READS_N, Mutation=$MUT"
+    echo "================================================="
+
+    sim_prefix="sim_${EXP_ID}"
+    R1="${sim_prefix}.bwa.read1.fastq.gz"
+    R2="${sim_prefix}.bwa.read2.fastq.gz"
+
+    if [ -f "$R1" ] && [ -f "$R2" ]; then
+        echo "Simulated reads exist. Skipping dwgsim."
+    else
+        FILTERED_REF="${REF_DECOMP%.fa}.filtered.fa"
+        if [ ! -f "$FILTERED_REF" ]; then
+            echo "Filtering reference genome (excluding ct/mt/scaffold contigs)..."
+            awk '/^>/ {
+                header = $0
+                lc = tolower(header)
+                skip = (index(lc, "ct") > 0 || index(lc, "mt") > 0 || index(lc, "scaffold") > 0)
+                if (!skip) print header
+                next
+            }
+            !skip { print }' "$REF_DECOMP" > "$FILTERED_REF"
+            echo "Filtered reference saved to $FILTERED_REF"
+        fi
+        dwgsim -N "$READS_N" -1 150 -2 150 -R 0 -X 0 -r "$MUT" -y 0 -H "$FILTERED_REF" "$sim_prefix"
+    fi
 
         
         measure() {
@@ -242,14 +265,13 @@ for COV in "${COVERAGE_LIST[@]}"; do
              echo "X-Mapper Failed"
         fi
         
-        python3 analyze_benchmark.py "$EXP_ID" \
-            "$TIME_SING" "$MEM_SING" \
-            "$TIME_STROBE" "$MEM_STROBE" \
-            "$TIME_MAP" "$MEM_MAP" >> "$OUTPUT_CSV"
+    python3 analyze_benchmark.py "$EXP_ID" \
+        "$TIME_SING" "$MEM_SING" \
+        "$TIME_STROBE" "$MEM_STROBE" \
+        "$TIME_MAP" "$MEM_MAP" >> "$OUTPUT_CSV"
 
-        rm sing.sam strobealign.sam mapper.sam sing.log strobe.log mapper.log
-        rm "${sim_prefix}"*
-    done
+    rm sing.sam strobealign.sam mapper.sam sing.log strobe.log mapper.log
+    rm "${sim_prefix}"*
 done
 
 echo "Done. Results saved in $OUTPUT_CSV"
