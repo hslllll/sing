@@ -3,7 +3,6 @@ set -e
 
 SING_BIN="./target/release/sing"
 STROBEALIGN_BIN="strobealign"
-MAPPER_BIN="x-mapper" 
 
 MODE=$1
 if [ "$MODE" == "h" ]; then
@@ -72,9 +71,6 @@ fi
 
 if ! command -v $STROBEALIGN_BIN &> /dev/null; then
     echo "Warning: strobealign not in PATH. Assuming ./strobealign or failing."
-fi
-if ! command -v $MAPPER_BIN &> /dev/null; then
-    echo "Warning: X-mapper ('mapper') not in PATH. Assuming ./mapper or failing."
 fi
 
 echo "=== Preparing Data & Indices ==="
@@ -162,7 +158,6 @@ def main():
     tools = [
         ("Sing",        sys.argv[2], sys.argv[3], "sing.sam"),
         ("Strobealign", sys.argv[4], sys.argv[5], "strobealign.sam"),
-        ("X-mapper",    sys.argv[6], sys.argv[7], "mapper.sam"),
     ]
 
     
@@ -214,64 +209,46 @@ for MUT in "${MUT_RATES[@]}"; do
         dwgsim -N "$READS_N" -1 150 -2 150 -R 0 -X 0 -r "$MUT" -y 0 -H "$FILTERED_REF" "$sim_prefix"
     fi
 
-        
-        measure() {
-            local LOG=$1
-            shift
-            
-            /usr/bin/time -f "%e %M" -o "$LOG" "$@"
-            
-            if [ $? -eq 0 ]; then
-                read T M < "$LOG"
-                RET_TIME=$T
-                RET_MEM=$M
-            else
-                RET_TIME="N/A"
-                RET_MEM="N/A"
-            fi
-        }
-
-        echo "Running Sing..."
-        if measure "sing.log" $SING_BIN map -t $THREADS "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" -o sing.sam; then
-            TIME_SING=$RET_TIME
-            MEM_SING=$RET_MEM
+    measure() {
+        local LOG=$1
+        shift
+        /usr/bin/time -f "%e %M" -o "$LOG" "$@"
+        if [ $? -eq 0 ]; then
+            read T M < "$LOG"
+            RET_TIME=$T
+            RET_MEM=$M
         else
-            TIME_SING="N/A"
-            MEM_SING="N/A"
-            echo "Sing Failed"
+            RET_TIME="N/A"
+            RET_MEM="N/A"
         fi
+    }
 
-        echo "Running Strobealign..."
-        CMD="$STROBEALIGN_BIN -t $THREADS $REF_DECOMP $R1 $R2 > strobealign.sam"
-        if /usr/bin/time -f "%e %M" -o strobe.log bash -c "$CMD"; then
-             read T M < strobe.log
-             TIME_STROBE=$T
-             MEM_STROBE=$M
-        else
-             TIME_STROBE="N/A"
-             MEM_STROBE="N/A"
-             echo "Strobealign Failed"
-        fi
+    echo "Running Sing..."
+    if measure "sing.log" $SING_BIN map -t $THREADS "${INDEX_PREFIX}.idx" -1 "$R1" -2 "$R2" -o sing.sam; then
+        TIME_SING=$RET_TIME
+        MEM_SING=$RET_MEM
+    else
+        TIME_SING="N/A"
+        MEM_SING="N/A"
+        echo "Sing Failed"
+    fi
 
-        echo "Running X-mapper..."
-        CMD="$MAPPER_BIN --reference $REF_DECOMP --queries $R1 --queries $R2 --num-threads $THREADS --out-sam mapper.sam"
-        if /usr/bin/time -f "%e %M" -o mapper.log bash -c "$CMD"; then
-             read T M < mapper.log
-             TIME_MAP=$T
-             MEM_MAP=$M
-        else
-             TIME_MAP="N/A"
-             MEM_MAP="N/A"
-             echo "X-Mapper Failed"
-        fi
-        
+    echo "Running Strobealign..."
+    CMD="$STROBEALIGN_BIN -t $THREADS $REF_DECOMP $R1 $R2 > strobealign.sam"
+    if /usr/bin/time -f "%e %M" -o strobe.log bash -c "$CMD"; then
+         read T M < strobe.log
+         TIME_STROBE=$T
+         MEM_STROBE=$M
+    else
+         TIME_STROBE="N/A"
+         MEM_STROBE="N/A"
+         echo "Strobealign Failed"
+    fi
+    
     python3 analyze_benchmark.py "$EXP_ID" \
         "$TIME_SING" "$MEM_SING" \
-        "$TIME_STROBE" "$MEM_STROBE" \
-        "$TIME_MAP" "$MEM_MAP" >> "$OUTPUT_CSV"
+        "$TIME_STROBE" "$MEM_STROBE" >> "$OUTPUT_CSV"
 
-    rm sing.sam strobealign.sam mapper.sam sing.log strobe.log mapper.log
+    rm sing.sam strobealign.sam sing.log strobe.log
     rm "${sim_prefix}"*
 done
-
-echo "Done. Results saved in $OUTPUT_CSV"
