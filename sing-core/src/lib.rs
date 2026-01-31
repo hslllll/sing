@@ -881,6 +881,15 @@ fn voted_anchor_for_group(group: &[Hit]) -> (i32, u32) {
     let (_, median, _) = target_positions.select_nth_unstable(mid);
     let median_pos = *median;
 
+    if tied_offsets.len() == 1 {
+        if let Some(hit) = group
+            .iter()
+            .find(|h| h.diag == tied_offsets[0] && h.ref_pos == median_pos)
+        {
+            return (hit.diag, hit.read_pos);
+        }
+    }
+
     group
         .iter()
         .filter(|h| tied_offsets.iter().any(|&d| d == h.diag))
