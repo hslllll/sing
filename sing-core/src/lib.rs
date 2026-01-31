@@ -25,15 +25,15 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
-    minimizer_window: 20,
-    hash_window: 18,
-    sync_s: 16,
+    minimizer_window: 19,
+    hash_window: 16,
+    sync_s: 14,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    max_hits: 4000,
+    max_hits: 8000,
     pair_max_dist: 1000,
     maxindel: 15,
     min_identity: 0.85,
