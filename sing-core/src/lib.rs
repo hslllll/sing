@@ -33,7 +33,7 @@ pub static CONFIG: Config = Config {
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    max_hits: 100,
+    max_hits: 4000,
     pair_max_dist: 1000,
     maxindel: 15,
     min_identity: 0.85,
