@@ -783,41 +783,34 @@ fn collect_candidates<I: IndexLike>(
         
         
         let pos = bucket_seeds.partition_point(|&s| (s >> 48) < target_hash);
-        
+
         if pos >= bucket_seeds.len() {
             continue;
         }
-        
-        let mut count = 0;
-        let mut idx_in_bucket = pos;
-        
-        while idx_in_bucket < bucket_seeds.len() {
-            let seed = bucket_seeds[idx_in_bucket];
-            let seed_hash = seed >> 48;
-            
-            if seed_hash != target_hash {
-                break;
-            }
 
-            if count >= max_hits {
-                capped = true;
-                break;
-            }
-            
+        let mut end = pos;
+        while end < bucket_seeds.len() && (bucket_seeds[end] >> 48) == target_hash {
+            end += 1;
+        }
+
+        let count = end - pos;
+        if count > max_hits {
+            capped = true;
+            continue;
+        }
+
+        for &seed in &bucket_seeds[pos..end] {
             let ref_id = ((seed >> 32) & 0xFFFF) as u32;
             let ref_pos = (seed & 0xFFFFFFFF) as u32;
             let id_strand = (ref_id << 1) | (if is_rev { 1 } else { 0 });
             let diag = (ref_pos as i32).wrapping_sub(r_pos as i32);
-            
+
             out.push(Hit {
                 id_strand,
                 diag,
                 read_pos: r_pos,
                 ref_pos,
             });
-            
-            count += 1;
-            idx_in_bucket += 1;
         }
     }
     
