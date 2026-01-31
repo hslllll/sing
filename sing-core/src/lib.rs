@@ -486,45 +486,41 @@ where
     eprintln!("Building sort-based index: {} bp, max_hits={}", total_bases, max_hits);
 
     
-    let mut all_seeds: Vec<(u32, u32, u32)> = Vec::new(); 
-    let mut mins = Vec::new();
-    
+    let mut mins = Vec::with_capacity(1024);
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+
+    for seq in ref_seqs.iter() {
+        get_syncmers(seq, &mut mins);
+        for &(h, _p, _is_rev) in mins.iter() {
+            let entry = counts.entry(h).or_insert(0);
+            if *entry <= max_hits as u32 {
+                *entry += 1;
+            }
+        }
+    }
+
+    eprintln!("  Counted {} unique seeds", counts.len());
+
+    let mut kept_seeds = Vec::new();
+    let mut kept = 0usize;
+    let mut filtered = 0usize;
+
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p, _is_rev) in mins.iter() {
-            all_seeds.push((h, rid as u32, p));
+            match counts.get(&h) {
+                Some(&c) if c <= max_hits as u32 => {
+                    kept_seeds.push((h, rid as u32, p));
+                    kept += 1;
+                }
+                Some(_) => {
+                    filtered += 1;
+                }
+                None => {}
+            }
         }
     }
-    
-    eprintln!("  Collected {} raw seeds", all_seeds.len());
 
-    
-    all_seeds.sort_unstable_by_key(|k| k.0);
-    eprintln!("  Sorted seeds");
-
-    
-    let mut kept_seeds = Vec::new();
-    let mut i = 0;
-    let mut kept = 0usize;
-    let mut filtered = 0usize;
-    
-    while i < all_seeds.len() {
-        let hash = all_seeds[i].0;
-        let mut j = i;
-        while j < all_seeds.len() && all_seeds[j].0 == hash {
-            j += 1;
-        }
-        
-        let freq = j - i;
-        if freq <= max_hits {
-            kept_seeds.extend_from_slice(&all_seeds[i..j]);
-            kept += freq;
-        } else {
-            filtered += freq;
-        }
-        i = j;
-    }
-    
     eprintln!("  Kept {} seeds, filtered {} seeds", kept, filtered);
 
     
