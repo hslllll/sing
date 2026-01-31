@@ -22,7 +22,6 @@ pub struct Config {
     pub min_identity: f32,
     pub pair_max_dist: i32,
     pub diag_band: i32,
-    pub cluster_window: usize,
 }
 
 pub static CONFIG: Config = Config {
@@ -39,7 +38,6 @@ pub static CONFIG: Config = Config {
     maxindel: 15,
     min_identity: 0.85,
     diag_band: 15,
-    cluster_window: 4,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -816,32 +814,62 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
 }
 
 #[inline(always)]
-fn find_densest_cluster(hits: &[Hit], band: i32, window: usize) -> (usize, usize, i32) {
+fn find_densest_cluster(hits: &[Hit], _band: i32, _window: usize) -> (usize, usize, i32) {
     if hits.is_empty() {
         return (0, 0, 0);
     }
+    
     let mut best_start = 0usize;
     let mut best_end = 0usize;
     let mut best_count = 0usize;
     let mut best_id_strand = hits[0].id_strand;
+    let mut best_offset = 0i32;
+    
+    // Group by id_strand first
     let mut j = 0usize;
     for i in 0..hits.len() {
-        while j < hits.len()
-            && hits[j].id_strand == hits[i].id_strand
-            && (hits[j].diag - hits[i].diag) < band
-        {
+        while j < hits.len() && hits[j].id_strand == hits[i].id_strand {
             j += 1;
         }
-        let cnt = j - i;
-        if cnt > best_count || (cnt == best_count && hits[i].id_strand != best_id_strand && cnt >= window) {
-            best_count = cnt;
-            best_start = i;
-            best_end = j;
-            best_id_strand = hits[i].id_strand;
+        
+        let group = &hits[i..j];
+        let cnt = group.len();
+        
+        if cnt >= best_count {
+            // Use offset voting to find the best seed
+            let mut offset_votes = std::collections::HashMap::new();
+            for hit in group {
+                let offset = hit.ref_pos as i32 - hit.read_pos as i32;
+                *offset_votes.entry(offset).or_insert(0usize) += 1;
+            }
+            
+            let (voted_offset, _vote_count) = offset_votes
+                .iter()
+                .max_by_key(|&(_, count)| count)
+                .unwrap_or((&0, &0));
+            
+            if cnt > best_count || (cnt == best_count && hits[i].id_strand != best_id_strand) {
+                best_count = cnt;
+                best_start = i;
+                best_end = j;
+                best_id_strand = hits[i].id_strand;
+                best_offset = *voted_offset;
+            }
         }
     }
-    let median_idx = best_start + best_count / 2;
-    (best_start, best_end, hits.get(median_idx).map_or(0, |h| h.diag))
+    
+    // Find diag corresponding to the voted offset
+    let target_diag = if best_end > best_start {
+        let group = &hits[best_start..best_end];
+        group.iter()
+            .find(|h| (h.ref_pos as i32 - h.read_pos as i32) == best_offset)
+            .map(|h| h.diag)
+            .unwrap_or(hits.get(best_start + best_count / 2).map_or(0, |h| h.diag))
+    } else {
+        0
+    };
+    
+    (best_start, best_end, target_diag)
 }
 
 const CASE_MASK: u64 = 0x2020202020202020;
@@ -1235,7 +1263,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         other => other,
     });
     let total_seeds = candidates.len();
-    let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, cfg.cluster_window);
+    let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, 0);
     let c1_count = c1_end - c1_start;
     
     if c1_count < 3 {
@@ -1250,8 +1278,8 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         return Vec::new();
     }
 
-    let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, cfg.cluster_window);
-    let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, cfg.cluster_window);
+    let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, 0);
+    let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, 0);
     let pre_count = pre_end.saturating_sub(pre_start);
     let post_count = post_end.saturating_sub(post_start);
     
