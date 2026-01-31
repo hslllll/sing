@@ -83,7 +83,7 @@ const REMOVE_S: [u64; 4] = [
     rot(BASES[3], (SYNC_S as u32 * ROT) % 64),
 ];
 
-pub const RADIX: usize = 28;
+pub const RADIX: usize = 24;
 pub const SHIFT: usize = 32 - RADIX;
 
 #[derive(Debug, Clone)]
@@ -491,32 +491,38 @@ where
     let mut ref_seqs = Vec::new();
     let mut ref_names = Vec::new();
 
-    let mut total_bases: u64 = 0;
+    for (_rid, (name, seq)) in records.into_iter().enumerate() {
+        ref_names.push(name.into());
+        ref_seqs.push(seq);
+    }
+
+    let total_bases: u64 = ref_seqs.iter().map(|s| s.len() as u64).sum();
     let max_hits = CONFIG.max_hits;
+    
+    eprintln!("Building sort-based index: {} bp, max_hits={}", total_bases, max_hits);
+
+    
     let mut mins = Vec::with_capacity(1024);
     let mut counts: HashMap<u32, u16> = HashMap::new();
 
-    eprintln!("Building streaming index: max_hits={}", max_hits);
-
-    for (name, seq) in records.into_iter() {
-        ref_names.push(name.into());
-        total_bases += seq.len() as u64;
-        get_syncmers(&seq, &mut mins);
+    for seq in ref_seqs.iter() {
+        get_syncmers(seq, &mut mins);
         for &(h, _p, _is_rev) in mins.iter() {
             let entry = counts.entry(h).or_insert(0);
             if *entry < u16::MAX {
                 *entry += 1;
             }
         }
-        ref_seqs.push(seq);
     }
 
-    eprintln!("  Loaded {} bp across {} references", total_bases, ref_seqs.len());
-
     let mut singleton_hits = 0usize;
-
+    let mut kept_hits_est = 0usize;
+    
     counts.retain(|_, val| {
         let c = *val as usize;
+        if c <= max_hits {
+             kept_hits_est += c;
+        }
         if c == 1 {
             singleton_hits += 1;
             false
@@ -524,26 +530,25 @@ where
             true
         }
     });
+    kept_hits_est += singleton_hits;
 
     eprintln!("  Counted {} unique seeds ({} singletons pruned)", counts.len() + singleton_hits, singleton_hits);
 
-    let mut bucket_counts = vec![0u32; 1 << RADIX];
+    let mut kept_seeds = Vec::with_capacity(kept_hits_est);
     let mut kept = 0usize;
     let mut filtered = 0usize;
 
-    for seq in ref_seqs.iter() {
+    for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
-        for &(h, _p, _is_rev) in mins.iter() {
+        for &(h, p, _is_rev) in mins.iter() {
             let keep = match counts.get(&h) {
                 Some(&c) => c as usize <= max_hits,
-                None => true,
+                None => true, // Singleton (pruned from map) -> keep
             };
+
             if keep {
-                let bucket = (h >> SHIFT) as usize;
-                if bucket < bucket_counts.len() {
-                    bucket_counts[bucket] += 1;
-                    kept += 1;
-                }
+                kept_seeds.push((h, rid as u32, p));
+                kept += 1;
             } else {
                 filtered += 1;
             }
@@ -551,44 +556,40 @@ where
     }
 
     eprintln!("  Kept {} seeds, filtered {} seeds", kept, filtered);
+    drop(counts); // Release memory for the hash map immediately
 
+
+    
     let mut offsets = vec![0u32; 1 << RADIX];
-    let mut running = 0u32;
-    for i in 0..offsets.len() {
-        offsets[i] = running;
-        running = running.saturating_add(bucket_counts[i]);
-    }
-
-    let mut final_seeds = vec![0u64; running as usize];
-    let mut write_offsets = offsets.clone();
-
-    for (rid, seq) in ref_seqs.iter().enumerate() {
-        get_syncmers(seq, &mut mins);
-        for &(h, p, _is_rev) in mins.iter() {
-            let keep = match counts.get(&h) {
-                Some(&c) => c as usize <= max_hits,
-                None => true,
-            };
-            if !keep {
-                continue;
-            }
-            let bucket = (h >> SHIFT) as usize;
-            if bucket >= write_offsets.len() {
-                continue;
-            }
-            let idx = write_offsets[bucket] as usize;
-            if idx >= final_seeds.len() {
-                continue;
-            }
-            let hash16 = (h & 0xFFFF) as u64;
-            let seed = (hash16 << 48) | ((rid as u64) << 32) | (p as u64);
-            final_seeds[idx] = seed;
-            write_offsets[bucket] += 1;
+    let mut final_seeds = Vec::with_capacity(kept_seeds.len());
+    
+    
+    kept_seeds.sort_unstable_by_key(|k| k.0 >> SHIFT);
+    
+    let mut write_offset = 0u32;
+    let mut last_bucket = 0usize;
+    
+    for &(h, rid, pos) in &kept_seeds {
+        let bucket = (h >> SHIFT) as usize;
+        
+        
+        while last_bucket <= bucket {
+            offsets[last_bucket] = write_offset;
+            last_bucket += 1;
         }
+        
+        let hash16 = (h & 0xFFFF) as u64;
+        let seed = (hash16 << 48) | ((rid as u64) << 32) | (pos as u64);
+        final_seeds.push(seed);
+        write_offset += 1;
     }
-
-    drop(counts);
-
+    
+    
+    while last_bucket < offsets.len() {
+        offsets[last_bucket] = write_offset;
+        last_bucket += 1;
+    }
+    
     eprintln!("  Index built: {} seeds", final_seeds.len());
 
     Ok(Index {
@@ -799,31 +800,44 @@ fn collect_candidates<I: IndexLike>(
         
         let target_hash = (h & 0xFFFF) as u64;
         let bucket_seeds = &seeds[start..end];
-
+        
+        
+        let pos = bucket_seeds.partition_point(|&s| (s >> 48) < target_hash);
+        
+        if pos >= bucket_seeds.len() {
+            continue;
+        }
+        
         let mut count = 0;
-        for &seed in bucket_seeds {
+        let mut idx_in_bucket = pos;
+        
+        while idx_in_bucket < bucket_seeds.len() {
+            let seed = bucket_seeds[idx_in_bucket];
             let seed_hash = seed >> 48;
+            
             if seed_hash != target_hash {
-                continue;
+                break;
             }
+
             if count >= max_hits {
                 capped = true;
                 break;
             }
-
+            
             let ref_id = ((seed >> 32) & 0xFFFF) as u32;
             let ref_pos = (seed & 0xFFFFFFFF) as u32;
             let id_strand = (ref_id << 1) | (if is_rev { 1 } else { 0 });
             let diag = (ref_pos as i32).wrapping_sub(r_pos as i32);
-
+            
             out.push(Hit {
                 id_strand,
                 diag,
                 read_pos: r_pos,
                 ref_pos,
             });
-
+            
             count += 1;
+            idx_in_bucket += 1;
         }
     }
     
