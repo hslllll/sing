@@ -83,7 +83,7 @@ const REMOVE_S: [u64; 4] = [
     rot(BASES[3], (SYNC_S as u32 * ROT) % 64),
 ];
 
-pub const RADIX: usize = 24;
+pub const RADIX: usize = 26;
 pub const SHIFT: usize = 32 - RADIX;
 
 #[derive(Debug, Clone)]
@@ -503,41 +503,61 @@ where
 
     
     let mut mins = Vec::with_capacity(1024);
-    let mut counts: HashMap<u32, u32> = HashMap::new();
+    let mut counts: HashMap<u32, u16> = HashMap::new();
 
     for seq in ref_seqs.iter() {
         get_syncmers(seq, &mut mins);
         for &(h, _p, _is_rev) in mins.iter() {
             let entry = counts.entry(h).or_insert(0);
-            if *entry <= max_hits as u32 {
+            if *entry < u16::MAX {
                 *entry += 1;
             }
         }
     }
 
-    eprintln!("  Counted {} unique seeds", counts.len());
+    let mut singleton_hits = 0usize;
+    let mut kept_hits_est = 0usize;
+    
+    counts.retain(|_, val| {
+        let c = *val as usize;
+        if c <= max_hits {
+             kept_hits_est += c;
+        }
+        if c == 1 {
+            singleton_hits += 1;
+            false
+        } else {
+            true
+        }
+    });
+    kept_hits_est += singleton_hits;
 
-    let mut kept_seeds = Vec::new();
+    eprintln!("  Counted {} unique seeds ({} singletons pruned)", counts.len() + singleton_hits, singleton_hits);
+
+    let mut kept_seeds = Vec::with_capacity(kept_hits_est);
     let mut kept = 0usize;
     let mut filtered = 0usize;
 
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p, _is_rev) in mins.iter() {
-            match counts.get(&h) {
-                Some(&c) if c <= max_hits as u32 => {
-                    kept_seeds.push((h, rid as u32, p));
-                    kept += 1;
-                }
-                Some(_) => {
-                    filtered += 1;
-                }
-                None => {}
+            let keep = match counts.get(&h) {
+                Some(&c) => c as usize <= max_hits,
+                None => true, // Singleton (pruned from map) -> keep
+            };
+
+            if keep {
+                kept_seeds.push((h, rid as u32, p));
+                kept += 1;
+            } else {
+                filtered += 1;
             }
         }
     }
 
     eprintln!("  Kept {} seeds, filtered {} seeds", kept, filtered);
+    drop(counts); // Release memory for the hash map immediately
+
 
     
     let mut offsets = vec![0u32; 1 << RADIX];
