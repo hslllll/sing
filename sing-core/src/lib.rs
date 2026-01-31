@@ -28,13 +28,13 @@ pub static CONFIG: Config = Config {
     minimizer_window: 19,
     hash_window: 16,
     sync_s: 14,
-    voting_window: 5,
+    voting_window: 15,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    max_hits: 1000,
+    max_hits: 100,
     pair_max_dist: 1000,
     maxindel: 15,
     min_identity: 0.85,
@@ -877,8 +877,9 @@ fn voted_anchor_for_group(group: &[Hit]) -> (i32, u32) {
             .map_or((0, 0), |h| (h.diag, h.read_pos));
     }
 
-    target_positions.sort_unstable();
-    let median_pos = target_positions[target_positions.len() / 2];
+    let mid = target_positions.len() / 2;
+    let (_, median, _) = target_positions.select_nth_unstable(mid);
+    let median_pos = *median;
 
     group
         .iter()
