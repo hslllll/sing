@@ -12,6 +12,7 @@ pub struct Config {
     pub hash_window: usize,
     pub minimizer_window: usize,
     pub sync_s: usize,
+    pub voting_window: i32,
     pub match_score: i32,
     pub mismatch_pen: i32,
     pub gap_open: i32,
@@ -21,13 +22,13 @@ pub struct Config {
     pub maxindel: usize,
     pub min_identity: f32,
     pub pair_max_dist: i32,
-    pub diag_band: i32,
 }
 
 pub static CONFIG: Config = Config {
     hash_window: 16,
     minimizer_window: 21,
     sync_s: 15,
+    voting_window: 10,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
@@ -37,7 +38,6 @@ pub static CONFIG: Config = Config {
     pair_max_dist: 1000,
     maxindel: 15,
     min_identity: 0.85,
-    diag_band: 15,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -817,15 +817,14 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
 }
 
 #[inline(always)]
-fn voted_diag_for_group(group: &[Hit]) -> i32 {
+fn voted_anchor_for_group(group: &[Hit]) -> (i32, u32) {
     if group.is_empty() {
-        return 0;
+        return (0, 0);
     }
 
     let mut offset_votes = std::collections::HashMap::new();
     for hit in group {
-        let offset = hit.ref_pos as i32 - hit.read_pos as i32;
-        *offset_votes.entry(offset).or_insert(0usize) += 1;
+        *offset_votes.entry(hit.diag).or_insert(0usize) += 1;
     }
 
     let max_votes = offset_votes.values().copied().max().unwrap_or(0);
@@ -839,12 +838,14 @@ fn voted_diag_for_group(group: &[Hit]) -> i32 {
     let tied_set: std::collections::HashSet<i32> = tied_offsets.into_iter().collect();
     let mut target_positions: Vec<u32> = group
         .iter()
-        .filter(|h| tied_set.contains(&(h.ref_pos as i32 - h.read_pos as i32)))
+        .filter(|h| tied_set.contains(&h.diag))
         .map(|h| h.ref_pos)
         .collect();
 
     if target_positions.is_empty() {
-        return group.get(group.len() / 2).map_or(0, |h| h.diag);
+        return group
+            .get(group.len() / 2)
+            .map_or((0, 0), |h| (h.diag, h.read_pos));
     }
 
     target_positions.sort_unstable();
@@ -852,7 +853,7 @@ fn voted_diag_for_group(group: &[Hit]) -> i32 {
 
     group
         .iter()
-        .filter(|h| tied_set.contains(&(h.ref_pos as i32 - h.read_pos as i32)))
+        .filter(|h| tied_set.contains(&h.diag))
         .min_by_key(|h| {
             let dist = if h.ref_pos >= median_pos {
                 h.ref_pos - median_pos
@@ -861,8 +862,35 @@ fn voted_diag_for_group(group: &[Hit]) -> i32 {
             };
             dist
         })
-        .map(|h| h.diag)
-        .unwrap_or(group.get(group.len() / 2).map_or(0, |h| h.diag))
+        .map(|h| (h.diag, h.read_pos))
+        .unwrap_or(group.get(group.len() / 2).map_or((0, 0), |h| (h.diag, h.read_pos)))
+}
+
+#[inline(always)]
+fn densest_window_range(group: &[Hit], window: i32) -> (usize, usize) {
+    if group.is_empty() {
+        return (0, 0);
+    }
+
+    let band = window.max(0);
+    let mut best_start = 0usize;
+    let mut best_end = 1usize;
+    let mut j = 0usize;
+
+    for i in 0..group.len() {
+        if j < i {
+            j = i;
+        }
+        while j < group.len() && (group[j].diag - group[i].diag) <= band {
+            j += 1;
+        }
+        if j - i > best_end - best_start {
+            best_start = i;
+            best_end = j;
+        }
+    }
+
+    (best_start, best_end)
 }
 
 const CASE_MASK: u64 = 0x2020202020202020;
@@ -1145,16 +1173,14 @@ fn extend_right(
 
 #[inline(always)]
 fn greedy_extend(
-    hits: &[Hit],
+    anchor_read_pos: usize,
     anchor_diag: i32,
     read: &[u8],
     rseq: &[u8],
     cfg: &Config,
 ) -> (Vec<u32>, i32, i32, usize, usize) {
     let rlen = read.len();
-    let anchor_idx = hits.len() / 2;
-    let anchor = &hits[anchor_idx.min(hits.len().saturating_sub(1))];
-    let a_rp = anchor.read_pos as usize;
+    let a_rp = anchor_read_pos;
     let mut a_gp = if anchor_diag >= 0 {
         anchor_diag as usize + a_rp
     } else {
@@ -1233,7 +1259,16 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let mut capped = false;
     let mut second_failed = false;
 
-    get_syncmers(seq, mins);
+    let mut tmp_mins: Vec<(u32, u32, bool)> = Vec::with_capacity(mins.capacity());
+
+    get_syncmers(seq, &mut tmp_mins);
+    mins.clear();
+    mins.extend(tmp_mins.iter().map(|&(h, p, _)| (h, p, false)));
+
+    let rev_seq = reverse_complement(seq);
+    tmp_mins.clear();
+    get_syncmers(&rev_seq, &mut tmp_mins);
+    mins.extend(tmp_mins.iter().map(|&(h, p, _)| (h, p, true)));
     
     capped |= collect_candidates(idx, mins, max_hits, candidates);
     
@@ -1256,13 +1291,21 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         }
     }
 
+    let mut window_ranges = vec![(0usize, 0usize); groups.len()];
+    for (id, group) in groups.iter().enumerate() {
+        if !group.is_empty() {
+            window_ranges[id] = densest_window_range(group, cfg.voting_window);
+        }
+    }
+
     let mut best_id: Option<usize> = None;
     let mut best_count = 0usize;
     for (id, group) in groups.iter().enumerate() {
-        let cnt = group.len();
-        if cnt == 0 {
+        if group.is_empty() {
             continue;
         }
+        let (s, e) = window_ranges[id];
+        let cnt = e.saturating_sub(s);
         if cnt > best_count || (cnt == best_count && best_id.map_or(true, |bid| id > bid)) {
             best_id = Some(id);
             best_count = cnt;
@@ -1278,8 +1321,9 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         return Vec::new();
     }
 
-    let best_hits = &groups[best_id];
-    let anchor_diag = voted_diag_for_group(best_hits);
+    let (best_start, best_end) = window_ranges[best_id];
+    let best_hits = &groups[best_id][best_start..best_end];
+    let (anchor_diag, anchor_read_pos) = voted_anchor_for_group(best_hits);
 
     if !span_check(best_hits, cfg) {
         return Vec::new();
@@ -1292,25 +1336,26 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let mut second_id: Option<usize> = None;
     let mut second_count = 0usize;
     for (id, group) in groups.iter().enumerate() {
-        if id == best_id {
+        if id == best_id || group.is_empty() {
             continue;
         }
-        let cnt = group.len();
-        if cnt == 0 {
-            continue;
-        }
+        let (s, e) = window_ranges[id];
+        let cnt = e.saturating_sub(s);
         if cnt > second_count || (cnt == second_count && second_id.map_or(true, |sid| id > sid)) {
             second_id = Some(id);
             second_count = cnt;
         }
     }
 
-    let second_hits = second_id.map(|id| &groups[id]);
-    let second_diag = second_hits
-        .map(|group| voted_diag_for_group(group.as_slice()))
-        .unwrap_or(0);
+    let second_hits = second_id.map(|id| {
+        let (s, e) = window_ranges[id];
+        &groups[id][s..e]
+    });
+    let (second_diag, second_anchor_read_pos) = second_hits
+        .map(|group| voted_anchor_for_group(group))
+        .unwrap_or((0, 0));
 
-    let mut attempt = |hits: &[Hit], diag: i32| -> Option<(AlignmentResult, usize)> {
+    let mut attempt = |hits: &[Hit], diag: i32, anchor_rp: u32| -> Option<(AlignmentResult, usize)> {
         if hits.is_empty() {
             return None;
         }
@@ -1339,7 +1384,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         
         let ref_seq = idx.ref_seq(ref_id as usize);
         
-        let (cigar, pos, as_score, aligned_len, nm) = greedy_extend(hits, diag, target_seq, ref_seq, cfg);
+        let (cigar, pos, as_score, aligned_len, nm) = greedy_extend(anchor_rp as usize, diag, target_seq, ref_seq, cfg);
         
         if aligned_len == 0 || pos < 0 || (pos as usize) >= ref_seq.len() {
             return None;
@@ -1355,7 +1400,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let mut results = Vec::with_capacity(2);
 
     let mut other_count = second_count;
-    if let Some((mut res, primary_len)) = attempt(best_hits, anchor_diag) {
+    if let Some((mut res, primary_len)) = attempt(best_hits, anchor_diag, anchor_read_pos) {
         let mapq = {
             let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
             (frac * 60.0).round().min(60.0) as u8
@@ -1365,7 +1410,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     }
 
     if let Some(hits) = second_hits {
-        if let Some((mut res, primary_len)) = attempt(hits, second_diag) {
+        if let Some((mut res, primary_len)) = attempt(hits, second_diag, second_anchor_read_pos) {
             other_count = best_count;
             let mapq = {
                 let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
