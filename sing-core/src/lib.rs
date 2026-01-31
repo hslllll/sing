@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
 use memmap2::MmapOptions;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::ops::Range;
@@ -12,7 +13,6 @@ pub struct Config {
     pub minimizer_window: usize,
     pub hash_window: usize,
     pub sync_s: usize,
-    pub voting_window: i32,
     pub match_score: i32,
     pub mismatch_pen: i32,
     pub gap_open: i32,
@@ -28,7 +28,6 @@ pub static CONFIG: Config = Config {
     minimizer_window: 19,
     hash_window: 16,
     sync_s: 14,
-    voting_window: 15,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
@@ -682,7 +681,10 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
             s_queue.push((s_pos, canonical_hash));
         }
 
-        if i + 1 >= HASH_WINDOW && ambig_k == 0 {
+        if i + 1 >= HASH_WINDOW {
+            if ambig_k != 0 {
+                continue;
+            }
             let k_pos = (i + 1 - HASH_WINDOW) as u32;
 
             // Maintain s-mer minima within the current k-mer window.
@@ -839,97 +841,54 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
 }
 
 #[inline(always)]
-fn voted_anchor_for_group(group: &[Hit]) -> (i32, u32) {
+fn best_diag_for_group(group: &[Hit]) -> Option<(i32, usize)> {
     if group.is_empty() {
-        return (0, 0);
+        return None;
     }
-
-    let mut max_votes = 0usize;
-    let mut tied_offsets: Vec<i32> = Vec::new();
-    let mut i = 0usize;
-    while i < group.len() {
-        let diag = group[i].diag;
-        let mut j = i + 1;
-        while j < group.len() && group[j].diag == diag {
-            j += 1;
-        }
-        let count = j - i;
-        if count > max_votes {
-            max_votes = count;
-            tied_offsets.clear();
-            tied_offsets.push(diag);
-        } else if count == max_votes {
-            tied_offsets.push(diag);
-        }
-        i = j;
-    }
-
-    let mut target_positions: Vec<u32> = Vec::with_capacity(group.len());
+    let mut counts: Vec<(i32, usize)> = Vec::new();
+    let mut best_diag = 0i32;
+    let mut best_count = 0usize;
     for hit in group {
-        if tied_offsets.iter().any(|&d| d == hit.diag) {
-            target_positions.push(hit.ref_pos);
+        let mut found = false;
+        for (d, c) in counts.iter_mut() {
+            if *d == hit.diag {
+                *c += 1;
+                if *c > best_count {
+                    best_count = *c;
+                    best_diag = *d;
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            counts.push((hit.diag, 1));
+            if best_count == 0 {
+                best_count = 1;
+                best_diag = hit.diag;
+            }
         }
     }
-
-    if target_positions.is_empty() {
-        return group
-            .get(group.len() / 2)
-            .map_or((0, 0), |h| (h.diag, h.read_pos));
-    }
-
-    let mid = target_positions.len() / 2;
-    let (_, median, _) = target_positions.select_nth_unstable(mid);
-    let median_pos = *median;
-
-    if tied_offsets.len() == 1 {
-        if let Some(hit) = group
-            .iter()
-            .find(|h| h.diag == tied_offsets[0] && h.ref_pos == median_pos)
-        {
-            return (hit.diag, hit.read_pos);
-        }
-    }
-
-    group
-        .iter()
-        .filter(|h| tied_offsets.iter().any(|&d| d == h.diag))
-        .min_by_key(|h| {
-            let dist = if h.ref_pos >= median_pos {
-                h.ref_pos - median_pos
-            } else {
-                median_pos - h.ref_pos
-            };
-            dist
-        })
-        .map(|h| (h.diag, h.read_pos))
-        .unwrap_or(group.get(group.len() / 2).map_or((0, 0), |h| (h.diag, h.read_pos)))
+    Some((best_diag, best_count))
 }
 
 #[inline(always)]
-fn densest_window_range(group: &[Hit], window: i32) -> (usize, usize) {
+fn anchor_for_diag(group: &[Hit], diag: i32) -> Option<(i32, u32)> {
     if group.is_empty() {
-        return (0, 0);
+        return None;
     }
-
-    let band = window.max(0);
-    let mut best_start = 0usize;
-    let mut best_end = 1usize;
-    let mut j = 0usize;
-
-    for i in 0..group.len() {
-        if j < i {
-            j = i;
-        }
-        while j < group.len() && (group[j].diag - group[i].diag) <= band {
-            j += 1;
-        }
-        if j - i > best_end - best_start {
-            best_start = i;
-            best_end = j;
+    let mut matches: Vec<usize> = Vec::new();
+    for (i, hit) in group.iter().enumerate() {
+        if hit.diag == diag {
+            matches.push(i);
         }
     }
-
-    (best_start, best_end)
+    if matches.is_empty() {
+        return None;
+    }
+    let mid = matches.len() / 2;
+    let hit = &group[matches[mid]];
+    Some((diag, hit.read_pos))
 }
 
 const CASE_MASK: u64 = 0x2020202020202020;
@@ -1255,11 +1214,22 @@ fn span_check(hits: &[Hit], cfg: &Config) -> bool {
     if hits.is_empty() {
         return false;
     }
-    let first = &hits[0];
-    let last = &hits[hits.len() - 1];
-    
-    let query_span = (last.read_pos as i32) - (first.read_pos as i32);
-    let ref_span = (last.ref_pos as i32) - (first.ref_pos as i32);
+    let mut min_read = hits[0].read_pos as i32;
+    let mut max_read = hits[0].read_pos as i32;
+    let mut min_ref = hits[0].ref_pos as i32;
+    let mut max_ref = hits[0].ref_pos as i32;
+
+    for hit in hits.iter().skip(1) {
+        let rp = hit.read_pos as i32;
+        let gp = hit.ref_pos as i32;
+        if rp < min_read { min_read = rp; }
+        if rp > max_read { max_read = rp; }
+        if gp < min_ref { min_ref = gp; }
+        if gp > max_ref { max_ref = gp; }
+    }
+
+    let query_span = max_read - min_read;
+    let ref_span = max_ref - min_ref;
     
     let span_diff = (ref_span - query_span).abs();
     span_diff < cfg.maxindel as i32
@@ -1316,38 +1286,28 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     }
 
     let total_seeds = candidates.len();
-    let mut groups: Vec<Vec<Hit>> = vec![Vec::new(); idx.ref_count() * 2];
+    let mut groups: HashMap<usize, Vec<Hit>> = HashMap::new();
     for hit in candidates.iter().copied() {
         let id = hit.id_strand as usize;
-        if id < groups.len() {
-            groups[id].push(hit);
-        }
+        groups.entry(id).or_default().push(hit);
     }
 
-    for group in groups.iter_mut() {
-        if group.len() > 1 {
-            group.sort_unstable_by(|a, b| a.diag.cmp(&b.diag));
-        }
-    }
 
-    let mut window_ranges = vec![(0usize, 0usize); groups.len()];
-    for (id, group) in groups.iter().enumerate() {
-        if !group.is_empty() {
-            window_ranges[id] = densest_window_range(group, cfg.voting_window);
+    let mut group_votes: HashMap<usize, (i32, usize)> = HashMap::new();
+    for (id, group) in groups.iter() {
+        if let Some((diag, count)) = best_diag_for_group(group) {
+            group_votes.insert(*id, (diag, count));
         }
     }
 
     let mut best_id: Option<usize> = None;
     let mut best_count = 0usize;
-    for (id, group) in groups.iter().enumerate() {
-        if group.is_empty() {
-            continue;
-        }
-        let (s, e) = window_ranges[id];
-        let cnt = e.saturating_sub(s);
-        if cnt > best_count || (cnt == best_count && best_id.map_or(true, |bid| id > bid)) {
-            best_id = Some(id);
-            best_count = cnt;
+    let mut best_diag = 0i32;
+    for (id, (diag, count)) in group_votes.iter() {
+        if *count > best_count || (*count == best_count && best_id.map_or(true, |bid| *id > bid)) {
+            best_id = Some(*id);
+            best_count = *count;
+            best_diag = *diag;
         }
     }
 
@@ -1360,41 +1320,65 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         return Vec::new();
     }
 
-    let (best_start, best_end) = window_ranges[best_id];
-    let best_hits = &groups[best_id][best_start..best_end];
-    let (anchor_diag, anchor_read_pos) = voted_anchor_for_group(best_hits);
+    let best_hits = match groups.get(&best_id) {
+        Some(hits) => hits,
+        None => return Vec::new(),
+    };
+    let mut best_diag_hits: Vec<Hit> = Vec::new();
+    for &hit in best_hits {
+        if hit.diag == best_diag {
+            best_diag_hits.push(hit);
+        }
+    }
+    if best_diag_hits.is_empty() {
+        return Vec::new();
+    }
+    let (anchor_diag, anchor_read_pos) = match anchor_for_diag(best_hits, best_diag) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
 
-    if !span_check(best_hits, cfg) {
+    if !span_check(&best_diag_hits, cfg) {
         return Vec::new();
     }
 
-    if !is_collinear(best_hits, cfg) {
+    if !is_collinear(&best_diag_hits, cfg) {
         return Vec::new();
     }
 
     let mut second_id: Option<usize> = None;
     let mut second_count = 0usize;
-    for (id, group) in groups.iter().enumerate() {
-        if id == best_id || group.is_empty() {
+    let mut second_diag = 0i32;
+    for (id, (diag, count)) in group_votes.iter() {
+        if *id == best_id {
             continue;
         }
-        let (s, e) = window_ranges[id];
-        let cnt = e.saturating_sub(s);
-        if cnt > second_count || (cnt == second_count && second_id.map_or(true, |sid| id > sid)) {
-            second_id = Some(id);
-            second_count = cnt;
+        if *count > second_count || (*count == second_count && second_id.map_or(true, |sid| *id > sid)) {
+            second_id = Some(*id);
+            second_count = *count;
+            second_diag = *diag;
         }
     }
 
-    let second_hits = second_id.map(|id| {
-        let (s, e) = window_ranges[id];
-        &groups[id][s..e]
-    });
-    let (second_diag, second_anchor_read_pos) = second_hits
-        .map(|group| voted_anchor_for_group(group))
-        .unwrap_or((0, 0));
 
-    let mut attempt = |hits: &[Hit], diag: i32, anchor_rp: u32| -> Option<(AlignmentResult, usize)> {
+    let second_hits = second_id.and_then(|id| groups.get(&id));
+    let mut second_diag_hits: Option<Vec<Hit>> = None;
+    if let Some(hits) = second_hits {
+        let mut filtered: Vec<Hit> = Vec::new();
+        for &hit in hits {
+            if hit.diag == second_diag {
+                filtered.push(hit);
+            }
+        }
+        if !filtered.is_empty() {
+            second_diag_hits = Some(filtered);
+        }
+    }
+    let second_anchor_read_pos = second_hits
+        .and_then(|group| anchor_for_diag(group, second_diag))
+        .map(|(_, rp)| rp);
+
+    let mut attempt = |hits: &[Hit], diag: i32, anchor_rp: u32| -> Option<AlignmentResult> {
         if hits.is_empty() {
             return None;
         }
@@ -1433,26 +1417,26 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         if identity < cfg.min_identity {
             return None;
         }
-        Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm: nm as i32, md: String::new(), as_score, paired: false, proper_pair: false }, hits.len()))
+        Some(AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm: nm as i32, md: String::new(), as_score, paired: false, proper_pair: false })
     };
 
     let mut results = Vec::with_capacity(2);
 
     let mut other_count = second_count;
-    if let Some((mut res, primary_len)) = attempt(best_hits, anchor_diag, anchor_read_pos) {
+    if let Some(mut res) = attempt(&best_diag_hits, anchor_diag, anchor_read_pos) {
         let mapq = {
-            let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
+            let frac = (best_count.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
             (frac * 60.0).round().min(60.0) as u8
         };
         res.mapq = mapq;
         results.push(res);
     }
 
-    if let Some(hits) = second_hits {
-        if let Some((mut res, primary_len)) = attempt(hits, second_diag, second_anchor_read_pos) {
+    if let (Some(hits), Some(second_anchor_read_pos)) = (second_diag_hits.as_deref(), second_anchor_read_pos) {
+        if let Some(mut res) = attempt(hits, second_diag, second_anchor_read_pos) {
             other_count = best_count;
             let mapq = {
-                let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
+                let frac = (second_count.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
                 (frac * 60.0).round().min(60.0) as u8
             };
             res.mapq = mapq;
