@@ -663,12 +663,21 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
             let s_hash_rc = h_s_rc.wrapping_mul(0x517cc1b727220a95);
             let canonical_hash = s_hash.min(s_hash_rc);
 
+            if s_head >= s_queue.len() {
+                s_queue.clear();
+                s_head = 0;
+            }
+
             while let Some(&(_, back_hash)) = s_queue.last() {
                 if back_hash >= canonical_hash {
                     s_queue.pop();
                 } else {
                     break;
                 }
+            }
+            if s_head >= s_queue.len() {
+                s_queue.clear();
+                s_head = 0;
             }
             s_queue.push((s_pos, canonical_hash));
         }
@@ -698,6 +707,8 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
             }
 
             if s_head >= s_queue.len() {
+                s_queue.clear();
+                s_head = 0;
                 continue;
             }
             let s_min_pos = s_queue[s_head].0;
