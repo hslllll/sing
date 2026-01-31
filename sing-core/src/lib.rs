@@ -605,7 +605,8 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
         return;
     }
 
-    let mut s_queue: std::collections::VecDeque<(u32, u64)> = std::collections::VecDeque::new();
+    let mut s_queue: Vec<(u32, u64)> = Vec::new();
+    let mut s_head: usize = 0;
 
     let mut h_k = 0u64;
     let mut h_k_rc = 0u64;
@@ -662,43 +663,49 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
             let s_hash_rc = h_s_rc.wrapping_mul(0x517cc1b727220a95);
             let canonical_hash = s_hash.min(s_hash_rc);
 
-            while let Some(&(_, back_hash)) = s_queue.back() {
+            while let Some(&(_, back_hash)) = s_queue.last() {
                 if back_hash >= canonical_hash {
-                    s_queue.pop_back();
+                    s_queue.pop();
                 } else {
                     break;
                 }
             }
-            s_queue.push_back((s_pos, canonical_hash));
+            s_queue.push((s_pos, canonical_hash));
         }
 
         if i + 1 >= HASH_WINDOW && ambig_k == 0 {
             let k_pos = (i + 1 - HASH_WINDOW) as u32;
 
             // Maintain s-mer minima within the current k-mer window.
-            while let Some(&(pos, _)) = s_queue.front() {
+            while s_head < s_queue.len() {
+                let pos = s_queue[s_head].0;
                 if pos < k_pos {
-                    s_queue.pop_front();
+                    s_head += 1;
                 } else {
                     break;
                 }
             }
             let max_pos = k_pos + (HASH_WINDOW - SYNC_S) as u32;
-            while let Some(&(pos, _)) = s_queue.front() {
+            while s_head < s_queue.len() {
+                let pos = s_queue[s_head].0;
                 if pos < k_pos {
-                    s_queue.pop_front();
+                    s_head += 1;
                 } else if pos > max_pos {
-                    // no s-mer within current k-mer window yet
                     break;
                 } else {
                     break;
                 }
             }
 
-            let s_min_pos = match s_queue.front() {
-                Some(&(pos, _)) => pos,
-                None => continue,
-            };
+            if s_head >= s_queue.len() {
+                continue;
+            }
+            let s_min_pos = s_queue[s_head].0;
+
+            if s_head > 1024 && s_head * 2 > s_queue.len() {
+                s_queue.drain(0..s_head);
+                s_head = 0;
+            }
 
             if (k_pos + 1) >= MINIMIZER_WINDOW as u32 {
                 let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
@@ -826,25 +833,32 @@ fn voted_anchor_for_group(group: &[Hit]) -> (i32, u32) {
         return (0, 0);
     }
 
-    let mut offset_votes = std::collections::HashMap::new();
-    for hit in group {
-        *offset_votes.entry(hit.diag).or_insert(0usize) += 1;
+    let mut max_votes = 0usize;
+    let mut tied_offsets: Vec<i32> = Vec::new();
+    let mut i = 0usize;
+    while i < group.len() {
+        let diag = group[i].diag;
+        let mut j = i + 1;
+        while j < group.len() && group[j].diag == diag {
+            j += 1;
+        }
+        let count = j - i;
+        if count > max_votes {
+            max_votes = count;
+            tied_offsets.clear();
+            tied_offsets.push(diag);
+        } else if count == max_votes {
+            tied_offsets.push(diag);
+        }
+        i = j;
     }
 
-    let max_votes = offset_votes.values().copied().max().unwrap_or(0);
-    let mut tied_offsets = Vec::new();
-    for (offset, count) in offset_votes.iter() {
-        if *count == max_votes {
-            tied_offsets.push(*offset);
+    let mut target_positions: Vec<u32> = Vec::with_capacity(group.len());
+    for hit in group {
+        if tied_offsets.iter().any(|&d| d == hit.diag) {
+            target_positions.push(hit.ref_pos);
         }
     }
-
-    let tied_set: std::collections::HashSet<i32> = tied_offsets.into_iter().collect();
-    let mut target_positions: Vec<u32> = group
-        .iter()
-        .filter(|h| tied_set.contains(&h.diag))
-        .map(|h| h.ref_pos)
-        .collect();
 
     if target_positions.is_empty() {
         return group
@@ -857,7 +871,7 @@ fn voted_anchor_for_group(group: &[Hit]) -> (i32, u32) {
 
     group
         .iter()
-        .filter(|h| tied_set.contains(&h.diag))
+        .filter(|h| tied_offsets.iter().any(|&d| d == h.diag))
         .min_by_key(|h| {
             let dist = if h.ref_pos >= median_pos {
                 h.ref_pos - median_pos
