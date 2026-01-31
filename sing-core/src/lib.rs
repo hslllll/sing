@@ -9,8 +9,8 @@ use std::path::Path;
 
 #[derive(Clone, Copy)]
 pub struct Config {
-    pub hash_window: usize,
     pub minimizer_window: usize,
+    pub hash_window: usize,
     pub sync_s: usize,
     pub voting_window: i32,
     pub match_score: i32,
@@ -25,10 +25,10 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
+    minimizer_window: 19,
     hash_window: 16,
-    minimizer_window: 21,
-    sync_s: 15,
-    voting_window: 10,
+    sync_s: 14,
+    voting_window: 5,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
@@ -601,17 +601,11 @@ fn base_to_index(b: u8) -> Option<usize> {
 #[inline(always)]
 pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
     out.clear();
-    if seq.len() < HASH_WINDOW || HASH_WINDOW < SYNC_S {
+    if seq.len() < HASH_WINDOW || MINIMIZER_WINDOW == 0 || SYNC_S > HASH_WINDOW {
         return;
     }
 
-    const Q_SIZE: usize = 32;
-    const Q_MASK: usize = Q_SIZE - 1;
-    let mut q_pos = [0u32; Q_SIZE];
-    let mut q_hash = [u64::MAX; Q_SIZE];
-    let mut q_is_rev = [false; Q_SIZE];
-    let mut head = 0;
-    let mut tail = 0;
+    let mut s_queue: std::collections::VecDeque<(u32, u64)> = std::collections::VecDeque::new();
 
     let mut h_k = 0u64;
     let mut h_k_rc = 0u64;
@@ -662,50 +656,60 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
             h_s_rc = (BASES[rc_idx] ^ REMOVE_S[3 - prev_idx_s]).rotate_right(ROT) ^ h_s_rc;
         }
 
-        if i + 1 < SYNC_S {
-            continue;
-        }
-
-        let s_pos = i + 1 - SYNC_S;
-        if ambig_s == 0 {
+        if i + 1 >= SYNC_S && ambig_s == 0 {
+            let s_pos = (i + 1 - SYNC_S) as u32;
             let s_hash = h_s.wrapping_mul(0x517cc1b727220a95);
             let s_hash_rc = h_s_rc.wrapping_mul(0x517cc1b727220a95);
-            let is_rev = s_hash_rc < s_hash;
             let canonical_hash = s_hash.min(s_hash_rc);
-            let s_pos_u32 = s_pos as u32;
 
-            while tail > head {
-                if q_hash[(tail - 1) & Q_MASK] >= canonical_hash {
-                    tail -= 1;
+            while let Some(&(_, back_hash)) = s_queue.back() {
+                if back_hash >= canonical_hash {
+                    s_queue.pop_back();
+                } else {
+                    break;
+                }
+            }
+            s_queue.push_back((s_pos, canonical_hash));
+        }
+
+        if i + 1 >= HASH_WINDOW && ambig_k == 0 {
+            let k_pos = (i + 1 - HASH_WINDOW) as u32;
+
+            // Maintain s-mer minima within the current k-mer window.
+            while let Some(&(pos, _)) = s_queue.front() {
+                if pos < k_pos {
+                    s_queue.pop_front();
+                } else {
+                    break;
+                }
+            }
+            let max_pos = k_pos + (HASH_WINDOW - SYNC_S) as u32;
+            while let Some(&(pos, _)) = s_queue.front() {
+                if pos < k_pos {
+                    s_queue.pop_front();
+                } else if pos > max_pos {
+                    // no s-mer within current k-mer window yet
+                    break;
                 } else {
                     break;
                 }
             }
 
-            q_hash[tail & Q_MASK] = canonical_hash;
-            q_pos[tail & Q_MASK] = s_pos_u32;
-            q_is_rev[tail & Q_MASK] = is_rev;
-            tail += 1;
-        }
+            let s_min_pos = match s_queue.front() {
+                Some(&(pos, _)) => pos,
+                None => continue,
+            };
 
-        if i + 1 >= HASH_WINDOW && ambig_k == 0 {
-            let k_pos = i + 1 - HASH_WINDOW;
-            let min_pos = k_pos as u32;
-            let max_pos = (k_pos + MINIMIZER_WINDOW - SYNC_S) as u32;
+            if (k_pos + 1) >= MINIMIZER_WINDOW as u32 {
+                let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
+                let k_hash_rc = h_k_rc.wrapping_mul(0x517cc1b727220a95);
+                let is_rev = k_hash_rc < k_hash;
+                let canonical_k = k_hash.min(k_hash_rc);
 
-            while head < tail && q_pos[head & Q_MASK] < min_pos {
-                head += 1;
-            }
-
-            if head < tail {
-                let m_pos = q_pos[head & Q_MASK];
-                if m_pos <= max_pos {
-                    let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
-                    let k_hash_rc = h_k_rc.wrapping_mul(0x517cc1b727220a95);
-                    let is_rev = k_hash_rc < k_hash;
-                    let canonical_hash = k_hash.min(k_hash_rc);
-                    if out.last().map(|&(_, p, _)| p) != Some(k_pos as u32) {
-                         out.push((canonical_hash as u32, k_pos as u32, is_rev));
+                let is_closed = s_min_pos == k_pos || s_min_pos == max_pos;
+                if is_closed {
+                    if out.last().map(|&(_, p, _)| p) != Some(k_pos) {
+                        out.push((canonical_k as u32, k_pos, is_rev));
                     }
                 }
             }
