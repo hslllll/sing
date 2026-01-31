@@ -23,6 +23,14 @@ else
     echo "samtools already installed"
 fi
 
+echo "Installing bcftools..."
+if ! command -v bcftools &> /dev/null; then
+    $SUDO apt-get install -y bcftools
+    echo "bcftools installed successfully"
+else
+    echo "bcftools already installed"
+fi
+
 echo "Checking for rustup (Rust toolchain)..."
 if ! command -v rustup &> /dev/null; then
     echo "rustup not found. Installing rustup..."
@@ -87,6 +95,7 @@ echo ""
 echo "=== Installation Complete ==="
 echo "Installed tools:"
 command -v samtools && samtools --version | head -n1
+command -v bcftools && bcftools --version | head -n1
 command -v dwgsim && echo "dwgsim installed" || echo "dwgsim not found"
 command -v minimap2 && minimap2 --version
 command -v bwa-mem2 && bwa-mem2 version
