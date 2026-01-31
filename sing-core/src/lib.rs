@@ -817,62 +817,52 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
 }
 
 #[inline(always)]
-fn find_densest_cluster(hits: &[Hit], _band: i32, _window: usize) -> (usize, usize, i32) {
-    if hits.is_empty() {
-        return (0, 0, 0);
+fn voted_diag_for_group(group: &[Hit]) -> i32 {
+    if group.is_empty() {
+        return 0;
     }
-    
-    let mut best_start = 0usize;
-    let mut best_end = 0usize;
-    let mut best_count = 0usize;
-    let mut best_id_strand = hits[0].id_strand;
-    let mut best_offset = 0i32;
-    
-    // Group by id_strand first
-    let mut j = 0usize;
-    for i in 0..hits.len() {
-        while j < hits.len() && hits[j].id_strand == hits[i].id_strand {
-            j += 1;
-        }
-        
-        let group = &hits[i..j];
-        let cnt = group.len();
-        
-        if cnt >= best_count {
-            // Use offset voting to find the best seed
-            let mut offset_votes = std::collections::HashMap::new();
-            for hit in group {
-                let offset = hit.ref_pos as i32 - hit.read_pos as i32;
-                *offset_votes.entry(offset).or_insert(0usize) += 1;
-            }
-            
-            let (voted_offset, _vote_count) = offset_votes
-                .iter()
-                .max_by_key(|&(_, count)| count)
-                .unwrap_or((&0, &0));
-            
-            if cnt > best_count || (cnt == best_count && hits[i].id_strand != best_id_strand) {
-                best_count = cnt;
-                best_start = i;
-                best_end = j;
-                best_id_strand = hits[i].id_strand;
-                best_offset = *voted_offset;
-            }
+
+    let mut offset_votes = std::collections::HashMap::new();
+    for hit in group {
+        let offset = hit.ref_pos as i32 - hit.read_pos as i32;
+        *offset_votes.entry(offset).or_insert(0usize) += 1;
+    }
+
+    let max_votes = offset_votes.values().copied().max().unwrap_or(0);
+    let mut tied_offsets = Vec::new();
+    for (offset, count) in offset_votes.iter() {
+        if *count == max_votes {
+            tied_offsets.push(*offset);
         }
     }
-    
-    // Find diag corresponding to the voted offset
-    let target_diag = if best_end > best_start {
-        let group = &hits[best_start..best_end];
-        group.iter()
-            .find(|h| (h.ref_pos as i32 - h.read_pos as i32) == best_offset)
-            .map(|h| h.diag)
-            .unwrap_or(hits.get(best_start + best_count / 2).map_or(0, |h| h.diag))
-    } else {
-        0
-    };
-    
-    (best_start, best_end, target_diag)
+
+    let tied_set: std::collections::HashSet<i32> = tied_offsets.into_iter().collect();
+    let mut target_positions: Vec<u32> = group
+        .iter()
+        .filter(|h| tied_set.contains(&(h.ref_pos as i32 - h.read_pos as i32)))
+        .map(|h| h.ref_pos)
+        .collect();
+
+    if target_positions.is_empty() {
+        return group.get(group.len() / 2).map_or(0, |h| h.diag);
+    }
+
+    target_positions.sort_unstable();
+    let median_pos = target_positions[target_positions.len() / 2];
+
+    group
+        .iter()
+        .filter(|h| tied_set.contains(&(h.ref_pos as i32 - h.read_pos as i32)))
+        .min_by_key(|h| {
+            let dist = if h.ref_pos >= median_pos {
+                h.ref_pos - median_pos
+            } else {
+                median_pos - h.ref_pos
+            };
+            dist
+        })
+        .map(|h| h.diag)
+        .unwrap_or(group.get(group.len() / 2).map_or(0, |h| h.diag))
 }
 
 const CASE_MASK: u64 = 0x2020202020202020;
@@ -1251,51 +1241,79 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         return Vec::new();
     }
 
-    candidates.sort_unstable_by(|a, b| match a.id_strand.cmp(&b.id_strand) {
-        std::cmp::Ordering::Equal => a.diag.cmp(&b.diag),
-        other => other,
-    });
     let total_seeds = candidates.len();
-    let (c1_start, c1_end, anchor_diag) = find_densest_cluster(candidates, cfg.diag_band, 0);
-    let c1_count = c1_end - c1_start;
-    
-    if c1_count < 3 {
-        return Vec::new();
-    }
-    
-    if !span_check(&candidates[c1_start..c1_end], cfg) {
-        return Vec::new();
-    }
-    
-    if !is_collinear(&candidates[c1_start..c1_end], cfg) {
-        return Vec::new();
+    let mut groups: Vec<Vec<Hit>> = vec![Vec::new(); idx.ref_count() * 2];
+    for hit in candidates.iter().copied() {
+        let id = hit.id_strand as usize;
+        if id < groups.len() {
+            groups[id].push(hit);
+        }
     }
 
-    let (pre_start, pre_end, pre_diag) = find_densest_cluster(&candidates[..c1_start], cfg.diag_band, 0);
-    let (post_start, post_end, post_diag) = find_densest_cluster(&candidates[c1_end..], cfg.diag_band, 0);
-    let pre_count = pre_end.saturating_sub(pre_start);
-    let post_count = post_end.saturating_sub(post_start);
-    
-    let (second_range, second_count) = if pre_count >= post_count {
-        if pre_count > 0 {
-            ((pre_start, pre_end, pre_diag), pre_count)
-        } else {
-            ((0, 0, 0), 0)
+    for group in groups.iter_mut() {
+        if group.len() > 1 {
+            group.sort_unstable_by(|a, b| a.diag.cmp(&b.diag));
         }
-    } else {
-        if post_count > 0 {
-            ((c1_end + post_start, c1_end + post_end, post_diag), post_count)
-        } else {
-            ((0, 0, 0), 0)
+    }
+
+    let mut best_id: Option<usize> = None;
+    let mut best_count = 0usize;
+    for (id, group) in groups.iter().enumerate() {
+        let cnt = group.len();
+        if cnt == 0 {
+            continue;
         }
+        if cnt > best_count || (cnt == best_count && best_id.map_or(true, |bid| id > bid)) {
+            best_id = Some(id);
+            best_count = cnt;
+        }
+    }
+
+    let best_id = match best_id {
+        Some(id) => id,
+        None => return Vec::new(),
     };
 
-    let mut attempt = |range: (usize, usize, i32)| -> Option<(AlignmentResult, usize)> {
-        let (s, e, diag) = range;
-        if e <= s {
+    if best_count < 3 {
+        return Vec::new();
+    }
+
+    let best_hits = &groups[best_id];
+    let anchor_diag = voted_diag_for_group(best_hits);
+
+    if !span_check(best_hits, cfg) {
+        return Vec::new();
+    }
+
+    if !is_collinear(best_hits, cfg) {
+        return Vec::new();
+    }
+
+    let mut second_id: Option<usize> = None;
+    let mut second_count = 0usize;
+    for (id, group) in groups.iter().enumerate() {
+        if id == best_id {
+            continue;
+        }
+        let cnt = group.len();
+        if cnt == 0 {
+            continue;
+        }
+        if cnt > second_count || (cnt == second_count && second_id.map_or(true, |sid| id > sid)) {
+            second_id = Some(id);
+            second_count = cnt;
+        }
+    }
+
+    let second_hits = second_id.map(|id| &groups[id]);
+    let second_diag = second_hits
+        .map(|group| voted_diag_for_group(group.as_slice()))
+        .unwrap_or(0);
+
+    let mut attempt = |hits: &[Hit], diag: i32| -> Option<(AlignmentResult, usize)> {
+        if hits.is_empty() {
             return None;
         }
-        let hits = &candidates[s..e];
         
         if !span_check(hits, cfg) {
             return None;
@@ -1331,13 +1349,13 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         if identity < cfg.min_identity {
             return None;
         }
-        Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm: nm as i32, md: String::new(), as_score, paired: false, proper_pair: false }, e - s))
+        Some((AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm: nm as i32, md: String::new(), as_score, paired: false, proper_pair: false }, hits.len()))
     };
 
     let mut results = Vec::with_capacity(2);
 
     let mut other_count = second_count;
-    if let Some((mut res, primary_len)) = attempt((c1_start, c1_end, anchor_diag)) {
+    if let Some((mut res, primary_len)) = attempt(best_hits, anchor_diag) {
         let mapq = {
             let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
             (frac * 60.0).round().min(60.0) as u8
@@ -1346,9 +1364,9 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         results.push(res);
     }
 
-    if second_count > 0 {
-        if let Some((mut res, primary_len)) = attempt(second_range) {
-            other_count = c1_count;
+    if let Some(hits) = second_hits {
+        if let Some((mut res, primary_len)) = attempt(hits, second_diag) {
+            other_count = best_count;
             let mapq = {
                 let frac = (primary_len.saturating_sub(other_count)) as f32 / total_seeds.max(1) as f32;
                 (frac * 60.0).round().min(60.0) as u8
