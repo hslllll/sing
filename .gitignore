@@ -45,3 +45,5 @@ perf*
 log
 
 dist
+
+*.bai

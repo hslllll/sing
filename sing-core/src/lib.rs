@@ -128,6 +128,10 @@ impl Index {
             offsets.push(u32::from_le_bytes(chunk.try_into().unwrap()));
         }
         pos = offsets_bytes;
+        let padding = (8 - (pos % 8)) % 8;
+        let padded = pos.checked_add(padding).filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read offsets padding: unexpected EOF"))?;
+        pos = padded;
 
         let seeds_len = read_u64(data, &mut pos, "read seeds len")? as usize;
         let seeds_bytes = seeds_len
@@ -179,6 +183,12 @@ impl Index {
             r.read_exact(&mut buf4).context("read offset")?;
             offsets.push(u32::from_le_bytes(buf4));
         }
+        let pos = 8usize + len.saturating_mul(4);
+        let padding = (8 - (pos % 8)) % 8;
+        if padding != 0 {
+            let mut pad = [0u8; 8];
+            r.read_exact(&mut pad[..padding]).context("read offsets padding")?;
+        }
 
         r.read_exact(&mut buf8).context("read seeds len")?;
         let len = u64::from_le_bytes(buf8) as usize;
@@ -220,6 +230,12 @@ impl Index {
         w.write_all(&(self.offsets.len() as u64).to_le_bytes())?;
         for v in &self.offsets {
             w.write_all(&v.to_le_bytes())?;
+        }
+        let pos = 8usize + self.offsets.len().saturating_mul(4);
+        let padding = (8 - (pos % 8)) % 8;
+        if padding != 0 {
+            let pad = [0u8; 8];
+            w.write_all(&pad[..padding])?;
         }
 
         w.write_all(&(self.seeds.len() as u64).to_le_bytes())?;
