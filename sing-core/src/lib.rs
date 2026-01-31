@@ -83,7 +83,7 @@ const REMOVE_S: [u64; 4] = [
     rot(BASES[3], (SYNC_S as u32 * ROT) % 64),
 ];
 
-pub const RADIX: usize = 26;
+pub const RADIX: usize = 28;
 pub const SHIFT: usize = 32 - RADIX;
 
 #[derive(Debug, Clone)]
