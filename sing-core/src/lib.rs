@@ -492,7 +492,7 @@ where
     
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
-        for &(h, p) in mins.iter() {
+        for &(h, p, _is_rev) in mins.iter() {
             all_seeds.push((h, rid as u32, p));
         }
     }
@@ -579,7 +579,7 @@ pub struct Hit {
 }
 
 pub struct State {
-    pub mins: Vec<(u32, u32)>,
+    pub mins: Vec<(u32, u32, bool)>,
     pub candidates: Vec<Hit>,
 }
 
@@ -599,7 +599,7 @@ fn base_to_index(b: u8) -> Option<usize> {
 }
 
 #[inline(always)]
-pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
+pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
     out.clear();
     if seq.len() < HASH_WINDOW || HASH_WINDOW < SYNC_S {
         return;
@@ -609,6 +609,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
     const Q_MASK: usize = Q_SIZE - 1;
     let mut q_pos = [0u32; Q_SIZE];
     let mut q_hash = [u64::MAX; Q_SIZE];
+    let mut q_is_rev = [false; Q_SIZE];
     let mut head = 0;
     let mut tail = 0;
 
@@ -669,6 +670,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
         if ambig_s == 0 {
             let s_hash = h_s.wrapping_mul(0x517cc1b727220a95);
             let s_hash_rc = h_s_rc.wrapping_mul(0x517cc1b727220a95);
+            let is_rev = s_hash_rc < s_hash;
             let canonical_hash = s_hash.min(s_hash_rc);
             let s_pos_u32 = s_pos as u32;
 
@@ -682,6 +684,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
 
             q_hash[tail & Q_MASK] = canonical_hash;
             q_pos[tail & Q_MASK] = s_pos_u32;
+            q_is_rev[tail & Q_MASK] = is_rev;
             tail += 1;
         }
 
@@ -699,9 +702,10 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
                 if m_pos <= max_pos {
                     let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
                     let k_hash_rc = h_k_rc.wrapping_mul(0x517cc1b727220a95);
+                    let is_rev = k_hash_rc < k_hash;
                     let canonical_hash = k_hash.min(k_hash_rc);
-                    if out.last().map(|&(_, p)| p) != Some(k_pos as u32) {
-                         out.push((canonical_hash as u32, k_pos as u32));
+                    if out.last().map(|&(_, p, _)| p) != Some(k_pos as u32) {
+                         out.push((canonical_hash as u32, k_pos as u32, is_rev));
                     }
                 }
             }
@@ -712,8 +716,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32)>) {
 #[inline(always)]
 fn collect_candidates<I: IndexLike>(
     idx: &I,
-    mins: &[(u32, u32)],
-    is_rev: bool,
+    mins: &[(u32, u32, bool)],
     max_hits: usize,
     out: &mut Vec<Hit>,
 ) -> bool {
@@ -721,7 +724,7 @@ fn collect_candidates<I: IndexLike>(
     let seeds = idx.seeds();
     let mut capped = false;
     
-    for &(h, r_pos) in mins {
+    for &(h, r_pos, is_rev) in mins {
         let bucket = (h >> SHIFT) as usize;
         
         if bucket >= offsets.len() {
@@ -1242,17 +1245,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
 
     get_syncmers(seq, mins);
     
-    capped |= collect_candidates(idx, mins, false, max_hits, candidates);
-    
-    rev.clear();
-    rev.extend(seq.iter().rev().map(|b| match b {
-        b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A',
-        b'a' => b't', b'c' => b'g', b'g' => b'c', b't' => b'a',
-        _ => b'N',
-    }));
-    get_syncmers(rev, mins);
-    
-    capped |= collect_candidates(idx, mins, true, max_hits, candidates);
+    capped |= collect_candidates(idx, mins, max_hits, candidates);
     
     if candidates.is_empty() {
         return Vec::new();
@@ -1297,7 +1290,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         }
     };
 
-    let attempt = |range: (usize, usize, i32)| -> Option<(AlignmentResult, usize)> {
+    let mut attempt = |range: (usize, usize, i32)| -> Option<(AlignmentResult, usize)> {
         let (s, e, diag) = range;
         if e <= s {
             return None;
@@ -1313,7 +1306,19 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
             return None;
         }
         let is_rev = (hits[0].id_strand & 1) == 1;
-        let target_seq = if is_rev { rev.as_slice() } else { seq };
+        
+        let target_seq = if is_rev {
+            rev.clear();
+            rev.extend(seq.iter().rev().map(|b| match b {
+                b'A' => b'T', b'C' => b'G', b'G' => b'C', b'T' => b'A',
+                b'a' => b't', b'c' => b'g', b'g' => b'c', b't' => b'a',
+                _ => b'N',
+            }));
+            rev.as_slice()
+        } else {
+            seq
+        };
+        
         let ref_seq = idx.ref_seq(ref_id as usize);
         
         let (cigar, pos, as_score, aligned_len, nm) = greedy_extend(hits, diag, target_seq, ref_seq, cfg);
