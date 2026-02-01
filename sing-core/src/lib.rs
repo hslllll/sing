@@ -776,12 +776,12 @@ fn best_diag_for_group(hits: &[Hit], counts: &mut Vec<(i32, u16)>) -> Option<(i3
     if hits.is_empty() { return None; }
     counts.clear();
     
-    // Use sorted insert for small groups (typical case)
     for hit in hits {
         let d = hit.diag;
-        match counts.binary_search_by_key(&d, |&(diag, _)| diag) {
-            Ok(idx) => counts[idx].1 += 1,
-            Err(idx) => counts.insert(idx, (d, 1)),
+        if let Some(entry) = counts.iter_mut().find(|(diag, _)| *diag == d) {
+            entry.1 += 1;
+        } else {
+            counts.push((d, 1));
         }
     }
     
