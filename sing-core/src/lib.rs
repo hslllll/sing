@@ -18,7 +18,7 @@ pub struct Config {
     pub gap_open: i32,
     pub gap_ext: i32,
     pub x_drop: i32,
-    pub max_hits: usize,
+    pub max_hits_pct: f32,
     pub maxindel: usize,
     pub min_identity: f32,
     pub pair_max_dist: i32,
@@ -33,7 +33,7 @@ pub static CONFIG: Config = Config {
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    max_hits: 500,
+    max_hits_pct: 0.00002,
     pair_max_dist: 1000,
     maxindel: 15,
     min_identity: 0.85,
@@ -91,6 +91,7 @@ pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
     pub genome_size: u64,
+    pub total_seeds: u64,
     pub ref_seqs: Vec<Vec<u8>>,
     pub ref_names: Vec<String>,
 }
@@ -99,6 +100,7 @@ pub trait IndexLike {
     fn offsets(&self) -> &[u32];
     fn seeds(&self) -> &[u64];
     fn genome_size(&self) -> u64;
+    fn total_seeds(&self) -> u64;
     fn ref_count(&self) -> usize;
     fn ref_seq(&self, id: usize) -> &[u8];
     fn ref_name(&self, id: usize) -> &str;
@@ -168,7 +170,20 @@ impl Index {
             pos = end;
         }
 
-        Ok(Index { offsets, seeds, genome_size, ref_seqs, ref_names })
+        let total_seeds = if pos + 8 <= data.len() {
+            read_u64(data, &mut pos, "read total_seeds")?
+        } else {
+            seeds.len() as u64
+        };
+
+        Ok(Index {
+            offsets,
+            seeds,
+            genome_size,
+            total_seeds,
+            ref_seqs,
+            ref_names,
+        })
     }
 
     pub fn from_reader<R: Read>(reader: R) -> Result<Self> {
@@ -223,7 +238,26 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
-        Ok(Index { offsets, seeds, genome_size, ref_seqs, ref_names })
+        let total_seeds = {
+            let mut buf = [0u8; 8];
+            match r.read(&mut buf).context("read total_seeds")? {
+                0 => seeds.len() as u64,
+                n if n < 8 => {
+                    r.read_exact(&mut buf[n..]).context("read total_seeds")?;
+                    u64::from_le_bytes(buf)
+                }
+                _ => u64::from_le_bytes(buf),
+            }
+        };
+
+        Ok(Index {
+            offsets,
+            seeds,
+            genome_size,
+            total_seeds,
+            ref_seqs,
+            ref_names,
+        })
     }
 
     pub fn to_writer<W: Write>(&self, mut w: W) -> Result<()> {
@@ -258,6 +292,8 @@ impl Index {
             w.write_all(bytes)?;
         }
 
+        w.write_all(&(self.total_seeds as u64).to_le_bytes())?;
+
         Ok(())
     }
 }
@@ -273,6 +309,10 @@ impl IndexLike for Index {
 
     fn genome_size(&self) -> u64 {
         self.genome_size
+    }
+
+    fn total_seeds(&self) -> u64 {
+        self.total_seeds
     }
 
     fn ref_count(&self) -> usize {
@@ -308,6 +348,7 @@ pub struct MemoryIndex {
     seeds_ptr: *const u64,
     seeds_len: usize,
     genome_size: u64,
+    total_seeds: u64,
     ref_seq_ranges: Vec<Range<usize>>,
     ref_name_ranges: Vec<Range<usize>>,
 }
@@ -401,6 +442,12 @@ impl MemoryIndex {
             pos = end;
         }
 
+        let total_seeds = if pos + 8 <= data.len() {
+            read_u64(data, &mut pos, "read total_seeds")?
+        } else {
+            seeds_len as u64
+        };
+
         Ok(Self {
             buf,
             offsets_ptr,
@@ -408,6 +455,7 @@ impl MemoryIndex {
             seeds_ptr,
             seeds_len,
             genome_size,
+            total_seeds,
             ref_seq_ranges,
             ref_name_ranges,
         })
@@ -425,6 +473,10 @@ impl IndexLike for MemoryIndex {
 
     fn genome_size(&self) -> u64 {
         self.genome_size
+    }
+
+    fn total_seeds(&self) -> u64 {
+        self.total_seeds
     }
 
     fn ref_count(&self) -> usize {
@@ -454,6 +506,10 @@ impl<T: IndexLike> IndexLike for std::sync::Arc<T> {
 
     fn genome_size(&self) -> u64 {
         self.as_ref().genome_size()
+    }
+
+    fn total_seeds(&self) -> u64 {
+        self.as_ref().total_seeds()
     }
 
     fn ref_count(&self) -> usize {
@@ -492,16 +548,17 @@ where
     let mut ref_names = Vec::new();
 
     let mut total_bases: u64 = 0;
-    let max_hits = CONFIG.max_hits;
+    let mut total_seed_occurrences: u64 = 0;
     let mut mins = Vec::with_capacity(1024);
     let mut counts: HashMap<u32, u16> = HashMap::new();
 
-    eprintln!("Building streaming index: max_hits={}", max_hits);
+    eprintln!("Building streaming index...");
 
     for (name, seq) in records.into_iter() {
         ref_names.push(name.into());
         total_bases += seq.len() as u64;
         get_syncmers(&seq, &mut mins);
+        total_seed_occurrences = total_seed_occurrences.saturating_add(mins.len() as u64);
         for &(h, _p, _is_rev) in mins.iter() {
             let entry = counts.entry(h).or_insert(0);
             if *entry < u16::MAX {
@@ -527,6 +584,8 @@ where
 
     eprintln!("  Counted {} unique seeds ({} singletons pruned)", counts.len() + singleton_hits, singleton_hits);
 
+    eprintln!("  Total seed occurrences: {}", total_seed_occurrences);
+
     let mut bucket_counts = vec![0u32; 1 << RADIX];
     let mut kept = 0usize;
     let mut filtered = 0usize;
@@ -534,11 +593,7 @@ where
     for seq in ref_seqs.iter() {
         get_syncmers(seq, &mut mins);
         for &(h, _p, _is_rev) in mins.iter() {
-            let keep = match counts.get(&h) {
-                Some(&c) => c as usize <= max_hits,
-                None => true,
-            };
-            if keep {
+            if true {
                 let bucket = (h >> SHIFT) as usize;
                 if bucket < bucket_counts.len() {
                     bucket_counts[bucket] += 1;
@@ -565,13 +620,6 @@ where
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p, _is_rev) in mins.iter() {
-            let keep = match counts.get(&h) {
-                Some(&c) => c as usize <= max_hits,
-                None => true,
-            };
-            if !keep {
-                continue;
-            }
             let bucket = (h >> SHIFT) as usize;
             if bucket >= write_offsets.len() {
                 continue;
@@ -607,6 +655,7 @@ where
         offsets,
         seeds: final_seeds,
         genome_size: total_bases,
+        total_seeds: total_seed_occurrences,
         ref_seqs,
         ref_names,
     })
@@ -1302,7 +1351,15 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let State { mins, candidates } = state;
     let cfg = &CONFIG;
     candidates.clear();
-    let max_hits = cfg.max_hits;
+    let max_hits = {
+        let pct = CONFIG.max_hits_pct.max(0.0);
+        let pct_hits = ((idx.total_seeds() as f64) * pct as f64).ceil() as usize;
+        let mut value = pct_hits.max(1);
+        if value > u16::MAX as usize {
+            value = u16::MAX as usize;
+        }
+        value
+    };
     let mut capped = false;
     let mut second_failed = false;
 
