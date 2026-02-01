@@ -25,7 +25,7 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
-    hash_window: 18,
+    hash_window: 20,
     sync_s: 16,
     match_score: 2,
     mismatch_pen: -2,
@@ -922,7 +922,6 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
                 let pos = s_queue[s_head].0;
                 if pos < k_pos {
                     s_head += 1;
-                } else if pos > max_pos {
                     break;
                 } else {
                     break;
