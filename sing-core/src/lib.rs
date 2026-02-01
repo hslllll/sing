@@ -20,23 +20,21 @@ pub struct Config {
     pub hardmask_pct: f32,
     pub seedmask_pct: f32,
     pub maxindel: usize,
-    pub min_identity: f32,
     pub pair_max_dist: i32,
 }
 
 pub static CONFIG: Config = Config {
     hash_window: 21,
-    sync_s: 11,
+    sync_s: 6,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    hardmask_pct: 0.01,
-    seedmask_pct: 0.001,
+    hardmask_pct: 0.03,
+    seedmask_pct: 0.002,
     pair_max_dist: 1000,
     maxindel: 15,
-    min_identity: 0.5,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -718,30 +716,18 @@ where
     );
 
     let mut bucket_counts = vec![0u32; 1 << RADIX];
-    let mut kept = 0usize;
-    let mut filtered = 0usize;
 
     for seq in ref_seqs.iter() {
         get_syncmers(seq, &mut mins);
         for &(h, _p, _is_rev) in mins.iter() {
             let h32 = h as u32;
-            let keep = match counts.get(&h32) {
-                Some(&c) => c as usize <= max_hits,
-                None => true,
-            };
-            if keep {
-                let bucket = (h32 >> SHIFT) as usize;
-                if bucket < bucket_counts.len() {
-                    bucket_counts[bucket] += 1;
-                    kept += 1;
-                }
-            } else {
-                filtered += 1;
+            let bucket = (h32 >> SHIFT) as usize;
+            if bucket < bucket_counts.len() {
+                bucket_counts[bucket] += 1;
             }
         }
     }
 
-    eprintln!("  Kept {} seeds, filtered {} seeds", kept, filtered);
 
     let mut offsets = vec![0u32; 1 << RADIX];
     let mut running = 0u32;
@@ -1657,11 +1643,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         if aligned_len == 0 || pos < 0 || (pos as usize) >= ref_seq.len() {
             return None;
         }
-        let identity = 1.0 - (nm as f32 / aligned_len.max(1) as f32);
         
-        if identity < cfg.min_identity {
-            return None;
-        }
         Some(AlignmentResult { ref_id, pos, is_rev, mapq: 0, cigar, nm: nm as i32, md: String::new(), as_score, paired: false, proper_pair: false })
     };
 
