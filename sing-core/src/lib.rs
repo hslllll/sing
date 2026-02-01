@@ -820,7 +820,7 @@ pub struct Hit {
 }
 
 pub struct State {
-    pub mins: Vec<(u64, u32, bool)>,
+    pub mins: Vec<(u32, u32, bool)>,
     pub candidates: Vec<Hit>,
 }
 
@@ -840,7 +840,7 @@ fn base_to_index(b: u8) -> Option<usize> {
 }
 
 #[inline(always)]
-pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u64, u32, bool)>) {
+pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
     out.clear();
     if seq.len() < HASH_WINDOW || HASH_WINDOW == 0 || SYNC_S > HASH_WINDOW {
         return;
@@ -961,7 +961,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u64, u32, bool)>) {
                 let is_closed = s_min_pos == k_pos || s_min_pos == max_pos;
                 if is_closed {
                     if out.last().map(|&(_, p, _)| p) != Some(k_pos) {
-                        out.push((canonical_k, k_pos, is_rev));
+                        out.push((canonical_k as u32, k_pos, is_rev));
                     }
                 }
             }
@@ -972,7 +972,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u64, u32, bool)>) {
 #[inline(always)]
 fn collect_candidates<I: IndexLike>(
     idx: &I,
-    mins: &[(u64, u32, bool)],
+    mins: &[(u32, u32, bool)],
     max_hits: usize,
     seedmask_threshold: u32,
     out: &mut Vec<Hit>,
@@ -982,8 +982,7 @@ fn collect_candidates<I: IndexLike>(
     let mut capped = false;
     
     for &(h, r_pos, is_rev) in mins {
-        let h32 = h as u32;
-        let bucket = (h32 >> SHIFT) as usize;
+        let bucket = (h >> SHIFT) as usize;
         
         if bucket >= offsets.len() {
             continue;
@@ -1001,13 +1000,13 @@ fn collect_candidates<I: IndexLike>(
         }
         
         if seedmask_threshold > 0 {
-            let c = idx.seed_count(h32);
+            let c = idx.seed_count(h);
             if c >= seedmask_threshold {
                 continue;
             }
         }
 
-        let target_hash = (h32 & 0xFFFF) as u64;
+        let target_hash = (h & 0xFFFF) as u64;
         let bucket_seeds = &seeds[start..end];
 
         let pos = bucket_seeds.partition_point(|&s| (s >> 48) < target_hash);
@@ -1514,7 +1513,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let mut capped = false;
     let mut second_failed = false;
 
-    let mut tmp_mins: Vec<(u64, u32, bool)> = Vec::with_capacity(mins.capacity());
+    let mut tmp_mins: Vec<(u32, u32, bool)> = Vec::with_capacity(mins.capacity());
 
     get_syncmers(seq, &mut tmp_mins);
     mins.clear();
