@@ -30,8 +30,8 @@ pub struct Config {
     pub gap_open: i32,
     pub gap_ext: i32,
     pub x_drop: i32,
-    pub hardmask_pct: f32,
-    pub seedmask_pct: f32,
+    pub max_seed_occ: usize,
+    pub max_candidates: usize,
     pub maxindel: usize,
     pub pair_max_dist: i32,
     pub min_seeds: usize,
@@ -45,8 +45,8 @@ pub static CONFIG: Config = Config {
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    hardmask_pct: 0.06,
-    seedmask_pct: 0.004,
+    max_seed_occ: 500,
+    max_candidates: 5000,
     pair_max_dist: 1000,
     maxindel: 15,
     min_seeds: 2,
@@ -577,10 +577,7 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     eprintln!("  Loaded {} bp across {} references", total_bases, ref_seqs.len());
     eprintln!("  Counted {} unique seeds", counts.len());
 
-    let max_hits = {
-        let pct = CONFIG.hardmask_pct.max(0.0);
-        ((total_seed_occurrences as f64) * pct as f64).ceil() as usize
-    }.max(1).min(u32::MAX as usize);
+    let max_hits = CONFIG.max_seed_occ;
 
     eprintln!("  Total seed occurrences: {}, max_hits={}", total_seed_occurrences, max_hits);
 
@@ -739,6 +736,8 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u64, u32)], is_rev: bool, 
     let mut capped = false;
     
     for &(h, r_pos) in mins {
+        if out.len() >= CONFIG.max_candidates { capped = true; break; }
+        
         let bucket = (h >> SHIFT) as usize;
         if bucket >= offsets.len() { continue; }
         let start = offsets[bucket] as usize;
@@ -764,6 +763,7 @@ fn collect_candidates<I: IndexLike>(idx: &I, mins: &[(u64, u32)], is_rev: bool, 
             });
             count += 1;
             idx_in_bucket += 1;
+            if out.len() >= CONFIG.max_candidates { capped = true; break; }
         }
         if count >= max_hits { capped = true; }
     }
