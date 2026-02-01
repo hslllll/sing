@@ -10,7 +10,6 @@ use std::path::Path;
 
 #[derive(Clone, Copy)]
 pub struct Config {
-    pub minimizer_window: usize,
     pub hash_window: usize,
     pub sync_s: usize,
     pub match_score: i32,
@@ -26,7 +25,6 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
-    minimizer_window: 20,
     hash_window: 18,
     sync_s: 16,
     match_score: 2,
@@ -42,7 +40,6 @@ pub static CONFIG: Config = Config {
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
-const MINIMIZER_WINDOW: usize = CONFIG.minimizer_window;
 const SYNC_S: usize = CONFIG.sync_s;
 
 const BASES: [u64; 4] = [
@@ -824,7 +821,7 @@ fn base_to_index(b: u8) -> Option<usize> {
 #[inline(always)]
 pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
     out.clear();
-    if seq.len() < HASH_WINDOW || MINIMIZER_WINDOW == 0 || SYNC_S > HASH_WINDOW {
+    if seq.len() < HASH_WINDOW || HASH_WINDOW == 0 || SYNC_S > HASH_WINDOW {
         return;
     }
 
@@ -944,7 +941,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
                 s_head = 0;
             }
 
-            if (k_pos + 1) >= MINIMIZER_WINDOW as u32 {
+            if (k_pos + 1) >= HASH_WINDOW as u32 {
                 let k_hash = h_k.wrapping_mul(0x517cc1b727220a95);
                 let k_hash_rc = h_k_rc.wrapping_mul(0x517cc1b727220a95);
                 let is_rev = k_hash_rc < k_hash;
