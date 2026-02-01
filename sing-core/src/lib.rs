@@ -24,8 +24,8 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
-    hash_window: 21,
-    sync_s: 6,
+    hash_window: 19,
+    sync_s: 10,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
@@ -99,12 +99,12 @@ const REMOVE_S_RC: [u64; 4] = [
 ];
 
 pub const RADIX: usize = 28;
-pub const SHIFT: usize = 32 - RADIX;
+pub const SHIFT: usize = 64 - RADIX;
 
 #[derive(Debug, Clone)]
 pub struct Index {
     pub offsets: Vec<u32>,
-    pub seeds: Vec<u64>,
+    pub seeds: Vec<u128>,
     pub genome_size: u64,
     pub max_hits: u32,
     pub total_seed_occurrences: u64,
@@ -115,11 +115,11 @@ pub struct Index {
 
 pub trait IndexLike {
     fn offsets(&self) -> &[u32];
-    fn seeds(&self) -> &[u64];
+    fn seeds(&self) -> &[u128];
     fn genome_size(&self) -> u64;
     fn max_hits(&self) -> usize;
     fn total_seed_occurrences(&self) -> u64;
-    fn seed_count(&self, hash: u32) -> u32;
+    fn seed_count(&self, hash: u64) -> u32;
     fn ref_count(&self) -> usize;
     fn ref_seq(&self, id: usize) -> &[u8];
     fn ref_name(&self, id: usize) -> &str;
@@ -156,13 +156,13 @@ impl Index {
 
         let seeds_len = read_u64(data, &mut pos, "read seeds len")? as usize;
         let seeds_bytes = seeds_len
-            .checked_mul(8)
+            .checked_mul(16)
             .and_then(|n| pos.checked_add(n))
             .filter(|&end| end <= data.len())
             .ok_or_else(|| anyhow::anyhow!("read seeds: unexpected EOF"))?;
         let mut seeds = Vec::with_capacity(seeds_len);
-        for chunk in data[pos..seeds_bytes].chunks_exact(8) {
-            seeds.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in data[pos..seeds_bytes].chunks_exact(16) {
+            seeds.push(u128::from_le_bytes(chunk.try_into().unwrap()));
         }
         pos = seeds_bytes;
 
@@ -246,9 +246,10 @@ impl Index {
         r.read_exact(&mut buf8).context("read seeds len")?;
         let len = u64::from_le_bytes(buf8) as usize;
         let mut seeds = Vec::with_capacity(len);
+        let mut buf16 = [0u8; 16];
         for _ in 0..len {
-            r.read_exact(&mut buf8).context("read seed")?;
-            seeds.push(u64::from_le_bytes(buf8));
+            r.read_exact(&mut buf16).context("read seed")?;
+            seeds.push(u128::from_le_bytes(buf16));
         }
 
         r.read_exact(&mut buf8).context("read genome_size")?;
@@ -372,7 +373,7 @@ impl IndexLike for Index {
         &self.offsets
     }
 
-    fn seeds(&self) -> &[u64] {
+    fn seeds(&self) -> &[u128] {
         &self.seeds
     }
 
@@ -388,9 +389,10 @@ impl IndexLike for Index {
         self.total_seed_occurrences
     }
 
-    fn seed_count(&self, hash: u32) -> u32 {
-        let key = (hash as u64) << 32;
-        match self.seed_counts.binary_search_by_key(&key, |v| v & 0xFFFF_FFFF_0000_0000) {
+    fn seed_count(&self, hash: u64) -> u32 {
+        // Key is top 32 bits of 64-bit hash
+        let key = hash >> 32;
+        match self.seed_counts.binary_search_by_key(&key, |v| v >> 32) {
             Ok(idx) => (self.seed_counts[idx] & 0xFFFF_FFFF) as u32,
             Err(_) => 0,
         }
@@ -426,7 +428,7 @@ pub struct MemoryIndex {
     buf: IndexBuffer,
     offsets_ptr: *const u32,
     offsets_len: usize,
-    seeds_ptr: *const u64,
+    seeds_ptr: *const u128,
     seeds_len: usize,
     genome_size: u64,
     max_hits: u32,
@@ -486,12 +488,12 @@ impl MemoryIndex {
 
         let seeds_len = read_u64(data, &mut pos, "read seeds len")? as usize;
         let seeds_bytes = seeds_len
-            .checked_mul(8)
+            .checked_mul(16)
             .and_then(|n| pos.checked_add(n))
             .filter(|&end| end <= data.len())
             .ok_or_else(|| anyhow::anyhow!("read seeds: unexpected EOF"))?;
         let seeds_range = pos..seeds_bytes;
-        let seeds_slice = try_cast_slice::<u8, u64>(&data[seeds_range])
+        let seeds_slice = try_cast_slice::<u8, u128>(&data[seeds_range])
             .map_err(|_| anyhow::anyhow!("read seeds: unaligned data"))?;
         let seeds_ptr = seeds_slice.as_ptr();
         let seeds_len = seeds_slice.len();
@@ -569,7 +571,7 @@ impl IndexLike for MemoryIndex {
         unsafe { std::slice::from_raw_parts(self.offsets_ptr, self.offsets_len) }
     }
 
-    fn seeds(&self) -> &[u64] {
+    fn seeds(&self) -> &[u128] {
         unsafe { std::slice::from_raw_parts(self.seeds_ptr, self.seeds_len) }
     }
 
@@ -585,12 +587,13 @@ impl IndexLike for MemoryIndex {
         self.total_seed_occurrences
     }
 
-    fn seed_count(&self, hash: u32) -> u32 {
+    fn seed_count(&self, hash: u64) -> u32 {
         if self.seed_counts.is_empty() {
             return 0;
         }
-        let key = (hash as u64) << 32;
-        match self.seed_counts.binary_search_by_key(&key, |v| v & 0xFFFF_FFFF_0000_0000) {
+        // Key is top 32 bits of 64-bit hash
+        let key = hash >> 32;
+        match self.seed_counts.binary_search_by_key(&key, |v| v >> 32) {
             Ok(idx) => (self.seed_counts[idx] & 0xFFFF_FFFF) as u32,
             Err(_) => 0,
         }
@@ -617,7 +620,7 @@ impl<T: IndexLike> IndexLike for std::sync::Arc<T> {
         self.as_ref().offsets()
     }
 
-    fn seeds(&self) -> &[u64] {
+    fn seeds(&self) -> &[u128] {
         self.as_ref().seeds()
     }
 
@@ -633,7 +636,7 @@ impl<T: IndexLike> IndexLike for std::sync::Arc<T> {
         self.as_ref().total_seed_occurrences()
     }
 
-    fn seed_count(&self, hash: u32) -> u32 {
+    fn seed_count(&self, hash: u64) -> u32 {
         self.as_ref().seed_count(hash)
     }
 
@@ -675,7 +678,7 @@ where
     let mut total_bases: u64 = 0;
     let mut total_seed_occurrences: u64 = 0;
     let mut mins = Vec::with_capacity(1024);
-    let mut counts: HashMap<u32, u16> = HashMap::new();
+    let mut counts: HashMap<u64, u32> = HashMap::new();
 
     eprintln!("Building streaming index...");
 
@@ -685,9 +688,8 @@ where
         get_syncmers(&seq, &mut mins);
         total_seed_occurrences = total_seed_occurrences.saturating_add(mins.len() as u64);
         for &(h, _p, _is_rev) in mins.iter() {
-            let h32 = h as u32;
-            let entry = counts.entry(h32).or_insert(0);
-            if *entry < u16::MAX {
+            let entry = counts.entry(h).or_insert(0);
+            if *entry < u32::MAX {
                 *entry += 1;
             }
         }
@@ -702,8 +704,8 @@ where
         let pct = CONFIG.hardmask_pct.max(0.0);
         let pct_hits = ((total_seed_occurrences as f64) * pct as f64).ceil() as usize;
         let mut value = pct_hits.max(1);
-        if value > u16::MAX as usize {
-            value = u16::MAX as usize;
+        if value > u32::MAX as usize {
+            value = u32::MAX as usize;
         }
         value
     };
@@ -720,8 +722,7 @@ where
     for seq in ref_seqs.iter() {
         get_syncmers(seq, &mut mins);
         for &(h, _p, _is_rev) in mins.iter() {
-            let h32 = h as u32;
-            let bucket = (h32 >> SHIFT) as usize;
+            let bucket = (h >> SHIFT) as usize;
             if bucket < bucket_counts.len() {
                 bucket_counts[bucket] += 1;
             }
@@ -736,21 +737,20 @@ where
         running = running.saturating_add(bucket_counts[i]);
     }
 
-    let mut final_seeds = vec![0u64; running as usize];
+    let mut final_seeds: Vec<u128> = vec![0u128; running as usize];
     let mut write_offsets = offsets.clone();
 
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p, _is_rev) in mins.iter() {
-            let h32 = h as u32;
-            let keep = match counts.get(&h32) {
+            let keep = match counts.get(&h) {
                 Some(&c) => c as usize <= max_hits,
                 None => true,
             };
             if !keep {
                 continue;
             }
-            let bucket = (h32 >> SHIFT) as usize;
+            let bucket = (h >> SHIFT) as usize;
             if bucket >= write_offsets.len() {
                 continue;
             }
@@ -758,8 +758,8 @@ where
             if idx >= final_seeds.len() {
                 continue;
             }
-            let hash16 = (h32 & 0xFFFF) as u64;
-            let seed = (hash16 << 48) | ((rid as u64) << 32) | (p as u64);
+            // u128 layout: [Hash: 64 bits] | [RID: 32 bits] | [Pos: 32 bits]
+            let seed: u128 = ((h as u128) << 64) | ((rid as u128) << 32) | (p as u128);
             final_seeds[idx] = seed;
             write_offsets[bucket] += 1;
         }
@@ -773,17 +773,20 @@ where
             final_seeds.len()
         };
         if start < end && end <= final_seeds.len() {
-            final_seeds[start..end].sort_unstable_by_key(|s| s >> 48);
+            // Sort by the full 64-bit hash (top 64 bits of u128)
+            final_seeds[start..end].sort_unstable_by_key(|s| s >> 64);
         }
     }
 
     eprintln!("  Index built: {} seeds", final_seeds.len());
 
+    // seed_counts now stores: [hash_high32: 32 bits] | [count: 32 bits] for binary search
+    // We use the top 32 bits of the 64-bit hash as key
     let mut seed_counts: Vec<u64> = counts
         .iter()
-        .map(|(&h, &c)| ((h as u64) << 32) | (c as u64))
+        .map(|(&h, &c)| ((h >> 32) << 32) | (c as u64))
         .collect();
-    seed_counts.sort_unstable_by_key(|v| v & 0xFFFF_FFFF_0000_0000);
+    seed_counts.sort_unstable_by_key(|v| v >> 32);
 
     Ok(Index {
         offsets,
@@ -806,7 +809,7 @@ pub struct Hit {
 }
 
 pub struct State {
-    pub mins: Vec<(u32, u32, bool)>,
+    pub mins: Vec<(u64, u32, bool)>,
     pub candidates: Vec<Hit>,
 }
 
@@ -826,7 +829,7 @@ fn base_to_index(b: u8) -> Option<usize> {
 }
 
 #[inline(always)]
-pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
+pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u64, u32, bool)>) {
     out.clear();
     if seq.len() < HASH_WINDOW || HASH_WINDOW == 0 || SYNC_S > HASH_WINDOW {
         return;
@@ -868,20 +871,32 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
         ambig_buf_s[s_slot] = ambig;
         ambig_s += ambig as i32 - prev_ambig_s as i32;
 
+        // Forward hash: rotate left then XOR
         if i + 1 <= HASH_WINDOW {
             h_k = h_k.rotate_left(ROT) ^ BASES[base_idx];
-            h_k_rc = h_k_rc.rotate_right(ROT) ^ BASES[rc_idx];
         } else {
             h_k = h_k.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx_k];
-            h_k_rc = h_k_rc.rotate_right(ROT) ^ BASES[rc_idx] ^ REMOVE_RC[3 - prev_idx_k];
+        }
+        
+        // RC hash: for RC, we need to rotate the accumulator right, then XOR with RC base
+        // The removal must also account for the rotation of the old base
+        if i + 1 <= HASH_WINDOW {
+            h_k_rc = (h_k_rc ^ BASES[rc_idx]).rotate_right(ROT);
+        } else {
+            h_k_rc = (h_k_rc ^ BASES[rc_idx] ^ REMOVE_RC[3 - prev_idx_k]).rotate_right(ROT);
+        }
+
+        // Same for s-mer hashes
+        if i + 1 <= SYNC_S {
+            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx];
+        } else {
+            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE_S[prev_idx_s];
         }
 
         if i + 1 <= SYNC_S {
-            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx];
-            h_s_rc = h_s_rc.rotate_right(ROT) ^ BASES[rc_idx];
+            h_s_rc = (h_s_rc ^ BASES[rc_idx]).rotate_right(ROT);
         } else {
-            h_s = h_s.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE_S[prev_idx_s];
-            h_s_rc = h_s_rc.rotate_right(ROT) ^ BASES[rc_idx] ^ REMOVE_S_RC[3 - prev_idx_s];
+            h_s_rc = (h_s_rc ^ BASES[rc_idx] ^ REMOVE_S_RC[3 - prev_idx_s]).rotate_right(ROT);
         }
 
         if i + 1 >= SYNC_S && ambig_s == 0 {
@@ -947,7 +962,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
                 let is_closed = s_min_pos == k_pos || s_min_pos == max_pos;
                 if is_closed {
                     if out.last().map(|&(_, p, _)| p) != Some(k_pos) {
-                        out.push((canonical_k as u32, k_pos, is_rev));
+                        out.push((canonical_k, k_pos, is_rev));
                     }
                 }
             }
@@ -958,9 +973,9 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
 #[inline(always)]
 fn collect_candidates<I: IndexLike>(
     idx: &I,
-    mins: &[(u32, u32, bool)],
+    mins: &[(u64, u32, bool)],
     max_hits: usize,
-    seedmask_threshold: u32,
+    seedmask_threshold: u64,
     out: &mut Vec<Hit>,
 ) -> bool {
     let offsets = idx.offsets();
@@ -968,6 +983,7 @@ fn collect_candidates<I: IndexLike>(
     let mut capped = false;
     
     for &(h, r_pos, is_rev) in mins {
+        // Use top RADIX bits for bucket
         let bucket = (h >> SHIFT) as usize;
         
         if bucket >= offsets.len() {
@@ -987,15 +1003,17 @@ fn collect_candidates<I: IndexLike>(
         
         if seedmask_threshold > 0 {
             let c = idx.seed_count(h);
-            if c >= seedmask_threshold {
+            if c as u64 >= seedmask_threshold {
                 continue;
             }
         }
 
-        let target_hash = (h & 0xFFFF) as u64;
+        // Full 64-bit hash for comparison
+        let target_hash = h as u128;
         let bucket_seeds = &seeds[start..end];
 
-        let pos = bucket_seeds.partition_point(|&s| (s >> 48) < target_hash);
+        // Binary search on top 64 bits of u128 seed
+        let pos = bucket_seeds.partition_point(|&s| (s >> 64) < target_hash);
         if pos >= bucket_seeds.len() {
             continue;
         }
@@ -1004,7 +1022,7 @@ fn collect_candidates<I: IndexLike>(
         let mut idx_in_bucket = pos;
         while idx_in_bucket < bucket_seeds.len() {
             let seed = bucket_seeds[idx_in_bucket];
-            let seed_hash = seed >> 48;
+            let seed_hash = seed >> 64;
             if seed_hash != target_hash {
                 break;
             }
@@ -1013,8 +1031,10 @@ fn collect_candidates<I: IndexLike>(
                 break;
             }
 
-            let ref_id = ((seed >> 32) & 0xFFFF) as u32;
-            let ref_pos = (seed & 0xFFFFFFFF) as u32;
+            // Extract RID and Pos from lower 64 bits
+            let lower64 = seed as u64;
+            let ref_id = (lower64 >> 32) as u32;
+            let ref_pos = (lower64 & 0xFFFFFFFF) as u32;
             let id_strand = (ref_id << 1) | (if is_rev { 1 } else { 0 });
             let diag = (ref_pos as i32).wrapping_sub(r_pos as i32);
 
@@ -1491,7 +1511,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         if total == 0 {
             0
         } else {
-            ((total as f64) * (cfg.seedmask_pct as f64)).ceil() as u32
+            ((total as f64) * (cfg.seedmask_pct as f64)).ceil() as u64
         }
     } else {
         0
@@ -1499,7 +1519,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let mut capped = false;
     let mut second_failed = false;
 
-    let mut tmp_mins: Vec<(u32, u32, bool)> = Vec::with_capacity(mins.capacity());
+    let mut tmp_mins: Vec<(u64, u32, bool)> = Vec::with_capacity(mins.capacity());
 
     get_syncmers(seq, &mut tmp_mins);
     mins.clear();
