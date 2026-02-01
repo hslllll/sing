@@ -45,8 +45,8 @@ pub static CONFIG: Config = Config {
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    max_seed_occ: 500,
-    max_candidates: 5000,
+    max_seed_occ: 100, // maximum occurrences of a seed to be used in genome
+    max_candidates: 5000, // maximum number of candidate hits to consider per read
     pair_max_dist: 1000,
     maxindel: 15,
     min_seeds: 2,
