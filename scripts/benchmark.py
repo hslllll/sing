@@ -107,14 +107,40 @@ def ensure_filtered_ref(ref_decomp: Path) -> Path:
 
 
 def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
+    sam_path = out_bam.with_suffix(".sam")
     unsorted = out_bam.with_suffix(".unsorted.bam")
+    time_log = out_bam.with_suffix(".time.log")
     start = time.perf_counter()
-    mapper = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-    view = subprocess.run(["samtools", "view", "-b", "-o", str(unsorted), "-"], stdin=mapper.stdout)
-    mapper.stdout.close()
-    mapper_ret = mapper.wait()
-    if mapper_ret != 0 or view.returncode != 0:
-        return None
+    elapsed = None
+    mem_kb = None
+
+    time_bin = Path("/usr/bin/time")
+    # Prefer /usr/bin/time to capture peak memory; fall back to manual timing if unavailable.
+    if time_bin.exists():
+        with sam_path.open("w") as sam_out:
+            mapper = subprocess.run(
+                [str(time_bin), "-f", "%e %M", "-o", str(time_log), *cmd],
+                stdout=sam_out,
+            )
+        if mapper.returncode != 0:
+            return None, None
+        log_parts = time_log.read_text().strip().split()
+        if len(log_parts) == 2:
+            elapsed = float(log_parts[0])
+            try:
+                mem_kb = int(float(log_parts[1]))
+            except ValueError:
+                mem_kb = None
+    else:
+        with sam_path.open("w") as sam_out:
+            mapper = subprocess.run(cmd, stdout=sam_out)
+        if mapper.returncode != 0:
+            return None, None
+        elapsed = time.perf_counter() - start
+
+    view = subprocess.run(["samtools", "view", "-b", "-o", str(unsorted), str(sam_path)])
+    if view.returncode != 0:
+        return None, None
 
     sort_threads = max(1, min(threads, 8))
     sort_mem = os.environ.get("SAMTOOLS_SORT_MEM", "512M")
@@ -136,8 +162,11 @@ def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
     ])
     run(["samtools", "index", "-@", str(sort_threads), str(out_bam)])
     unsorted.unlink(missing_ok=True)
-    elapsed = time.perf_counter() - start
-    return elapsed
+    sam_path.unlink(missing_ok=True)
+    time_log.unlink(missing_ok=True)
+    if elapsed is None:
+        elapsed = time.perf_counter() - start
+    return elapsed, mem_kb
 
 
 def parse_dwgsim_qname(qname):
@@ -242,7 +271,7 @@ def benchmark_all(mode, threads_override):
 
     output_csv = Path(f"benchmark_results_f1.{mode}.csv")
     if not output_csv.exists():
-        output_csv.write_text("Exp_ID,Tool,Time_ms,TotalReads,TP,FP,FN,Precision,Recall,F1,Mode\n")
+        output_csv.write_text("Exp_ID,Tool,Time_ms,Mem_kb,TotalReads,TP,FP,FN,Precision,Recall,F1,Mode\n")
 
     workdir = Path(f"bench_all_{mode}")
     ensure_dir(workdir)
@@ -269,14 +298,17 @@ def benchmark_all(mode, threads_override):
 
             bam_paths = {}
             times_ms = {}
+            mem_kb_map = {}
             for tool, cmd in tool_cmds.items():
                 bam_path = workdir / f"{tool.lower().replace('-', '')}.bam"
                 print(f"Running {tool}...")
-                elapsed = run_mapper_to_sorted_bam(cmd, bam_path, threads)
+                elapsed, mem_kb = run_mapper_to_sorted_bam(cmd, bam_path, threads)
                 if elapsed is None:
                     times_ms[tool] = "N/A"
+                    mem_kb_map[tool] = "N/A"
                 else:
                     times_ms[tool] = int(elapsed * 1000)
+                    mem_kb_map[tool] = mem_kb if mem_kb is not None else "N/A"
                 bam_paths[tool] = bam_path
 
             truth_dict, tool_results = load_bams_and_build_truth(bam_paths)
@@ -285,20 +317,20 @@ def benchmark_all(mode, threads_override):
             for tool in ["Minimap2", "BWA-MEM2", "Sing", "Bowtie2"]:
                 if tool in tool_results and len(tool_results[tool]) > 0:
                     tp, fp, fn, prec, rec, f1 = calculate_metrics(truth_dict, tool_results[tool])
-                    csv_line = f"{exp_id},{tool},{times_ms[tool]},{total_reads},{tp},{fp},{fn},{prec:.4f},{rec:.4f},{f1:.4f},{mode}"
+                    csv_line = f"{exp_id},{tool},{times_ms[tool]},{mem_kb_map[tool]},{total_reads},{tp},{fp},{fn},{prec:.4f},{rec:.4f},{f1:.4f},{mode}"
                 else:
-                    csv_line = f"{exp_id},{tool},{times_ms[tool]},{total_reads},0,0,0,0,0,0,{mode}"
+                    csv_line = f"{exp_id},{tool},{times_ms[tool]},{mem_kb_map[tool]},{total_reads},0,0,0,0,0,0,{mode}"
                 with output_csv.open("a") as f:
                     f.write(csv_line + "\n")
 
             print("\n--- Summary (ALL) ---")
-            print("Tool        | Time_ms | Precision | Recall   | F1")
+            print("Tool        | Time_ms | Mem_KB  | Precision | Recall   | F1")
             for tool in ["Minimap2", "BWA-MEM2", "Sing", "Bowtie2"]:
                 if tool in tool_results and len(tool_results[tool]) > 0:
                     tp, fp, fn, prec, rec, f1 = calculate_metrics(truth_dict, tool_results[tool])
-                    print(f"{tool:<10} | {times_ms[tool]:<7} | {prec:6.2f}%   | {rec:6.2f}%   | {f1:6.2f}")
+                    print(f"{tool:<10} | {times_ms[tool]:<7} | {mem_kb_map[tool]:<7} | {prec:6.2f}%   | {rec:6.2f}%   | {f1:6.2f}")
                 else:
-                    print(f"{tool:<10} | {times_ms[tool]:<7} | FAILED")
+                    print(f"{tool:<10} | {times_ms[tool]:<7} | {mem_kb_map[tool]:<7} | FAILED")
 
             for bam in bam_paths.values():
                 bam.unlink(missing_ok=True)
@@ -336,7 +368,7 @@ def benchmark_minimap(mode, threads_override):
 
     output_csv = Path(f"benchmark_results_minimap_comparision.{mode}.csv")
     if not output_csv.exists():
-        output_csv.write_text("Exp_ID,Tool,Time_ms,TotalReads,TP,FP,FN,Precision,Recall,F1,Mode\n")
+        output_csv.write_text("Exp_ID,Tool,Time_ms,Mem_kb,TotalReads,TP,FP,FN,Precision,Recall,F1,Mode\n")
 
     workdir = Path(f"bench_minimap_{mode}")
     ensure_dir(workdir)
@@ -360,14 +392,17 @@ def benchmark_minimap(mode, threads_override):
 
         bam_paths = {}
         times_ms = {}
+        mem_kb_map = {}
         for tool, cmd in tool_cmds.items():
             bam_path = workdir / f"{tool.lower().replace('-', '')}.bam"
             print(f"Running {tool}...")
-            elapsed = run_mapper_to_sorted_bam(cmd, bam_path, threads)
+            elapsed, mem_kb = run_mapper_to_sorted_bam(cmd, bam_path, threads)
             if elapsed is None:
                 times_ms[tool] = "N/A"
+                mem_kb_map[tool] = "N/A"
             else:
                 times_ms[tool] = int(elapsed * 1000)
+                mem_kb_map[tool] = mem_kb if mem_kb is not None else "N/A"
             bam_paths[tool] = bam_path
 
         truth_dict, tool_results = load_bams_and_build_truth(bam_paths)
@@ -376,20 +411,20 @@ def benchmark_minimap(mode, threads_override):
         for tool in ["Minimap2", "Sing"]:
             if tool in tool_results and len(tool_results[tool]) > 0:
                 tp, fp, fn, prec, rec, f1 = calculate_metrics(truth_dict, tool_results[tool])
-                csv_line = f"{exp_id},{tool},{times_ms[tool]},{total_reads},{tp},{fp},{fn},{prec:.4f},{rec:.4f},{f1:.4f},{mode}"
+                csv_line = f"{exp_id},{tool},{times_ms[tool]},{mem_kb_map[tool]},{total_reads},{tp},{fp},{fn},{prec:.4f},{rec:.4f},{f1:.4f},{mode}"
             else:
-                csv_line = f"{exp_id},{tool},{times_ms[tool]},{total_reads},0,0,0,0,0,0,{mode}"
+                csv_line = f"{exp_id},{tool},{times_ms[tool]},{mem_kb_map[tool]},{total_reads},0,0,0,0,0,0,{mode}"
             with output_csv.open("a") as f:
                 f.write(csv_line + "\n")
 
         print("\n--- Summary (MINIMAP) ---")
-        print("Tool        | Time_ms | Precision | Recall   | F1")
+        print("Tool        | Time_ms | Mem_KB  | Precision | Recall   | F1")
         for tool in ["Minimap2", "Sing"]:
             if tool in tool_results and len(tool_results[tool]) > 0:
                 tp, fp, fn, prec, rec, f1 = calculate_metrics(truth_dict, tool_results[tool])
-                print(f"{tool:<10} | {times_ms[tool]:<7} | {prec:6.2f}%   | {rec:6.2f}%   | {f1:6.2f}")
+                print(f"{tool:<10} | {times_ms[tool]:<7} | {mem_kb_map[tool]:<7} | {prec:6.2f}%   | {rec:6.2f}%   | {f1:6.2f}")
             else:
-                print(f"{tool:<10} | {times_ms[tool]:<7} | FAILED")
+                print(f"{tool:<10} | {times_ms[tool]:<7} | {mem_kb_map[tool]:<7} | FAILED")
 
         for bam in bam_paths.values():
             bam.unlink(missing_ok=True)
@@ -426,7 +461,7 @@ def benchmark_strobe(mode, threads_override):
     threads = threads_override
 
     output_csv = Path(f"benchmark_results_custom.{mode}.csv")
-    output_csv.write_text("Experiment,Tool,Time_sec,Precision,Recall,F1\n")
+    output_csv.write_text("Experiment,Tool,Time_sec,Mem_kb,Precision,Recall,F1\n")
 
     workdir = Path(f"bench_strobe_{mode}")
     ensure_dir(workdir)
@@ -450,14 +485,17 @@ def benchmark_strobe(mode, threads_override):
 
         bam_paths = {}
         times_sec = {}
+        mem_kb_map = {}
         for tool, cmd in tool_cmds.items():
             bam_path = workdir / f"{tool.lower()}.bam"
             print(f"Running {tool}...")
-            elapsed = run_mapper_to_sorted_bam(cmd, bam_path, threads)
+            elapsed, mem_kb = run_mapper_to_sorted_bam(cmd, bam_path, threads)
             if elapsed is None:
                 times_sec[tool] = "N/A"
+                mem_kb_map[tool] = "N/A"
             else:
                 times_sec[tool] = f"{elapsed:.2f}"
+                mem_kb_map[tool] = mem_kb if mem_kb is not None else "N/A"
             bam_paths[tool] = bam_path
 
         truth_dict, tool_results = load_bams_and_build_truth(bam_paths)
@@ -465,20 +503,20 @@ def benchmark_strobe(mode, threads_override):
         for tool in ["Sing", "Strobealign"]:
             if tool in tool_results and len(tool_results[tool]) > 0:
                 tp, fp, fn, prec, rec, f1 = calculate_metrics(truth_dict, tool_results[tool])
-                csv_line = f"{exp_id},{tool},{times_sec[tool]},{prec:.4f},{rec:.4f},{f1:.4f}"
+                csv_line = f"{exp_id},{tool},{times_sec[tool]},{mem_kb_map[tool]},{prec:.4f},{rec:.4f},{f1:.4f}"
             else:
-                csv_line = f"{exp_id},{tool},{times_sec[tool]},0,0,0"
+                csv_line = f"{exp_id},{tool},{times_sec[tool]},{mem_kb_map[tool]},0,0,0"
             with output_csv.open("a") as f:
                 f.write(csv_line + "\n")
 
         print("\n--- Summary (STROBE) ---")
-        print("Tool        | Time_sec | Precision | Recall   | F1")
+        print("Tool        | Time_sec | Mem_KB  | Precision | Recall   | F1")
         for tool in ["Sing", "Strobealign"]:
             if tool in tool_results and len(tool_results[tool]) > 0:
                 tp, fp, fn, prec, rec, f1 = calculate_metrics(truth_dict, tool_results[tool])
-                print(f"{tool:<10} | {times_sec[tool]:<8} | {prec:6.2f}%   | {rec:6.2f}%   | {f1:6.2f}")
+                print(f"{tool:<10} | {times_sec[tool]:<8} | {mem_kb_map[tool]:<7} | {prec:6.2f}%   | {rec:6.2f}%   | {f1:6.2f}")
             else:
-                print(f"{tool:<10} | {times_sec[tool]:<8} | FAILED")
+                print(f"{tool:<10} | {times_sec[tool]:<8} | {mem_kb_map[tool]:<7} | FAILED")
 
         for bam in bam_paths.values():
             bam.unlink(missing_ok=True)
@@ -573,7 +611,7 @@ def benchmark_gatk(mode, threads_override):
         seconds_map[tool] = read_time
         mem_map[tool] = read_mem
         sam = out_dir / f"{tool}.sam"
-        run(["samtools", "view", "-b", "-o", str(out_dir / f"{tool}.unsorted.bam"), str(sam)])
+        run(["samtools", "view", "-b", "-@", "4", "-o", str(out_dir / f"{tool}.unsorted.bam"), str(sam)])
         run(["samtools", "sort", "-@", str(threads), "-O", "BAM", "-o", str(bam), str(out_dir / f"{tool}.unsorted.bam")])
         run(["samtools", "index", "-@", str(threads), str(bam)])
         (out_dir / f"{tool}.unsorted.bam").unlink(missing_ok=True)
