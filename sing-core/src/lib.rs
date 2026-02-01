@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
 use memmap2::MmapOptions;
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -691,19 +692,9 @@ where
     I: IntoIterator<Item = (S, Vec<u8>)>,
     S: Into<String>,
 {
-    let mut ref_seqs = Vec::new();
-    let mut ref_names = Vec::new();
-
-    let mut total_bases: u64 = 0;
-    let mut total_seed_occurrences: u64 = 0;
-    let mut mins = Vec::with_capacity(1024);
-    let mut counts: HashMap<u32, u16> = HashMap::new();
-
-    eprintln!("Building streaming index...");
-
+    let mut all_refs: Vec<(String, Vec<u8>)> = Vec::new();
     for (name, seq) in records.into_iter() {
         let name: String = name.into();
-
         if seq.len() >= (1usize << POS_BITS) {
             panic!(
                 "reference {} length {} exceeds limit {}",
@@ -712,14 +703,31 @@ where
                 1usize << POS_BITS
             );
         }
-        if ref_seqs.len() >= (1usize << RID_BITS) {
-            panic!(
-                "reference count {} exceeds limit {}",
-                ref_seqs.len() + 1,
-                1usize << RID_BITS
-            );
-        }
+        all_refs.push((name, seq));
+    }
 
+    let limit = 1usize << RID_BITS;
+    if all_refs.len() > limit {
+        eprintln!(
+            "  Reference count {} exceeds {}; keeping longest {}",
+            all_refs.len(),
+            limit,
+            limit
+        );
+        all_refs.sort_by_key(|(_, seq)| Reverse(seq.len()));
+        all_refs.truncate(limit);
+    }
+
+    let mut ref_seqs = Vec::with_capacity(all_refs.len());
+    let mut ref_names = Vec::with_capacity(all_refs.len());
+    let mut total_bases: u64 = 0;
+    let mut total_seed_occurrences: u64 = 0;
+    let mut mins = Vec::with_capacity(1024);
+    let mut counts: HashMap<u32, u16> = HashMap::new();
+
+    eprintln!("Building streaming index...");
+
+    for (name, seq) in all_refs.into_iter() {
         ref_names.push(name);
         total_bases += seq.len() as u64;
         get_syncmers(&seq, &mut mins);
