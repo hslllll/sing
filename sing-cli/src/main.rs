@@ -2,8 +2,9 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
+use crossbeam::thread as crossbeam_thread;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use needletail::parse_fastx_file;
 use sing_core::{
@@ -14,7 +15,6 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
 
 const PROG_NAME: &str = env!("CARGO_PKG_NAME");
 const PROG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
             
             let reader_threads = (r1.len()*2).max(1);
             
-            let batch_size = reader_threads * 512;
+            let batch_size = reader_threads * 1024;
 
             eprintln!("Loading index from {:?}...", index);
             let idx = Arc::new(load_index(&index)?);
@@ -131,235 +131,300 @@ fn main() -> Result<()> {
             let (tx, rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(channel_cap);
             let (recycle_tx, recycle_rx): (Sender<ReadBatch>, Receiver<ReadBatch>) = bounded(channel_cap);
             let paired_mode = r2.is_some();
-            let mut reader_handles = Vec::new();
 
             eprintln!("Mapping with {} worker threads...", worker_threads);
             let total_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mapped_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-            if paired_mode {
-                let r2 = r2.unwrap();
-                if r1.len() != r2.len() {
-                    bail!("The number of -1 and -2 files must match");
+            let _ = crossbeam_thread::scope(|scope| -> Result<()> {
+                if paired_mode {
+                    let r2 = r2.unwrap();
+                    if r1.len() != r2.len() {
+                        bail!("The number of -1 and -2 files must match");
+                    }
+
+                    let pairs: Vec<(PathBuf, PathBuf)> = r1.into_iter().zip(r2.into_iter()).collect();
+                    let pair_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+                    for _ in 0..reader_threads {
+                        let pairs = pairs.clone();
+                        let pair_idx = pair_idx.clone();
+                        let tx = tx.clone();
+                        let recycle_rx = recycle_rx.clone();
+
+                        scope.spawn(move |_| {
+                            let mut batch = recycle_rx
+                                .try_recv()
+                                .unwrap_or_else(|_| ReadBatch::new(batch_size));
+                            batch.clear();
+                            loop {
+                                let i = pair_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if i >= pairs.len() {
+                                    break;
+                                }
+                                let (r1_path, r2_path) = &pairs[i];
+
+                                let mut r1 = parse_fastx_file(r1_path).unwrap();
+                                let mut r2 = parse_fastx_file(r2_path).unwrap();
+
+                                while let (Some(Ok(rec1)), Some(Ok(rec2))) = (r1.next(), r2.next()) {
+                                    if batch.count >= batch.seqs1.len() {
+                                        batch.seqs1.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                        batch.quals1.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                        batch.seqs2.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                        batch.quals2.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                        batch.names.push(String::with_capacity(100));
+                                    }
+                                    let idx = batch.count;
+                                    let name_str = String::from_utf8_lossy(rec1.id());
+                                    let name_part = name_str.split_whitespace().next().unwrap();
+                                    batch.names[idx].clear();
+                                    batch.names[idx].push_str(name_part);
+                                    if batch.names[idx].ends_with("/1") || batch.names[idx].ends_with("/2") {
+                                        let new_len = batch.names[idx].len() - 2;
+                                        batch.names[idx].truncate(new_len);
+                                    }
+
+                                    batch.seqs1[idx].clear();
+                                    batch.seqs1[idx].extend_from_slice(&rec1.seq());
+                                    batch.quals1[idx].clear();
+                                    if let Some(q) = rec1.qual() {
+                                        batch.quals1[idx].extend_from_slice(q);
+                                    } else {
+                                        batch.quals1[idx].push(b'*');
+                                    }
+
+                                    batch.seqs2[idx].clear();
+                                    batch.seqs2[idx].extend_from_slice(&rec2.seq());
+                                    batch.quals2[idx].clear();
+                                    if let Some(q) = rec2.qual() {
+                                        batch.quals2[idx].extend_from_slice(q);
+                                    } else {
+                                        batch.quals2[idx].push(b'*');
+                                    }
+
+                                    batch.count += 1;
+
+                                    if batch.count >= batch.max_size {
+                                        try_send_retry(&tx, batch);
+                                        batch = recycle_rx
+                                            .try_recv()
+                                            .unwrap_or_else(|_| ReadBatch::new(batch_size));
+                                        batch.clear();
+                                    }
+                                }
+                            }
+                            if batch.count > 0 {
+                                try_send_retry(&tx, batch);
+                            }
+                        });
+                    }
+                } else {
+                    let r1_paths = r1.clone();
+                    let r1_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    for _ in 0..reader_threads {
+                        let r1_paths = r1_paths.clone();
+                        let r1_idx = r1_idx.clone();
+                        let tx = tx.clone();
+                        let recycle_rx = recycle_rx.clone();
+
+                        scope.spawn(move |_| {
+                            let mut batch = recycle_rx
+                                .try_recv()
+                                .unwrap_or_else(|_| ReadBatch::new(batch_size));
+                            batch.clear();
+                            loop {
+                                let i = r1_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if i >= r1_paths.len() {
+                                    break;
+                                }
+                                let r1_path = &r1_paths[i];
+                                let mut r1 = parse_fastx_file(r1_path).unwrap();
+
+                                while let Some(Ok(rec1)) = r1.next() {
+                                    if batch.count >= batch.seqs1.len() {
+                                        batch.seqs1.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                        batch.quals1.push(Vec::with_capacity(MAX_SEQ_LEN));
+                                        batch.seqs2.push(Vec::new());
+                                        batch.quals2.push(Vec::new());
+                                        batch.names.push(String::with_capacity(64));
+                                    }
+                                    let idx = batch.count;
+                                    let name_str = String::from_utf8_lossy(rec1.id());
+                                    let name_part = name_str.split_whitespace().next().unwrap();
+                                    batch.names[idx].clear();
+                                    batch.names[idx].push_str(name_part);
+                                    if batch.names[idx].ends_with("/1") || batch.names[idx].ends_with("/2") {
+                                        let new_len = batch.names[idx].len() - 2;
+                                        batch.names[idx].truncate(new_len);
+                                    }
+
+                                    batch.seqs1[idx].clear();
+                                    batch.seqs1[idx].extend_from_slice(&rec1.seq());
+                                    batch.quals1[idx].clear();
+                                    if let Some(q) = rec1.qual() {
+                                        batch.quals1[idx].extend_from_slice(q);
+                                    } else {
+                                        batch.quals1[idx].push(b'*');
+                                    }
+
+                                    batch.seqs2[idx].clear();
+                                    batch.quals2[idx].clear();
+
+                                    batch.count += 1;
+
+                                    if batch.count >= batch.max_size {
+                                        try_send_retry(&tx, batch);
+                                        batch = recycle_rx
+                                            .try_recv()
+                                            .unwrap_or_else(|_| ReadBatch::new(batch_size));
+                                        batch.clear();
+                                    }
+                                }
+                            }
+                            if batch.count > 0 {
+                                try_send_retry(&tx, batch);
+                            }
+                        });
+                    }
                 }
 
-                let pairs: Vec<(PathBuf, PathBuf)> = r1.into_iter().zip(r2.into_iter()).collect();
-                let pair_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let idx_writer = idx.clone();
 
-                for _ in 0..reader_threads {
-                    let pairs = pairs.clone();
-                    let pair_idx = pair_idx.clone();
-                    let tx = tx.clone();
-                    let recycle_rx = recycle_rx.clone();
+                let mut writer: Box<dyn Write + Send> = match &output {
+                    Some(p) => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p)?)),
+                    None => Box::new(BufWriter::with_capacity(2 * 1024 * 1024, std::io::stdout())),
+                };
 
-                    reader_handles.push(thread::spawn(move || {
-                        let mut batch = recycle_rx
-                            .try_recv()
-                            .unwrap_or_else(|_| ReadBatch::new(batch_size));
-                        batch.clear();
-                        loop {
-                            let i = pair_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= pairs.len() {
-                                break;
-                            }
-                            let (r1_path, r2_path) = &pairs[i];
-
-                            let mut r1 = parse_fastx_file(r1_path).unwrap();
-                            let mut r2 = parse_fastx_file(r2_path).unwrap();
-
-                            while let (Some(Ok(rec1)), Some(Ok(rec2))) = (r1.next(), r2.next()) {
-                                if batch.count >= batch.seqs1.len() {
-                                    batch.seqs1.push(Vec::with_capacity(MAX_SEQ_LEN));
-                                    batch.quals1.push(Vec::with_capacity(MAX_SEQ_LEN));
-                                    batch.seqs2.push(Vec::with_capacity(MAX_SEQ_LEN));
-                                    batch.quals2.push(Vec::with_capacity(MAX_SEQ_LEN));
-                                    batch.names.push(String::with_capacity(100));
-                                }
-                                let idx = batch.count;
-                                let name_str = String::from_utf8_lossy(rec1.id());
-                                let name_part = name_str.split_whitespace().next().unwrap();
-                                batch.names[idx].clear();
-                                batch.names[idx].push_str(name_part);
-                                if batch.names[idx].ends_with("/1") || batch.names[idx].ends_with("/2") {
-                                    let new_len = batch.names[idx].len() - 2;
-                                    batch.names[idx].truncate(new_len);
-                                }
-
-                                batch.seqs1[idx].clear();
-                                batch.seqs1[idx].extend_from_slice(&rec1.seq());
-                                batch.quals1[idx].clear();
-                                if let Some(q) = rec1.qual() {
-                                    batch.quals1[idx].extend_from_slice(q);
-                                } else {
-                                    batch.quals1[idx].push(b'*');
-                                }
-
-                                batch.seqs2[idx].clear();
-                                batch.seqs2[idx].extend_from_slice(&rec2.seq());
-                                batch.quals2[idx].clear();
-                                if let Some(q) = rec2.qual() {
-                                    batch.quals2[idx].extend_from_slice(q);
-                                } else {
-                                    batch.quals2[idx].push(b'*');
-                                }
-
-                                batch.count += 1;
-
-                                if batch.count >= batch.max_size {
-                                    try_send_retry(&tx, batch);
-                                    batch = recycle_rx
-                                        .try_recv()
-                                        .unwrap_or_else(|_| ReadBatch::new(batch_size));
-                                    batch.clear();
-                                }
-                            }
-                        }
-                        if batch.count > 0 {
-                            try_send_retry(&tx, batch);
-                        }
-                    }));
+                writeln!(writer, "@HD\tVN:1.6\tSO:unsorted")?;
+                for i in 0..idx_writer.ref_count() {
+                    let name = idx_writer.ref_name(i);
+                    let seq = idx_writer.ref_seq(i);
+                    writeln!(writer, "@SQ\tSN:{}\tLN:{}", name, seq.len())?;
                 }
-            } else {
-                let r1_paths = r1.clone();
-                let r1_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                for _ in 0..reader_threads {
-                    let r1_paths = r1_paths.clone();
-                    let r1_idx = r1_idx.clone();
-                    let tx = tx.clone();
-                    let recycle_rx = recycle_rx.clone();
+                writeln!(writer, "@RG\tID:sing\tSM:song\tPL:ILLUMINA")?;
+                writeln!(writer, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION)?;
 
-                    reader_handles.push(thread::spawn(move || {
-                        let mut batch = recycle_rx
-                            .try_recv()
-                            .unwrap_or_else(|_| ReadBatch::new(batch_size));
-                        batch.clear();
-                        loop {
-                            let i = r1_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= r1_paths.len() {
-                                break;
-                            }
-                            let r1_path = &r1_paths[i];
-                            let mut r1 = parse_fastx_file(r1_path).unwrap();
+                let writer_queue_cap = worker_threads * 64;
+                let (wtx, wrx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(writer_queue_cap);
+                let (recycle_out_tx, recycle_out_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(writer_queue_cap);
+                scope.spawn(move |_| {
+                    let mut out = writer;
+                    while let Ok(mut chunk) = wrx.recv() {
+                        out.write_all(&chunk).unwrap();
+                        chunk.clear();
+                        let _ = recycle_out_tx.try_send(chunk);
+                    }
+                    out.flush().unwrap();
+                });
 
-                            while let Some(Ok(rec1)) = r1.next() {
-                                if batch.count >= batch.seqs1.len() {
-                                    batch.seqs1.push(Vec::with_capacity(MAX_SEQ_LEN));
-                                    batch.quals1.push(Vec::with_capacity(MAX_SEQ_LEN));
-                                    batch.seqs2.push(Vec::new());
-                                    batch.quals2.push(Vec::new());
-                                    batch.names.push(String::with_capacity(64));
+                for _ in 0..worker_threads {
+                    let rx = rx.clone();
+                    let recycle_tx = recycle_tx.clone();
+                    let idx = idx.clone();
+                    let total_reads = total_reads.clone();
+                    let mapped_reads = mapped_reads.clone();
+                    let wtx = wtx.clone();
+                    let recycle_out_rx = recycle_out_rx.clone();
+
+                    scope.spawn(move |_| {
+                        let mut state = State::new();
+                        let mut rev_buf = Vec::new();
+                        while let Ok(batch) = rx.recv() {
+                            let mut output_chunk = match recycle_out_rx.try_recv() {
+                                Ok(mut chunk) => {
+                                    chunk.clear();
+                                    chunk
                                 }
-                                let idx = batch.count;
-                                let name_str = String::from_utf8_lossy(rec1.id());
-                                let name_part = name_str.split_whitespace().next().unwrap();
-                                batch.names[idx].clear();
-                                batch.names[idx].push_str(name_part);
-                                if batch.names[idx].ends_with("/1") || batch.names[idx].ends_with("/2") {
-                                    let new_len = batch.names[idx].len() - 2;
-                                    batch.names[idx].truncate(new_len);
-                                }
-
-                                batch.seqs1[idx].clear();
-                                batch.seqs1[idx].extend_from_slice(&rec1.seq());
-                                batch.quals1[idx].clear();
-                                if let Some(q) = rec1.qual() {
-                                    batch.quals1[idx].extend_from_slice(q);
-                                } else {
-                                    batch.quals1[idx].push(b'*');
-                                }
-
-                                batch.seqs2[idx].clear();
-                                batch.quals2[idx].clear();
-
-                                batch.count += 1;
-
-                                if batch.count >= batch.max_size {
-                                    try_send_retry(&tx, batch);
-                                    batch = recycle_rx
-                                        .try_recv()
-                                        .unwrap_or_else(|_| ReadBatch::new(batch_size));
-                                    batch.clear();
-                                }
-                            }
-                        }
-                        if batch.count > 0 {
-                            try_send_retry(&tx, batch);
-                        }
-                    }));
-                }
-            }
-
-            let idx_writer = idx.clone();
-            
-            let mut writer: Box<dyn Write + Send> = match &output {
-                Some(p) => Box::new(BufWriter::with_capacity(4 * 1024 * 1024, File::create(p)?)),
-                None => Box::new(BufWriter::with_capacity(2 * 1024 * 1024, std::io::stdout())),
-            };
-            
-            writeln!(writer, "@HD\tVN:1.6\tSO:unsorted")?;
-            for i in 0..idx_writer.ref_count() {
-                let name = idx_writer.ref_name(i);
-                let seq = idx_writer.ref_seq(i);
-                writeln!(writer, "@SQ\tSN:{}\tLN:{}", name, seq.len())?;
-            }
-            writeln!(writer, "@RG\tID:sing\tSM:song\tPL:ILLUMINA")?;
-            writeln!(writer, "@PG\tID:{}\tPN:{}\tVN:{}", PROG_NAME, PROG_NAME, PROG_VERSION)?;
-
-            let writer_queue_cap = worker_threads * 64;
-            let (wtx, wrx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(writer_queue_cap);
-            let (recycle_out_tx, recycle_out_rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = bounded(writer_queue_cap);
-            let writer_handle = thread::spawn(move || {
-                let mut out = writer;
-                while let Ok(mut chunk) = wrx.recv() {
-                    out.write_all(&chunk).unwrap();
-                    chunk.clear();
-                    let _ = recycle_out_tx.try_send(chunk);
-                }
-                out.flush().unwrap();
-            });
-
-            let mut handles = Vec::new();
-            for _ in 0..worker_threads {
-                let rx = rx.clone();
-                let recycle_tx = recycle_tx.clone();
-                let idx = idx.clone();
-                let total_reads = total_reads.clone();
-                let mapped_reads = mapped_reads.clone();
-                let wtx = wtx.clone();
-                let recycle_out_rx = recycle_out_rx.clone();
-                
-                handles.push(thread::spawn(move || {
-                    let mut state = State::new();
-                    let mut rev_buf = Vec::new();
-                    while let Ok(batch) = rx.recv() {
-                        let mut output_chunk = match recycle_out_rx.try_recv() {
-                            Ok(mut chunk) => {
-                                chunk.clear();
-                                chunk
-                            }
-                            Err(_) => Vec::with_capacity(batch.count * 800),
-                        };
-                        let mut batch_total = 0usize;
-                        let mut batch_mapped = 0usize;
-                        for i in 0..batch.count {
-                            let s1 = &batch.seqs1[i];
-                            let q1 = &batch.quals1[i];
-                            let name = &batch.names[i];
-
-                            let a1_candidates = align(s1, &idx, &mut state, &mut rev_buf);
-                            let is_paired = !batch.seqs2[i].is_empty();
-                            let a2_candidates = if is_paired {
-                                align(&batch.seqs2[i], &idx, &mut state, &mut rev_buf)
-                            } else {
-                                Vec::new()
+                                Err(_) => Vec::with_capacity(batch.count * 800),
                             };
+                            let mut batch_total = 0usize;
+                            let mut batch_mapped = 0usize;
+                            for i in 0..batch.count {
+                                let s1 = &batch.seqs1[i];
+                                let q1 = &batch.quals1[i];
+                                let name = &batch.names[i];
 
-                            let (final_a1, final_a2) = if is_paired {
-                                let mut valid_pairs = Vec::with_capacity(4);
+                                let a1_candidates = align(s1, &idx, &mut state, &mut rev_buf);
+                                let is_paired = !batch.seqs2[i].is_empty();
+                                let a2_candidates = if is_paired {
+                                    align(&batch.seqs2[i], &idx, &mut state, &mut rev_buf)
+                                } else {
+                                    Vec::new()
+                                };
 
-                                for (i, res1) in a1_candidates.iter().enumerate() {
-                                    for (j, res2) in a2_candidates.iter().enumerate() {
-                                        if res1.ref_id == res2.ref_id && res1.is_rev != res2.is_rev {
+                                let (final_a1, final_a2) = if is_paired {
+                                    let mut valid_pairs = Vec::with_capacity(4);
+
+                                    for (i, res1) in a1_candidates.iter().enumerate() {
+                                        for (j, res2) in a2_candidates.iter().enumerate() {
+                                            if res1.ref_id == res2.ref_id && res1.is_rev != res2.is_rev {
+                                                let span1 = cigar_ref_span(&res1.cigar);
+                                                let span2 = cigar_ref_span(&res2.cigar);
+                                                let end1 = res1.pos + span1;
+                                                let end2 = res2.pos + span2;
+                                                let left = res1.pos.min(res2.pos);
+                                                let right = end1.max(end2);
+                                                let dist = right - left;
+
+                                                if dist < CONFIG.pair_max_dist {
+                                                    let score = res1.as_score + res2.as_score;
+                                                    valid_pairs.push((score, i, j));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if !valid_pairs.is_empty() {
+                                        valid_pairs.sort_by(|a, b| b.0.cmp(&a.0));
+                                        let (best_score, i, j) = valid_pairs[0];
+                                        let mut best_res1 = a1_candidates[i].clone();
+                                        let mut best_res2 = a2_candidates[j].clone();
+
+                                        // Set paired flag (0x1) and properly matched pair flag (0x2)
+                                        let mapq = if valid_pairs.len() > 1 {
+                                            let (second_score, _, _) = valid_pairs[1];
+                                            let diff = best_score - second_score;
+                                            if diff > 30 { 60 } else { (diff * 2) as u8 }
+                                        } else {
+                                            60
+                                        };
+
+                                        best_res1.mapq = mapq;
+                                        best_res2.mapq = mapq;
+                                        best_res1.paired = true;
+                                        best_res2.paired = true;
+                                        best_res1.proper_pair = true;
+                                        best_res2.proper_pair = true;
+
+                                        (Some(best_res1), Some(best_res2))
+                                    } else {
+                                        (a1_candidates.first().cloned(), a2_candidates.first().cloned())
+                                    }
+                                } else {
+                                    (a1_candidates.first().cloned(), None)
+                                };
+
+                                let a1 = final_a1;
+                                let a2 = final_a2;
+
+                                batch_total += 1;
+                                if a1.is_some() {
+                                    batch_mapped += 1;
+                                }
+                                if is_paired {
+                                    batch_total += 1;
+                                    if a2.is_some() {
+                                        batch_mapped += 1;
+                                    }
+                                }
+
+                                if is_paired {
+                                    let mut tlen = 0;
+                                    let mut proper_pair = false;
+
+                                    if let (Some(res1), Some(res2)) = (&a1, a2.as_ref()) {
+                                        if res1.ref_id == res2.ref_id {
                                             let span1 = cigar_ref_span(&res1.cigar);
                                             let span2 = cigar_ref_span(&res2.cigar);
                                             let end1 = res1.pos + span1;
@@ -368,132 +433,70 @@ fn main() -> Result<()> {
                                             let right = end1.max(end2);
                                             let dist = right - left;
 
-                                            if dist < CONFIG.pair_max_dist {
-                                                let score = res1.as_score + res2.as_score;
-                                                valid_pairs.push((score, i, j));
+                                            if res1.pos <= res2.pos {
+                                                tlen = dist;
+                                            } else {
+                                                tlen = -dist;
+                                            }
+
+                                            if res1.is_rev != res2.is_rev && dist.abs() < CONFIG.pair_max_dist {
+                                                proper_pair = true;
                                             }
                                         }
                                     }
-                                }
 
-                                if !valid_pairs.is_empty() {
-                                    valid_pairs.sort_by(|a, b| b.0.cmp(&a.0));
-                                    let (best_score, i, j) = valid_pairs[0];
-                                    let mut best_res1 = a1_candidates[i].clone();
-                                    let mut best_res2 = a2_candidates[j].clone();
+                                    let q2 = &batch.quals2[i];
+                                    let s2 = &batch.seqs2[i];
 
-                                    // Set paired flag (0x1) and properly matched pair flag (0x2)
-                                    let mapq = if valid_pairs.len() > 1 {
-                                        let (second_score, _, _) = valid_pairs[1];
-                                        let diff = best_score - second_score;
-                                        if diff > 30 { 60 } else { (diff * 2) as u8 }
-                                    } else {
-                                        60
-                                    };
-                                    
-                                    best_res1.mapq = mapq;
-                                    best_res2.mapq = mapq;
-                                    best_res1.paired = true;
-                                    best_res2.paired = true;
-                                    best_res1.proper_pair = true;
-                                    best_res2.proper_pair = true;
-                                    
-                                    (Some(best_res1), Some(best_res2))
+                                    format_sam(&mut output_chunk, name, s1, q1, &a1, &a2, true, tlen, proper_pair, &idx);
+                                    format_sam(
+                                        &mut output_chunk,
+                                        name,
+                                        s2,
+                                        q2,
+                                        &a2,
+                                        &a1,
+                                        false,
+                                        -tlen,
+                                        proper_pair,
+                                        &idx,
+                                    );
                                 } else {
-                                    (a1_candidates.first().cloned(), a2_candidates.first().cloned())
-                                }
-                            } else {
-                                (a1_candidates.first().cloned(), None)
-                            };
-
-                            let a1 = final_a1;
-                            let a2 = final_a2;
-
-                            batch_total += 1;
-                            if a1.is_some() {
-                                batch_mapped += 1;
-                            }
-                            if is_paired {
-                                batch_total += 1;
-                                if a2.is_some() {
-                                    batch_mapped += 1;
+                                    format_sam_single(&mut output_chunk, name, s1, q1, &a1, &idx);
                                 }
                             }
 
-                            if is_paired {
-                                let mut tlen = 0;
-                                let mut proper_pair = false;
 
-                                if let (Some(res1), Some(res2)) = (&a1, a2.as_ref()) {
-                                    if res1.ref_id == res2.ref_id {
-                                        let span1 = cigar_ref_span(&res1.cigar);
-                                        let span2 = cigar_ref_span(&res2.cigar);
-                                        let end1 = res1.pos + span1;
-                                        let end2 = res2.pos + span2;
-                                        let left = res1.pos.min(res2.pos);
-                                        let right = end1.max(end2);
-                                        let dist = right - left;
-
-                                        if res1.pos <= res2.pos {
-                                            tlen = dist;
-                                        } else {
-                                            tlen = -dist;
-                                        }
-
-                                        if res1.is_rev != res2.is_rev && dist.abs() < CONFIG.pair_max_dist {
-                                            proper_pair = true;
-                                        }
-                                    }
-                                }
-
-                                let q2 = &batch.quals2[i];
-                                let s2 = &batch.seqs2[i];
-
-                                format_sam(&mut output_chunk, name, s1, q1, &a1, &a2, true, tlen, proper_pair, &idx);
-                                format_sam(
-                                    &mut output_chunk,
-                                    name,
-                                    s2,
-                                    q2,
-                                    &a2,
-                                    &a1,
-                                    false,
-                                    -tlen,
-                                    proper_pair,
-                                    &idx,
-                                );
-                            } else {
-                                format_sam_single(&mut output_chunk, name, s1, q1, &a1, &idx);
+                            if batch_total > 0 {
+                                total_reads.fetch_add(batch_total, std::sync::atomic::Ordering::Relaxed);
                             }
-                        }
-                        
-                        
-                        if batch_total > 0 {
-                            total_reads.fetch_add(batch_total, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        if batch_mapped > 0 {
-                            mapped_reads.fetch_add(batch_mapped, std::sync::atomic::Ordering::Relaxed);
-                        }
+                            if batch_mapped > 0 {
+                                mapped_reads.fetch_add(batch_mapped, std::sync::atomic::Ordering::Relaxed);
+                            }
 
-                        let _ = wtx.send(output_chunk);
-                        
-                        try_send_retry(&recycle_tx, batch);
-                    }
-                }));
-            }
+                            let _ = wtx.send(output_chunk);
 
-            for h in reader_handles {
-                h.join().unwrap();
-            }
-            drop(tx);
-            drop(recycle_rx);  
+                            try_send_retry(&recycle_tx, batch);
+                        }
+                    });
+                }
 
-            for h in handles {
-                h.join().unwrap();
-            }
-            drop(recycle_tx);  
-            drop(wtx);
-            writer_handle.join().unwrap();
+                drop(tx);
+                drop(recycle_rx);
+                drop(recycle_tx);
+                drop(wtx);
+
+                Ok(())
+            })
+            .map_err(|e| {
+                if let Some(msg) = e.downcast_ref::<&str>() {
+                    anyhow!("thread panicked: {}", msg)
+                } else if let Some(msg) = e.downcast_ref::<String>() {
+                    anyhow!("thread panicked: {}", msg)
+                } else {
+                    anyhow!("thread panicked")
+                }
+            })?;
 
             let total = total_reads.load(std::sync::atomic::Ordering::Relaxed);
             let mapped = mapped_reads.load(std::sync::atomic::Ordering::Relaxed);
