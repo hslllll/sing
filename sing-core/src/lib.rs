@@ -8,6 +8,19 @@ use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
+// SIMD support detection - disabled for WASM targets
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+use std::arch::x86_64::*;
+
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+fn has_avx2() -> bool {
+    is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(all(target_arch = "x86_64", not(target_family = "wasm"))))]
+#[allow(dead_code)]
+fn has_avx2() -> bool { false }
+
 #[derive(Clone, Copy)]
 pub struct Config {
     pub hash_window: usize,
@@ -806,6 +819,43 @@ fn eq_base(a: u8, b: u8) -> bool {
     (a | 0x20) == (b | 0x20)
 }
 
+// SIMD-accelerated sequence comparison for x86_64
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn simd_cmp_32(a: &[u8], b: &[u8]) -> u32 {
+    unsafe {
+        let case_mask = _mm256_set1_epi8(0x20);
+        let va = _mm256_or_si256(_mm256_loadu_si256(a.as_ptr() as *const __m256i), case_mask);
+        let vb = _mm256_or_si256(_mm256_loadu_si256(b.as_ptr() as *const __m256i), case_mask);
+        let cmp = _mm256_cmpeq_epi8(va, vb);
+        _mm256_movemask_epi8(cmp) as u32
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "sse2")]
+#[inline]
+unsafe fn simd_cmp_16(a: &[u8], b: &[u8]) -> u16 {
+    unsafe {
+        let case_mask = _mm_set1_epi8(0x20);
+        let va = _mm_or_si128(_mm_loadu_si128(a.as_ptr() as *const __m128i), case_mask);
+        let vb = _mm_or_si128(_mm_loadu_si128(b.as_ptr() as *const __m128i), case_mask);
+        let cmp = _mm_cmpeq_epi8(va, vb);
+        _mm_movemask_epi8(cmp) as u16
+    }
+}
+
+// Scalar fallback for WASM and other platforms
+#[inline(always)]
+fn scalar_cmp_8(a: &[u8], b: &[u8]) -> bool {
+    unsafe {
+        let r_val = std::ptr::read_unaligned(a.as_ptr() as *const u64) | CASE_MASK;
+        let g_val = std::ptr::read_unaligned(b.as_ptr() as *const u64) | CASE_MASK;
+        r_val == g_val
+    }
+}
+
 #[inline(always)]
 fn extend_left(read: &[u8], rseq: &[u8], mut rp: usize, mut gp: usize, cfg: &Config) -> (i32, usize, usize, Vec<u32>, usize) {
     let (mut score, mut max_score) = (0i32, 0i32);
@@ -814,18 +864,42 @@ fn extend_left(read: &[u8], rseq: &[u8], mut rp: usize, mut gp: usize, cfg: &Con
     let (mut best_rp, mut best_gp, mut best_cigar_len, mut best_match_run) = (rp, gp, 0, 0);
     let (mut nm, mut best_nm) = (0usize, 0usize);
 
+    // Use SIMD on x86_64 (non-WASM)
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    let use_avx2 = has_avx2();
+    #[cfg(not(all(target_arch = "x86_64", not(target_family = "wasm"))))]
+    let _use_avx2 = false;
+
     while rp > 0 && gp > 0 {
-        if rp >= 8 && gp >= 8 {
-            unsafe {
-                let r_val = std::ptr::read_unaligned(read.as_ptr().add(rp - 8) as *const u64) | CASE_MASK;
-                let g_val = std::ptr::read_unaligned(rseq.as_ptr().add(gp - 8) as *const u64) | CASE_MASK;
-                if r_val == g_val {
-                    score += cfg.match_score * 8; match_run += 8; rp -= 8; gp -= 8;
-                    if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
-                    continue;
-                }
+        // Try 32-byte SIMD comparison (AVX2)
+        #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+        if use_avx2 && rp >= 32 && gp >= 32 {
+            let mask = unsafe { simd_cmp_32(&read[rp - 32..rp], &rseq[gp - 32..gp]) };
+            if mask == 0xFFFFFFFF {
+                score += cfg.match_score * 32; match_run += 32; rp -= 32; gp -= 32;
+                if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
+                continue;
             }
         }
+
+        // Try 16-byte SIMD comparison (SSE2)
+        #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+        if rp >= 16 && gp >= 16 {
+            let mask = unsafe { simd_cmp_16(&read[rp - 16..rp], &rseq[gp - 16..gp]) };
+            if mask == 0xFFFF {
+                score += cfg.match_score * 16; match_run += 16; rp -= 16; gp -= 16;
+                if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
+                continue;
+            }
+        }
+
+        // 8-byte scalar comparison (portable, works on WASM)
+        if rp >= 8 && gp >= 8 && scalar_cmp_8(&read[rp - 8..rp], &rseq[gp - 8..gp]) {
+            score += cfg.match_score * 8; match_run += 8; rp -= 8; gp -= 8;
+            if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
+            continue;
+        }
+
         let (rb, gb) = (read[rp - 1], rseq[gp - 1]);
         if eq_base(rb, gb) { score += cfg.match_score; match_run += 1; rp -= 1; gp -= 1; }
         else {
@@ -860,18 +934,42 @@ fn extend_right(read: &[u8], rseq: &[u8], mut rp: usize, mut gp: usize, cfg: &Co
     let (mut best_rp, mut best_gp, mut best_cigar_len, mut best_match_run) = (rp, gp, 0, 0);
     let (mut nm, mut best_nm) = (0usize, 0usize);
 
+    // Use SIMD on x86_64 (non-WASM)
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    let use_avx2 = has_avx2();
+    #[cfg(not(all(target_arch = "x86_64", not(target_family = "wasm"))))]
+    let _use_avx2 = false;
+
     while rp < rlen && gp < glen {
-        if rlen - rp >= 8 && glen - gp >= 8 {
-            unsafe {
-                let r_val = std::ptr::read_unaligned(read.as_ptr().add(rp) as *const u64) | CASE_MASK;
-                let g_val = std::ptr::read_unaligned(rseq.as_ptr().add(gp) as *const u64) | CASE_MASK;
-                if r_val == g_val {
-                    rp += 8; gp += 8; score += cfg.match_score * 8; match_run += 8;
-                    if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
-                    continue;
-                }
+        // Try 32-byte SIMD comparison (AVX2)
+        #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+        if use_avx2 && rlen - rp >= 32 && glen - gp >= 32 {
+            let mask = unsafe { simd_cmp_32(&read[rp..rp + 32], &rseq[gp..gp + 32]) };
+            if mask == 0xFFFFFFFF {
+                rp += 32; gp += 32; score += cfg.match_score * 32; match_run += 32;
+                if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
+                continue;
             }
         }
+
+        // Try 16-byte SIMD comparison (SSE2)
+        #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+        if rlen - rp >= 16 && glen - gp >= 16 {
+            let mask = unsafe { simd_cmp_16(&read[rp..rp + 16], &rseq[gp..gp + 16]) };
+            if mask == 0xFFFF {
+                rp += 16; gp += 16; score += cfg.match_score * 16; match_run += 16;
+                if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
+                continue;
+            }
+        }
+
+        // 8-byte scalar comparison (portable, works on WASM)
+        if rlen - rp >= 8 && glen - gp >= 8 && scalar_cmp_8(&read[rp..rp + 8], &rseq[gp..gp + 8]) {
+            rp += 8; gp += 8; score += cfg.match_score * 8; match_run += 8;
+            if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
+            continue;
+        }
+
         let (rb, gb) = (read[rp], rseq[gp]);
         if eq_base(rb, gb) { score += cfg.match_score; match_run += 1; rp += 1; gp += 1; }
         else {
