@@ -68,6 +68,10 @@ const fn rot(val: u64, n: u32) -> u64 {
     (val << n) | (val >> (64 - n))
 }
 
+const fn rot_right(val: u64, n: u32) -> u64 {
+    (val >> n) | (val << (64 - n))
+}
+
 const REMOVE: [u64; 4] = [
     rot(BASES[0], (HASH_WINDOW as u32 * ROT) % 64),
     rot(BASES[1], (HASH_WINDOW as u32 * ROT) % 64),
@@ -75,11 +79,25 @@ const REMOVE: [u64; 4] = [
     rot(BASES[3], (HASH_WINDOW as u32 * ROT) % 64),
 ];
 
+const REMOVE_RC: [u64; 4] = [
+    rot_right(BASES[0], (HASH_WINDOW as u32 * ROT) % 64),
+    rot_right(BASES[1], (HASH_WINDOW as u32 * ROT) % 64),
+    rot_right(BASES[2], (HASH_WINDOW as u32 * ROT) % 64),
+    rot_right(BASES[3], (HASH_WINDOW as u32 * ROT) % 64),
+];
+
 const REMOVE_S: [u64; 4] = [
     rot(BASES[0], (SYNC_S as u32 * ROT) % 64),
     rot(BASES[1], (SYNC_S as u32 * ROT) % 64),
     rot(BASES[2], (SYNC_S as u32 * ROT) % 64),
     rot(BASES[3], (SYNC_S as u32 * ROT) % 64),
+];
+
+const REMOVE_S_RC: [u64; 4] = [
+    rot_right(BASES[0], (SYNC_S as u32 * ROT) % 64),
+    rot_right(BASES[1], (SYNC_S as u32 * ROT) % 64),
+    rot_right(BASES[2], (SYNC_S as u32 * ROT) % 64),
+    rot_right(BASES[3], (SYNC_S as u32 * ROT) % 64),
 ];
 
 pub const RADIX: usize = 28;
@@ -669,7 +687,8 @@ where
         get_syncmers(&seq, &mut mins);
         total_seed_occurrences = total_seed_occurrences.saturating_add(mins.len() as u64);
         for &(h, _p, _is_rev) in mins.iter() {
-            let entry = counts.entry(h).or_insert(0);
+            let h32 = h as u32;
+            let entry = counts.entry(h32).or_insert(0);
             if *entry < u16::MAX {
                 *entry += 1;
             }
@@ -705,12 +724,13 @@ where
     for seq in ref_seqs.iter() {
         get_syncmers(seq, &mut mins);
         for &(h, _p, _is_rev) in mins.iter() {
-            let keep = match counts.get(&h) {
+            let h32 = h as u32;
+            let keep = match counts.get(&h32) {
                 Some(&c) => c as usize <= max_hits,
                 None => true,
             };
             if keep {
-                let bucket = (h >> SHIFT) as usize;
+                let bucket = (h32 >> SHIFT) as usize;
                 if bucket < bucket_counts.len() {
                     bucket_counts[bucket] += 1;
                     kept += 1;
@@ -736,14 +756,15 @@ where
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p, _is_rev) in mins.iter() {
-            let keep = match counts.get(&h) {
+            let h32 = h as u32;
+            let keep = match counts.get(&h32) {
                 Some(&c) => c as usize <= max_hits,
                 None => true,
             };
             if !keep {
                 continue;
             }
-            let bucket = (h >> SHIFT) as usize;
+            let bucket = (h32 >> SHIFT) as usize;
             if bucket >= write_offsets.len() {
                 continue;
             }
@@ -751,7 +772,7 @@ where
             if idx >= final_seeds.len() {
                 continue;
             }
-            let hash16 = (h & 0xFFFF) as u64;
+            let hash16 = (h32 & 0xFFFF) as u64;
             let seed = (hash16 << 48) | ((rid as u64) << 32) | (p as u64);
             final_seeds[idx] = seed;
             write_offsets[bucket] += 1;
@@ -799,7 +820,7 @@ pub struct Hit {
 }
 
 pub struct State {
-    pub mins: Vec<(u32, u32, bool)>,
+    pub mins: Vec<(u64, u32, bool)>,
     pub candidates: Vec<Hit>,
 }
 
@@ -819,7 +840,7 @@ fn base_to_index(b: u8) -> Option<usize> {
 }
 
 #[inline(always)]
-pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
+pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u64, u32, bool)>) {
     out.clear();
     if seq.len() < HASH_WINDOW || HASH_WINDOW == 0 || SYNC_S > HASH_WINDOW {
         return;
@@ -863,18 +884,18 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
 
         if i + 1 <= HASH_WINDOW {
             h_k = h_k.rotate_left(ROT) ^ BASES[base_idx];
-            h_k_rc = (BASES[rc_idx]).rotate_right(ROT) ^ h_k_rc;
+            h_k_rc = h_k_rc.rotate_right(ROT) ^ BASES[rc_idx];
         } else {
             h_k = h_k.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE[prev_idx_k];
-            h_k_rc = (BASES[rc_idx] ^ REMOVE[3 - prev_idx_k]).rotate_right(ROT) ^ h_k_rc;
+            h_k_rc = h_k_rc.rotate_right(ROT) ^ BASES[rc_idx] ^ REMOVE_RC[3 - prev_idx_k];
         }
 
         if i + 1 <= SYNC_S {
             h_s = h_s.rotate_left(ROT) ^ BASES[base_idx];
-            h_s_rc = (BASES[rc_idx]).rotate_right(ROT) ^ h_s_rc;
+            h_s_rc = h_s_rc.rotate_right(ROT) ^ BASES[rc_idx];
         } else {
             h_s = h_s.rotate_left(ROT) ^ BASES[base_idx] ^ REMOVE_S[prev_idx_s];
-            h_s_rc = (BASES[rc_idx] ^ REMOVE_S[3 - prev_idx_s]).rotate_right(ROT) ^ h_s_rc;
+            h_s_rc = h_s_rc.rotate_right(ROT) ^ BASES[rc_idx] ^ REMOVE_S_RC[3 - prev_idx_s];
         }
 
         if i + 1 >= SYNC_S && ambig_s == 0 {
@@ -918,15 +939,6 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
                 }
             }
             let max_pos = k_pos + (HASH_WINDOW - SYNC_S) as u32;
-            while s_head < s_queue.len() {
-                let pos = s_queue[s_head].0;
-                if pos < k_pos {
-                    s_head += 1;
-                    break;
-                } else {
-                    break;
-                }
-            }
 
             if s_head >= s_queue.len() {
                 s_queue.clear();
@@ -949,7 +961,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
                 let is_closed = s_min_pos == k_pos || s_min_pos == max_pos;
                 if is_closed {
                     if out.last().map(|&(_, p, _)| p) != Some(k_pos) {
-                        out.push((canonical_k as u32, k_pos, is_rev));
+                        out.push((canonical_k, k_pos, is_rev));
                     }
                 }
             }
@@ -960,7 +972,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u32, u32, bool)>) {
 #[inline(always)]
 fn collect_candidates<I: IndexLike>(
     idx: &I,
-    mins: &[(u32, u32, bool)],
+    mins: &[(u64, u32, bool)],
     max_hits: usize,
     seedmask_threshold: u32,
     out: &mut Vec<Hit>,
@@ -970,7 +982,8 @@ fn collect_candidates<I: IndexLike>(
     let mut capped = false;
     
     for &(h, r_pos, is_rev) in mins {
-        let bucket = (h >> SHIFT) as usize;
+        let h32 = h as u32;
+        let bucket = (h32 >> SHIFT) as usize;
         
         if bucket >= offsets.len() {
             continue;
@@ -988,13 +1001,13 @@ fn collect_candidates<I: IndexLike>(
         }
         
         if seedmask_threshold > 0 {
-            let c = idx.seed_count(h);
+            let c = idx.seed_count(h32);
             if c >= seedmask_threshold {
                 continue;
             }
         }
 
-        let target_hash = (h & 0xFFFF) as u64;
+        let target_hash = (h32 & 0xFFFF) as u64;
         let bucket_seeds = &seeds[start..end];
 
         let pos = bucket_seeds.partition_point(|&s| (s >> 48) < target_hash);
@@ -1501,7 +1514,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let mut capped = false;
     let mut second_failed = false;
 
-    let mut tmp_mins: Vec<(u32, u32, bool)> = Vec::with_capacity(mins.capacity());
+    let mut tmp_mins: Vec<(u64, u32, bool)> = Vec::with_capacity(mins.capacity());
 
     get_syncmers(seq, &mut tmp_mins);
     mins.clear();
