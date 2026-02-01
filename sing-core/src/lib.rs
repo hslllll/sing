@@ -18,7 +18,8 @@ pub struct Config {
     pub gap_open: i32,
     pub gap_ext: i32,
     pub x_drop: i32,
-    pub max_hits_pct: f32,
+    pub hardmask_pct: f32,
+    pub seedmask_pct: f32,
     pub maxindel: usize,
     pub min_identity: f32,
     pub pair_max_dist: i32,
@@ -33,7 +34,8 @@ pub static CONFIG: Config = Config {
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    max_hits_pct: 0.00002,
+    hardmask_pct: 0.003,
+    seedmask_pct: 0.0009,
     pair_max_dist: 1000,
     maxindel: 15,
     min_identity: 0.85,
@@ -91,7 +93,9 @@ pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
     pub genome_size: u64,
-    pub total_seeds: u64,
+    pub max_hits: u32,
+    pub total_seed_occurrences: u64,
+    pub seed_counts: Vec<u64>,
     pub ref_seqs: Vec<Vec<u8>>,
     pub ref_names: Vec<String>,
 }
@@ -100,7 +104,9 @@ pub trait IndexLike {
     fn offsets(&self) -> &[u32];
     fn seeds(&self) -> &[u64];
     fn genome_size(&self) -> u64;
-    fn total_seeds(&self) -> u64;
+    fn max_hits(&self) -> usize;
+    fn total_seed_occurrences(&self) -> u64;
+    fn seed_count(&self, hash: u32) -> u32;
     fn ref_count(&self) -> usize;
     fn ref_seq(&self, id: usize) -> &[u8];
     fn ref_name(&self, id: usize) -> &str;
@@ -170,17 +176,36 @@ impl Index {
             pos = end;
         }
 
-        let total_seeds = if pos + 8 <= data.len() {
-            read_u64(data, &mut pos, "read total_seeds")?
+        let max_hits = if pos + 8 <= data.len() {
+            read_u64(data, &mut pos, "read max_hits")? as u32
         } else {
-            seeds.len() as u64
+            u32::MAX
+        };
+
+        let (total_seed_occurrences, seed_counts) = if pos + 16 <= data.len() {
+            let total = read_u64(data, &mut pos, "read total_seed_occurrences")?;
+            let counts_len = read_u64(data, &mut pos, "read seed_counts len")? as usize;
+            let counts_bytes = counts_len
+                .checked_mul(8)
+                .and_then(|n| pos.checked_add(n))
+                .filter(|&end| end <= data.len())
+                .ok_or_else(|| anyhow::anyhow!("read seed_counts: unexpected EOF"))?;
+            let mut counts = Vec::with_capacity(counts_len);
+            for chunk in data[pos..counts_bytes].chunks_exact(8) {
+                counts.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            (total, counts)
+        } else {
+            (0, Vec::new())
         };
 
         Ok(Index {
             offsets,
             seeds,
             genome_size,
-            total_seeds,
+            max_hits,
+            total_seed_occurrences,
+            seed_counts,
             ref_seqs,
             ref_names,
         })
@@ -238,15 +263,39 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
-        let total_seeds = {
+        let max_hits = {
             let mut buf = [0u8; 8];
-            match r.read(&mut buf).context("read total_seeds")? {
-                0 => seeds.len() as u64,
+            match r.read(&mut buf).context("read max_hits")? {
+                0 => u32::MAX,
                 n if n < 8 => {
-                    r.read_exact(&mut buf[n..]).context("read total_seeds")?;
+                    r.read_exact(&mut buf[n..]).context("read max_hits")?;
+                    u64::from_le_bytes(buf) as u32
+                }
+                _ => u64::from_le_bytes(buf) as u32,
+            }
+        };
+
+        let (total_seed_occurrences, seed_counts) = {
+            let mut buf = [0u8; 8];
+            let total = match r.read(&mut buf).context("read total_seed_occurrences")? {
+                0 => 0,
+                n if n < 8 => {
+                    r.read_exact(&mut buf[n..]).context("read total_seed_occurrences")?;
                     u64::from_le_bytes(buf)
                 }
                 _ => u64::from_le_bytes(buf),
+            };
+            if total == 0 {
+                (0, Vec::new())
+            } else {
+                r.read_exact(&mut buf).context("read seed_counts len")?;
+                let counts_len = u64::from_le_bytes(buf) as usize;
+                let mut counts = Vec::with_capacity(counts_len);
+                for _ in 0..counts_len {
+                    r.read_exact(&mut buf).context("read seed_counts entry")?;
+                    counts.push(u64::from_le_bytes(buf));
+                }
+                (total, counts)
             }
         };
 
@@ -254,7 +303,9 @@ impl Index {
             offsets,
             seeds,
             genome_size,
-            total_seeds,
+            max_hits,
+            total_seed_occurrences,
+            seed_counts,
             ref_seqs,
             ref_names,
         })
@@ -292,7 +343,12 @@ impl Index {
             w.write_all(bytes)?;
         }
 
-        w.write_all(&(self.total_seeds as u64).to_le_bytes())?;
+        w.write_all(&(self.max_hits as u64).to_le_bytes())?;
+        w.write_all(&self.total_seed_occurrences.to_le_bytes())?;
+        w.write_all(&(self.seed_counts.len() as u64).to_le_bytes())?;
+        for v in &self.seed_counts {
+            w.write_all(&v.to_le_bytes())?;
+        }
 
         Ok(())
     }
@@ -311,8 +367,20 @@ impl IndexLike for Index {
         self.genome_size
     }
 
-    fn total_seeds(&self) -> u64 {
-        self.total_seeds
+    fn max_hits(&self) -> usize {
+        self.max_hits as usize
+    }
+
+    fn total_seed_occurrences(&self) -> u64 {
+        self.total_seed_occurrences
+    }
+
+    fn seed_count(&self, hash: u32) -> u32 {
+        let key = (hash as u64) << 32;
+        match self.seed_counts.binary_search_by_key(&key, |v| v & 0xFFFF_FFFF_0000_0000) {
+            Ok(idx) => (self.seed_counts[idx] & 0xFFFF_FFFF) as u32,
+            Err(_) => 0,
+        }
     }
 
     fn ref_count(&self) -> usize {
@@ -348,7 +416,9 @@ pub struct MemoryIndex {
     seeds_ptr: *const u64,
     seeds_len: usize,
     genome_size: u64,
-    total_seeds: u64,
+    max_hits: u32,
+    total_seed_occurrences: u64,
+    seed_counts: Vec<u64>,
     ref_seq_ranges: Vec<Range<usize>>,
     ref_name_ranges: Vec<Range<usize>>,
 }
@@ -442,10 +512,27 @@ impl MemoryIndex {
             pos = end;
         }
 
-        let total_seeds = if pos + 8 <= data.len() {
-            read_u64(data, &mut pos, "read total_seeds")?
+        let max_hits = if pos + 8 <= data.len() {
+            read_u64(data, &mut pos, "read max_hits")? as u32
         } else {
-            seeds_len as u64
+            u32::MAX
+        };
+
+        let (total_seed_occurrences, seed_counts) = if pos + 16 <= data.len() {
+            let total = read_u64(data, &mut pos, "read total_seed_occurrences")?;
+            let counts_len = read_u64(data, &mut pos, "read seed_counts len")? as usize;
+            let counts_bytes = counts_len
+                .checked_mul(8)
+                .and_then(|n| pos.checked_add(n))
+                .filter(|&end| end <= data.len())
+                .ok_or_else(|| anyhow::anyhow!("read seed_counts: unexpected EOF"))?;
+            let mut counts = Vec::with_capacity(counts_len);
+            for chunk in data[pos..counts_bytes].chunks_exact(8) {
+                counts.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            (total, counts)
+        } else {
+            (0, Vec::new())
         };
 
         Ok(Self {
@@ -455,7 +542,9 @@ impl MemoryIndex {
             seeds_ptr,
             seeds_len,
             genome_size,
-            total_seeds,
+            max_hits,
+            total_seed_occurrences,
+            seed_counts,
             ref_seq_ranges,
             ref_name_ranges,
         })
@@ -475,8 +564,23 @@ impl IndexLike for MemoryIndex {
         self.genome_size
     }
 
-    fn total_seeds(&self) -> u64 {
-        self.total_seeds
+    fn max_hits(&self) -> usize {
+        self.max_hits as usize
+    }
+
+    fn total_seed_occurrences(&self) -> u64 {
+        self.total_seed_occurrences
+    }
+
+    fn seed_count(&self, hash: u32) -> u32 {
+        if self.seed_counts.is_empty() {
+            return 0;
+        }
+        let key = (hash as u64) << 32;
+        match self.seed_counts.binary_search_by_key(&key, |v| v & 0xFFFF_FFFF_0000_0000) {
+            Ok(idx) => (self.seed_counts[idx] & 0xFFFF_FFFF) as u32,
+            Err(_) => 0,
+        }
     }
 
     fn ref_count(&self) -> usize {
@@ -508,8 +612,16 @@ impl<T: IndexLike> IndexLike for std::sync::Arc<T> {
         self.as_ref().genome_size()
     }
 
-    fn total_seeds(&self) -> u64 {
-        self.as_ref().total_seeds()
+    fn max_hits(&self) -> usize {
+        self.as_ref().max_hits()
+    }
+
+    fn total_seed_occurrences(&self) -> u64 {
+        self.as_ref().total_seed_occurrences()
+    }
+
+    fn seed_count(&self, hash: u32) -> u32 {
+        self.as_ref().seed_count(hash)
     }
 
     fn ref_count(&self) -> usize {
@@ -570,21 +682,24 @@ where
 
     eprintln!("  Loaded {} bp across {} references", total_bases, ref_seqs.len());
 
-    let mut singleton_hits = 0usize;
+    eprintln!("  Counted {} unique seeds", counts.len());
 
-    counts.retain(|_, val| {
-        let c = *val as usize;
-        if c == 1 {
-            singleton_hits += 1;
-            false
-        } else {
-            true
+    let max_hits = {
+        let pct = CONFIG.hardmask_pct.max(0.0);
+        let pct_hits = ((total_seed_occurrences as f64) * pct as f64).ceil() as usize;
+        let mut value = pct_hits.max(1);
+        if value > u16::MAX as usize {
+            value = u16::MAX as usize;
         }
-    });
+        value
+    };
 
-    eprintln!("  Counted {} unique seeds ({} singletons pruned)", counts.len() + singleton_hits, singleton_hits);
-
-    eprintln!("  Total seed occurrences: {}", total_seed_occurrences);
+    eprintln!(
+        "  Total seed occurrences: {}, max_hits={} (hardmask_pct={:.6})",
+        total_seed_occurrences,
+        max_hits,
+        CONFIG.hardmask_pct
+    );
 
     let mut bucket_counts = vec![0u32; 1 << RADIX];
     let mut kept = 0usize;
@@ -593,7 +708,11 @@ where
     for seq in ref_seqs.iter() {
         get_syncmers(seq, &mut mins);
         for &(h, _p, _is_rev) in mins.iter() {
-            if true {
+            let keep = match counts.get(&h) {
+                Some(&c) => c as usize <= max_hits,
+                None => true,
+            };
+            if keep {
                 let bucket = (h >> SHIFT) as usize;
                 if bucket < bucket_counts.len() {
                     bucket_counts[bucket] += 1;
@@ -620,6 +739,13 @@ where
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p, _is_rev) in mins.iter() {
+            let keep = match counts.get(&h) {
+                Some(&c) => c as usize <= max_hits,
+                None => true,
+            };
+            if !keep {
+                continue;
+            }
             let bucket = (h >> SHIFT) as usize;
             if bucket >= write_offsets.len() {
                 continue;
@@ -647,15 +773,21 @@ where
         }
     }
 
-    drop(counts);
-
     eprintln!("  Index built: {} seeds", final_seeds.len());
+
+    let mut seed_counts: Vec<u64> = counts
+        .iter()
+        .map(|(&h, &c)| ((h as u64) << 32) | (c as u64))
+        .collect();
+    seed_counts.sort_unstable_by_key(|v| v & 0xFFFF_FFFF_0000_0000);
 
     Ok(Index {
         offsets,
         seeds: final_seeds,
         genome_size: total_bases,
-        total_seeds: total_seed_occurrences,
+        max_hits: max_hits as u32,
+        total_seed_occurrences,
+        seed_counts,
         ref_seqs,
         ref_names,
     })
@@ -834,6 +966,7 @@ fn collect_candidates<I: IndexLike>(
     idx: &I,
     mins: &[(u32, u32, bool)],
     max_hits: usize,
+    seedmask_threshold: u32,
     out: &mut Vec<Hit>,
 ) -> bool {
     let offsets = idx.offsets();
@@ -858,6 +991,13 @@ fn collect_candidates<I: IndexLike>(
             continue;
         }
         
+        if seedmask_threshold > 0 {
+            let c = idx.seed_count(h);
+            if c >= seedmask_threshold {
+                continue;
+            }
+        }
+
         let target_hash = (h & 0xFFFF) as u64;
         let bucket_seeds = &seeds[start..end];
 
@@ -1351,14 +1491,16 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let State { mins, candidates } = state;
     let cfg = &CONFIG;
     candidates.clear();
-    let max_hits = {
-        let pct = CONFIG.max_hits_pct.max(0.0);
-        let pct_hits = ((idx.total_seeds() as f64) * pct as f64).ceil() as usize;
-        let mut value = pct_hits.max(1);
-        if value > u16::MAX as usize {
-            value = u16::MAX as usize;
+    let max_hits = idx.max_hits();
+    let seedmask_threshold = if cfg.seedmask_pct > 0.0 {
+        let total = idx.total_seed_occurrences();
+        if total == 0 {
+            0
+        } else {
+            ((total as f64) * (cfg.seedmask_pct as f64)).ceil() as u32
         }
-        value
+    } else {
+        0
     };
     let mut capped = false;
     let mut second_failed = false;
@@ -1374,7 +1516,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     get_syncmers(&rev_seq, &mut tmp_mins);
     mins.extend(tmp_mins.iter().map(|&(h, p, _)| (h, p, true)));
     
-    capped |= collect_candidates(idx, mins, max_hits, candidates);
+    capped |= collect_candidates(idx, mins, max_hits, seedmask_threshold, candidates);
     
     if candidates.is_empty() {
         return Vec::new();
