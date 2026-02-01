@@ -2,7 +2,6 @@ use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
 use memmap2::MmapOptions;
 use std::borrow::Cow;
-use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
@@ -37,7 +36,7 @@ pub static CONFIG: Config = Config {
     seedmask_pct: 0.001,
     pair_max_dist: 1000,
     maxindel: 15,
-    min_identity: 0.85,
+    min_identity: 0.5,
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -101,22 +100,8 @@ const REMOVE_S_RC: [u64; 4] = [
     rot_right(BASES[3], (SYNC_S as u32 * ROT) % 64),
 ];
 
-pub const POS_BITS: usize = 30;
-pub const RID_BITS: usize = 10;
-pub const HASH_BITS: usize = 24;
-
-pub const SHIFT_RID: usize = POS_BITS;
-pub const SHIFT_HASH: usize = POS_BITS + RID_BITS;
-
-pub const RADIX: usize = 12;
-pub const BUCKET_SHIFT: usize = HASH_BITS - RADIX;
-
-pub const POS_MASK: u64 = (1u64 << POS_BITS) - 1;
-pub const RID_MASK: u64 = (1u64 << RID_BITS) - 1;
-pub const HASH_MASK: u64 = (1u64 << HASH_BITS) - 1;
-
-const HASH_MASK_U32: u32 = HASH_MASK as u32;
-const HASH_FIELD_MASK: u64 = HASH_MASK << SHIFT_HASH;
+pub const RADIX: usize = 28;
+pub const SHIFT: usize = 32 - RADIX;
 
 #[derive(Debug, Clone)]
 pub struct Index {
@@ -406,12 +391,9 @@ impl IndexLike for Index {
     }
 
     fn seed_count(&self, hash: u32) -> u32 {
-        let key = ((hash as u64) & HASH_MASK) << SHIFT_HASH;
-        match self
-            .seed_counts
-            .binary_search_by_key(&key, |v| v & HASH_FIELD_MASK)
-        {
-            Ok(idx) => (self.seed_counts[idx] & !HASH_FIELD_MASK) as u32,
+        let key = (hash as u64) << 32;
+        match self.seed_counts.binary_search_by_key(&key, |v| v & 0xFFFF_FFFF_0000_0000) {
+            Ok(idx) => (self.seed_counts[idx] & 0xFFFF_FFFF) as u32,
             Err(_) => 0,
         }
     }
@@ -609,12 +591,9 @@ impl IndexLike for MemoryIndex {
         if self.seed_counts.is_empty() {
             return 0;
         }
-        let key = ((hash as u64) & HASH_MASK) << SHIFT_HASH;
-        match self
-            .seed_counts
-            .binary_search_by_key(&key, |v| v & HASH_FIELD_MASK)
-        {
-            Ok(idx) => (self.seed_counts[idx] & !HASH_FIELD_MASK) as u32,
+        let key = (hash as u64) << 32;
+        match self.seed_counts.binary_search_by_key(&key, |v| v & 0xFFFF_FFFF_0000_0000) {
+            Ok(idx) => (self.seed_counts[idx] & 0xFFFF_FFFF) as u32,
             Err(_) => 0,
         }
     }
@@ -692,34 +671,9 @@ where
     I: IntoIterator<Item = (S, Vec<u8>)>,
     S: Into<String>,
 {
-    let mut all_refs: Vec<(String, Vec<u8>)> = Vec::new();
-    for (name, seq) in records.into_iter() {
-        let name: String = name.into();
-        if seq.len() >= (1usize << POS_BITS) {
-            panic!(
-                "reference {} length {} exceeds limit {}",
-                name,
-                seq.len(),
-                1usize << POS_BITS
-            );
-        }
-        all_refs.push((name, seq));
-    }
+    let mut ref_seqs = Vec::new();
+    let mut ref_names = Vec::new();
 
-    let limit = 1usize << RID_BITS;
-    if all_refs.len() > limit {
-        eprintln!(
-            "  Reference count {} exceeds {}; keeping longest {}",
-            all_refs.len(),
-            limit,
-            limit
-        );
-        all_refs.sort_by_key(|(_, seq)| Reverse(seq.len()));
-        all_refs.truncate(limit);
-    }
-
-    let mut ref_seqs = Vec::with_capacity(all_refs.len());
-    let mut ref_names = Vec::with_capacity(all_refs.len());
     let mut total_bases: u64 = 0;
     let mut total_seed_occurrences: u64 = 0;
     let mut mins = Vec::with_capacity(1024);
@@ -727,14 +681,14 @@ where
 
     eprintln!("Building streaming index...");
 
-    for (name, seq) in all_refs.into_iter() {
-        ref_names.push(name);
+    for (name, seq) in records.into_iter() {
+        ref_names.push(name.into());
         total_bases += seq.len() as u64;
         get_syncmers(&seq, &mut mins);
         total_seed_occurrences = total_seed_occurrences.saturating_add(mins.len() as u64);
         for &(h, _p, _is_rev) in mins.iter() {
-            let h24 = (h as u32) & HASH_MASK_U32;
-            let entry = counts.entry(h24).or_insert(0);
+            let h32 = h as u32;
+            let entry = counts.entry(h32).or_insert(0);
             if *entry < u16::MAX {
                 *entry += 1;
             }
@@ -770,13 +724,13 @@ where
     for seq in ref_seqs.iter() {
         get_syncmers(seq, &mut mins);
         for &(h, _p, _is_rev) in mins.iter() {
-            let hash24 = (h as u32) & HASH_MASK_U32;
-            let keep = match counts.get(&hash24) {
+            let h32 = h as u32;
+            let keep = match counts.get(&h32) {
                 Some(&c) => c as usize <= max_hits,
                 None => true,
             };
             if keep {
-                let bucket = (hash24 >> BUCKET_SHIFT) as usize;
+                let bucket = (h32 >> SHIFT) as usize;
                 if bucket < bucket_counts.len() {
                     bucket_counts[bucket] += 1;
                     kept += 1;
@@ -802,15 +756,15 @@ where
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p, _is_rev) in mins.iter() {
-            let hash24 = (h as u32) & HASH_MASK_U32;
-            let keep = match counts.get(&hash24) {
+            let h32 = h as u32;
+            let keep = match counts.get(&h32) {
                 Some(&c) => c as usize <= max_hits,
                 None => true,
             };
             if !keep {
                 continue;
             }
-            let bucket = (hash24 >> BUCKET_SHIFT) as usize;
+            let bucket = (h32 >> SHIFT) as usize;
             if bucket >= write_offsets.len() {
                 continue;
             }
@@ -818,9 +772,8 @@ where
             if idx >= final_seeds.len() {
                 continue;
             }
-            let seed = ((hash24 as u64) << SHIFT_HASH)
-                | ((rid as u64) << SHIFT_RID)
-                | ((p as u64) & POS_MASK);
+            let hash16 = (h32 & 0xFFFF) as u64;
+            let seed = (hash16 << 48) | ((rid as u64) << 32) | (p as u64);
             final_seeds[idx] = seed;
             write_offsets[bucket] += 1;
         }
@@ -834,7 +787,7 @@ where
             final_seeds.len()
         };
         if start < end && end <= final_seeds.len() {
-            final_seeds[start..end].sort_unstable_by_key(|s| s >> SHIFT_HASH);
+            final_seeds[start..end].sort_unstable_by_key(|s| s >> 48);
         }
     }
 
@@ -842,9 +795,9 @@ where
 
     let mut seed_counts: Vec<u64> = counts
         .iter()
-        .map(|(&h, &c)| (((h as u64) & HASH_MASK) << SHIFT_HASH) | (c as u64))
+        .map(|(&h, &c)| ((h as u64) << 32) | (c as u64))
         .collect();
-    seed_counts.sort_unstable_by_key(|v| v & HASH_FIELD_MASK);
+    seed_counts.sort_unstable_by_key(|v| v & 0xFFFF_FFFF_0000_0000);
 
     Ok(Index {
         offsets,
@@ -1029,8 +982,7 @@ fn collect_candidates<I: IndexLike>(
     let mut capped = false;
     
     for &(h, r_pos, is_rev) in mins {
-        let hash24 = h & HASH_MASK_U32;
-        let bucket = (hash24 >> BUCKET_SHIFT) as usize;
+        let bucket = (h >> SHIFT) as usize;
         
         if bucket >= offsets.len() {
             continue;
@@ -1048,16 +1000,16 @@ fn collect_candidates<I: IndexLike>(
         }
         
         if seedmask_threshold > 0 {
-            let c = idx.seed_count(hash24);
+            let c = idx.seed_count(h);
             if c >= seedmask_threshold {
                 continue;
             }
         }
 
-        let target_hash = (hash24 as u64) & HASH_MASK;
+        let target_hash = (h & 0xFFFF) as u64;
         let bucket_seeds = &seeds[start..end];
 
-        let pos = bucket_seeds.partition_point(|&s| (s >> SHIFT_HASH) < target_hash);
+        let pos = bucket_seeds.partition_point(|&s| (s >> 48) < target_hash);
         if pos >= bucket_seeds.len() {
             continue;
         }
@@ -1066,7 +1018,7 @@ fn collect_candidates<I: IndexLike>(
         let mut idx_in_bucket = pos;
         while idx_in_bucket < bucket_seeds.len() {
             let seed = bucket_seeds[idx_in_bucket];
-            let seed_hash = seed >> SHIFT_HASH;
+            let seed_hash = seed >> 48;
             if seed_hash != target_hash {
                 break;
             }
@@ -1075,8 +1027,8 @@ fn collect_candidates<I: IndexLike>(
                 break;
             }
 
-            let ref_id = ((seed >> SHIFT_RID) & RID_MASK) as u32;
-            let ref_pos = (seed & POS_MASK) as u32;
+            let ref_id = ((seed >> 32) & 0xFFFF) as u32;
+            let ref_pos = (seed & 0xFFFFFFFF) as u32;
             let id_strand = (ref_id << 1) | (if is_rev { 1 } else { 0 });
             let diag = (ref_pos as i32).wrapping_sub(r_pos as i32);
 
