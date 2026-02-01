@@ -25,15 +25,15 @@ pub struct Config {
 }
 
 pub static CONFIG: Config = Config {
-    minimizer_window: 19,
-    hash_window: 16,
-    sync_s: 14,
+    minimizer_window: 20,
+    hash_window: 18,
+    sync_s: 16,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    max_hits: 8000,
+    max_hits: 4000,
     pair_max_dist: 1000,
     maxindel: 15,
     min_identity: 0.85,
@@ -587,6 +587,18 @@ where
         }
     }
 
+    for bucket in 0..offsets.len() {
+        let start = offsets[bucket] as usize;
+        let end = if bucket + 1 < offsets.len() {
+            offsets[bucket + 1] as usize
+        } else {
+            final_seeds.len()
+        };
+        if start < end && end <= final_seeds.len() {
+            final_seeds[start..end].sort_unstable_by_key(|s| s >> 48);
+        }
+    }
+
     drop(counts);
 
     eprintln!("  Index built: {} seeds", final_seeds.len());
@@ -800,11 +812,18 @@ fn collect_candidates<I: IndexLike>(
         let target_hash = (h & 0xFFFF) as u64;
         let bucket_seeds = &seeds[start..end];
 
+        let pos = bucket_seeds.partition_point(|&s| (s >> 48) < target_hash);
+        if pos >= bucket_seeds.len() {
+            continue;
+        }
+
         let mut count = 0;
-        for &seed in bucket_seeds {
+        let mut idx_in_bucket = pos;
+        while idx_in_bucket < bucket_seeds.len() {
+            let seed = bucket_seeds[idx_in_bucket];
             let seed_hash = seed >> 48;
             if seed_hash != target_hash {
-                continue;
+                break;
             }
             if count >= max_hits {
                 capped = true;
@@ -824,6 +843,7 @@ fn collect_candidates<I: IndexLike>(
             });
 
             count += 1;
+            idx_in_bucket += 1;
         }
     }
     
