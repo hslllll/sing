@@ -10,7 +10,6 @@ from pathlib import Path
 
 TOLERANCE = 10
 
-
 def run(cmd, cwd=None, env=None, quiet=False):
     if not quiet:
         print("+", " ".join(cmd))
@@ -107,23 +106,36 @@ def ensure_filtered_ref(ref_decomp: Path) -> Path:
 
 
 def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
-    sam_path = out_bam.with_suffix(".sam")
     unsorted = out_bam.with_suffix(".unsorted.bam")
     time_log = out_bam.with_suffix(".time.log")
-    start = time.perf_counter()
     elapsed = None
     mem_kb = None
+    time_bin = Path("./time")
+    if not time_bin.exists():
+        time_bin = Path("/usr/bin/time")
+    
+    if not time_bin.exists():
+        print(f"Error: {time_bin} not found. installation required.")
+        return None, None
 
-    time_bin = Path("/usr/bin/time")
-    # Prefer /usr/bin/time to capture peak memory; fall back to manual timing if unavailable.
-    if time_bin.exists():
-        with sam_path.open("w") as sam_out:
-            mapper = subprocess.run(
-                [str(time_bin), "-f", "%e %M", "-o", str(time_log), *cmd],
-                stdout=sam_out,
-            )
-        if mapper.returncode != 0:
+    mapper_cmd = [str(time_bin), "-f", "%e %M", "-o", str(time_log)] + cmd
+    print("+", " | ".join([" ".join(mapper_cmd), f"samtools view -b -o {unsorted} -"]))
+    
+    try:
+        p1 = subprocess.Popen(mapper_cmd, stdout=subprocess.PIPE)
+        p2 = subprocess.Popen(["samtools", "view", "-b", "-o", str(unsorted), "-"], stdin=p1.stdout)
+        p1.stdout.close()
+        p2.wait()
+        p1.wait()
+        
+        if p1.returncode != 0 or p2.returncode != 0:
             return None, None
+            
+    except Exception as e:
+        print(f"Pipeline error: {e}")
+        return None, None
+
+    if time_log.exists():
         log_parts = time_log.read_text().strip().split()
         if len(log_parts) == 2:
             elapsed = float(log_parts[0])
@@ -131,17 +143,7 @@ def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
                 mem_kb = int(float(log_parts[1]))
             except ValueError:
                 mem_kb = None
-    else:
-        with sam_path.open("w") as sam_out:
-            mapper = subprocess.run(cmd, stdout=sam_out)
-        if mapper.returncode != 0:
-            return None, None
-        elapsed = time.perf_counter() - start
-
-    view = subprocess.run(["samtools", "view", "-b", "-o", str(unsorted), str(sam_path)])
-    if view.returncode != 0:
-        return None, None
-
+    
     sort_threads = max(1, min(threads, 8))
     sort_mem = os.environ.get("SAMTOOLS_SORT_MEM", "512M")
     tmp_prefix = str(out_bam.with_suffix(""))
@@ -162,7 +164,6 @@ def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
     ])
     run(["samtools", "index", "-@", str(sort_threads), str(out_bam)])
     unsorted.unlink(missing_ok=True)
-    sam_path.unlink(missing_ok=True)
     time_log.unlink(missing_ok=True)
     if elapsed is None:
         elapsed = time.perf_counter() - start
@@ -537,14 +538,17 @@ def benchmark_strobe(mode, threads_override):
 
 
 def run_timed_cmd(label, cmd_str: str, log_path: Path):
-    time_bin = Path("/usr/bin/time")
+    time_bin = Path("./time")
+    if not time_bin.exists():
+        time_bin = Path("/usr/bin/time")
+
     if not time_bin.exists():
         start = time.perf_counter()
         run_shell(cmd_str)
         elapsed = time.perf_counter() - start
         log_path.write_text(f"{elapsed:.2f} 0")
         return
-    run_shell(f"/usr/bin/time -f '%e %M' -o '{log_path}' {cmd_str}")
+    run_shell(f"{time_bin} -f '%e %M' -o '{log_path}' {cmd_str}")
 
 
 def benchmark_gatk(mode, threads_override):
@@ -600,37 +604,31 @@ def benchmark_gatk(mode, threads_override):
     seconds_map = {}
     mem_map = {}
 
-    def map_and_sort(tool, cmd_str: str):
+    def map_and_track(tool, cmd_list):
         bam = out_dir / f"{tool}.bam"
         if bam.exists():
+            # If bam exists, try to recover stats from unsorted log if possible or just skip time
             return
-        elapsed_log = out_dir / f"{tool}.time_log"
-        run_timed_cmd(tool, cmd_str, elapsed_log)
-        read_time, read_mem = elapsed_log.read_text().strip().split()
-        seconds_map[tool] = read_time
-        mem_map[tool] = read_mem
-        sam = out_dir / f"{tool}.sam"
-        run(["samtools", "view", "-b", "-@", "4", "-o", str(out_dir / f"{tool}.unsorted.bam"), str(sam)])
-        run(["samtools", "sort", "-@", str(threads), "-O", "BAM", "-o", str(bam), str(out_dir / f"{tool}.unsorted.bam")])
-        run(["samtools", "index", "-@", str(threads), str(bam)])
-        (out_dir / f"{tool}.unsorted.bam").unlink(missing_ok=True)
-        sam.unlink(missing_ok=True)
+
+        print(f"Running {tool}...")
+        elapsed, mem_kb = run_mapper_to_sorted_bam(cmd_list, bam, threads)
+        
+        if elapsed is not None:
+             seconds_map[tool] = f"{elapsed:.2f}"
+             mem_map[tool] = str(mem_kb) if mem_kb is not None else "N/A"
+        else:
+             seconds_map[tool] = "N/A"
+             mem_map[tool] = "N/A"
 
     if not (out_dir / "sing.bam").exists():
-        map_and_sort(
-            "sing",
-            f"./target/release/sing map -t {threads} {sing_index} -1 {r1} -2 {r2} > {out_dir / 'sing.sam'}",
-        )
+        map_and_track("sing", ["./target/release/sing", "map", "-t", str(threads), str(sing_index), "-1", str(r1), "-2", str(r2)])
+
     if not (out_dir / "bwa.bam").exists():
-        map_and_sort(
-            "bwa",
-            f"bwa-mem2 mem -t {threads} -R '@RG\\tID:bwa\\tSM:{cfg['species']}\\tPL:ILLUMINA' {ref} {r1} {r2} > {out_dir / 'bwa.sam'}",
-        )
+        # Note: No single quotes around RG string in list mode
+        map_and_track("bwa", ["bwa-mem2", "mem", "-t", str(threads), "-R", f"@RG\\tID:bwa\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(ref), str(r1), str(r2)])
+
     if not (out_dir / "mini.bam").exists():
-        map_and_sort(
-            "mini",
-            f"minimap2 -t {threads} -ax sr -R '@RG\\tID:mini\\tSM:{cfg['species']}\\tPL:ILLUMINA' {ref} {r1} {r2} > {out_dir / 'mini.sam'}",
-        )
+        map_and_track("mini", ["minimap2", "-t", str(threads), "-ax", "sr", "-R", f"@RG\\tID:mini\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(ref), str(r1), str(r2)])
 
     dict_path = Path(str(ref).replace(".fa", ".dict"))
     if ref.suffix != ".fa":
