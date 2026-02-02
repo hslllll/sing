@@ -165,8 +165,6 @@ def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
     run(["samtools", "index", "-@", str(sort_threads), str(out_bam)])
     unsorted.unlink(missing_ok=True)
     time_log.unlink(missing_ok=True)
-    if elapsed is None:
-        elapsed = time.perf_counter() - start
     return elapsed, mem_kb
 
 
@@ -543,10 +541,7 @@ def run_timed_cmd(label, cmd_str: str, log_path: Path):
         time_bin = Path("/usr/bin/time")
 
     if not time_bin.exists():
-        start = time.perf_counter()
-        run_shell(cmd_str)
-        elapsed = time.perf_counter() - start
-        log_path.write_text(f"{elapsed:.2f} 0")
+        print(f"Error: {time_bin} not found. installation required.")
         return
     run_shell(f"{time_bin} -f '%e %M' -o '{log_path}' {cmd_str}")
 
