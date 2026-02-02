@@ -33,6 +33,7 @@ def get_mode_config(mode: str):
             "ref_name": "Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa",
             "ref_url": "http://ftp.ensembl.org/pub/release-110/fasta/saccharomyces_cerevisiae/dna/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa.gz",
             "index_prefix": "yeast",
+            "top_n": 16,
         }
     if mode == "a":
         return {
@@ -41,6 +42,7 @@ def get_mode_config(mode: str):
             "ref_name": "Arabidopsis_thaliana.TAIR10.dna.toplevel.fa",
             "ref_url": "http://ftp.ensemblgenomes.org/pub/plants/release-57/fasta/arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz",
             "index_prefix": "arabidopsis",
+            "top_n": 5,
         }
     if mode == "m":
         return {
@@ -49,6 +51,7 @@ def get_mode_config(mode: str):
             "ref_name": "Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa",
             "ref_url": "https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/fasta/zea_mays/dna/Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa.gz",
             "index_prefix": "maize",
+            "top_n": 10,
         }
     if mode == "h":
         return {
@@ -57,6 +60,7 @@ def get_mode_config(mode: str):
             "ref_name": "GRCh38_latest_genomic.fna",
             "ref_url": "https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers/GRCh38_latest_genomic.fna.gz",
             "index_prefix": "human",
+            "top_n": 23,
         }
     if mode == "b":
         return {
@@ -65,6 +69,7 @@ def get_mode_config(mode: str):
             "ref_name": "Brassica_rapa.Brapa_1.0.dna.toplevel.fa",
             "ref_url": "https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/release-57/fasta/brassica_rapa/dna/Brassica_rapa.Brapa_1.0.dna.toplevel.fa.gz",
             "index_prefix": "brassica",
+            "top_n": 10,
         }
     raise SystemExit("Unknown mode. Use one of: y/a/m/h/b")
 
@@ -74,6 +79,35 @@ def download_and_decompress(ref_gz: Path, ref_url: str, ref_decomp: Path):
         run(["wget", "-c", "-O", str(ref_gz), ref_url])
     if not ref_decomp.exists():
         run_shell(f"pigz -p 8 -cd '{ref_gz}' > '{ref_decomp}'")
+
+
+def ensure_top_n_ref(ref_input: Path, n: int) -> Path:
+    if n is None:
+        return ref_input
+
+    top_n_ref = Path(str(ref_input).replace(".fa", f".top{n}.fa").replace(".fna", f".top{n}.fna"))
+    if top_n_ref == ref_input:
+         top_n_ref = Path(str(ref_input) + f".top{n}.fa")
+
+    if top_n_ref.exists():
+        return top_n_ref
+
+    if not Path(str(ref_input) + ".fai").exists():
+        run(["samtools", "faidx", str(ref_input)])
+
+    cmd = f"sort -k2,2nr '{str(ref_input)}.fai' | head -n {n} | cut -f1"
+    res = subprocess.run(cmd, shell=True, check=True, executable="/bin/bash", capture_output=True, text=True)
+    top_names = res.stdout.strip().split('\n')
+
+    cmd_extract = ["samtools", "faidx", str(ref_input)] + top_names
+
+    print(f"+ Extracting top {n} sequences to {top_n_ref}")
+    with open(top_n_ref, "w") as f:
+        subprocess.run(cmd_extract, stdout=f, check=True)
+
+    run(["samtools", "faidx", str(top_n_ref)])
+
+    return top_n_ref
 
 
 def ensure_sing_binary():
@@ -259,11 +293,14 @@ def benchmark_all(mode, threads_override):
 
     ensure_tools("dwgsim", "minimap2", "bowtie2", "bwa-mem2", "samtools", "wget", "pigz")
     download_and_decompress(ref_gz, ref_url, ref_decomp)
-    ensure_bwa_index(ref_decomp)
-    ensure_bowtie2_index(ref_decomp)
-    ensure_sing_index(ref_decomp, index_prefix)
 
-    filtered_ref = ensure_filtered_ref(ref_decomp)
+    filtered_ref = ensure_top_n_ref(ref_decomp, cfg.get("top_n"))
+    if cfg.get("top_n"):
+        index_prefix = Path(str(index_prefix).replace(".idx", f".top{cfg['top_n']}.idx"))
+
+    ensure_bwa_index(filtered_ref)
+    ensure_bowtie2_index(filtered_ref)
+    ensure_sing_index(filtered_ref, index_prefix)
 
     coverage_list = [1, 3]
     mut_rates = [0.001, 0.01]
@@ -290,10 +327,10 @@ def benchmark_all(mode, threads_override):
                 run(["dwgsim", "-C", str(coverage), "-1", "150", "-2", "150", "-R", "0", "-X", "0", "-r", str(mut_rate), "-y", "0", "-H", str(filtered_ref), f"sim_{exp_id}"])
 
             tool_cmds = {
-                "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(ref_decomp), str(r1), str(r2)],
-                "BWA-MEM2": ["bwa-mem2", "mem", "-t", str(threads), str(ref_decomp), str(r1), str(r2)],
+                "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(filtered_ref), str(r1), str(r2)],
+                "BWA-MEM2": ["bwa-mem2", "mem", "-t", str(threads), str(filtered_ref), str(r1), str(r2)],
                 "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
-                "Bowtie2": ["bowtie2", "-p", str(threads), "-x", str(ref_decomp), "-1", str(r1), "-2", str(r2)],
+                "Bowtie2": ["bowtie2", "-p", str(threads), "-x", str(filtered_ref), "-1", str(r1), "-2", str(r2)],
             }
 
             bam_paths = {}
@@ -359,8 +396,12 @@ def benchmark_minimap(mode, threads_override):
 
     ensure_tools("dwgsim", "minimap2", "samtools", "wget", "pigz")
     download_and_decompress(ref_gz, ref_url, ref_decomp)
-    ensure_sing_index(ref_decomp, index_prefix)
-    filtered_ref = ensure_filtered_ref(ref_decomp)
+    
+    filtered_ref = ensure_top_n_ref(ref_decomp, cfg.get("top_n"))
+    if cfg.get("top_n"):
+        index_prefix = Path(str(index_prefix).replace(".idx", f".top{cfg['top_n']}.idx"))
+
+    ensure_sing_index(filtered_ref, index_prefix)
 
     reads_n = 100000
     mut_rates = [0.001, 0.01]
@@ -386,7 +427,7 @@ def benchmark_minimap(mode, threads_override):
             run(["dwgsim", "-N", str(reads_n), "-1", "150", "-2", "150", "-R", "0", "-X", "0", "-r", str(mut_rate), "-y", "0", "-H", str(filtered_ref), f"sim_{exp_id}"])
 
         tool_cmds = {
-            "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(ref_decomp), str(r1), str(r2)],
+            "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(filtered_ref), str(r1), str(r2)],
             "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
         }
 
@@ -453,8 +494,12 @@ def benchmark_strobe(mode, threads_override):
 
     ensure_tools("dwgsim", "samtools", "wget", "pigz")
     download_and_decompress(ref_gz, ref_url, ref_decomp)
-    ensure_sing_index(ref_decomp, index_prefix)
-    filtered_ref = ensure_filtered_ref(ref_decomp)
+
+    filtered_ref = ensure_top_n_ref(ref_decomp, cfg.get("top_n"))
+    if cfg.get("top_n"):
+        index_prefix = Path(str(index_prefix).replace(".idx", f".top{cfg['top_n']}.idx"))
+    
+    ensure_sing_index(filtered_ref, index_prefix)
 
     reads_n = 100000
     mut_rates = [0.001, 0.01]
@@ -480,7 +525,7 @@ def benchmark_strobe(mode, threads_override):
 
         tool_cmds = {
             "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
-            "Strobealign": ["strobealign", "-t", str(threads), str(ref_decomp), str(r1), str(r2)],
+            "Strobealign": ["strobealign", "-t", str(threads), str(filtered_ref), str(r1), str(r2)],
         }
 
         bam_paths = {}
@@ -564,6 +609,8 @@ def benchmark_gatk(mode, threads_override):
     if not ref.exists():
         run_shell(f"sed 's/ .*//' <(pigz -p 8 -cd '{ref_gz}') > '{ref}'")
 
+    ref = ensure_top_n_ref(ref, cfg.get("top_n"))
+
     r1 = out_dir / "sim_reads.bwa.read1.fastq.gz"
     r2 = out_dir / "sim_reads.bwa.read2.fastq.gz"
     raw_truth = out_dir / "sim_reads.mutations.vcf"
@@ -589,7 +636,7 @@ def benchmark_gatk(mode, threads_override):
         run_shell(f"bgzip -c '{raw_truth}' > '{truth_vcf}'")
         run(["tabix", "-p", "vcf", str(truth_vcf)])
 
-    sing_index = out_dir / "index.sing"
+    sing_index = out_dir / f"index.top{cfg.get('top_n', 'all')}.sing"
     if not sing_index.exists():
         run(["cargo", "run", "--release", "--", "build", str(ref), str(sing_index)])
 
