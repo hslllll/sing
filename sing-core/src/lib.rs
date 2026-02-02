@@ -95,7 +95,7 @@ const REMOVE_S: [u64; 4] = [
     rot(BASES[3], (SYNC_S as u32 * ROT) % 64),
 ];
 
-// Seed layout (u64): [hash_remainder: 24 bits] | [ref_id: 12 bits] | [pos: 28 bits]
+// Seed layout (u64): [hash_remainder: 24 bits] | [ref_id: 8 bits] | [pos: 32 bits]
 pub const RADIX: usize = 20;
 pub const SHIFT: usize = 64 - RADIX;
 pub const HASH_BITS: usize = 24;
@@ -572,6 +572,15 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
             *counts.entry(h).or_insert(0) = counts.get(&h).unwrap_or(&0).saturating_add(1);
         }
         ref_seqs.push(seq);
+    }
+
+    if ref_seqs.len() > (1 << RID_BITS) {
+            bail!(
+                "Too many references: {} provided, but only {} allowed with RID_BITS={}.",
+                ref_seqs.len(),
+                1 << RID_BITS,
+                2usize.pow(RID_BITS as u32)
+            );
     }
 
     eprintln!("  Loaded {} bp across {} references", total_bases, ref_seqs.len());
