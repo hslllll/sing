@@ -32,9 +32,9 @@ pub struct Config {
     pub x_drop: i32,
     pub max_seed_occ: usize,
     pub max_candidates: usize,
-    pub maxindel: usize,
-    pub pair_max_dist: i32,
     pub min_votes: usize,
+    pub lookup_dist: usize,
+    pub pair_max_dist: i32,
 }
 
 pub static CONFIG: Config = Config {
@@ -45,11 +45,11 @@ pub static CONFIG: Config = Config {
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    max_seed_occ: 100, // maximum occurrences of a seed to be used in genome
-    max_candidates: 750, // maximum number of candidate hits to consider per read
+    max_seed_occ: 100,
+    max_candidates: 750,
+    min_votes: 2,
+    lookup_dist: 4,
     pair_max_dist: 1000,
-    maxindel: 15,
-    min_votes: 2, // minimum number of votes for an offset
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -871,6 +871,28 @@ fn scalar_cmp_8(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[inline(always)]
+fn peek_match_count(read: &[u8], rseq: &[u8], rp: usize, gp: usize, limit: usize) -> i32 {
+    let mut count = 0i32;
+    let rlen = read.len();
+    let glen = rseq.len();
+    for i in 0..limit {
+        if rp + i >= rlen || gp + i >= glen { break; }
+        if eq_base(read[rp + i], rseq[gp + i]) { count += 1; }
+    }
+    count
+}
+
+#[inline(always)]
+fn peek_match_count_left(read: &[u8], rseq: &[u8], rp: usize, gp: usize, limit: usize) -> i32 {
+    let mut count = 0i32;
+    for i in 0..limit {
+        if rp < i + 1 || gp < i + 1 { break; }
+        if eq_base(read[rp - 1 - i], rseq[gp - 1 - i]) { count += 1; }
+    }
+    count
+}
+
+#[inline(always)]
 fn extend_left(read: &[u8], rseq: &[u8], mut rp: usize, mut gp: usize, cfg: &Config) -> (i32, usize, usize, Vec<u32>, usize) {
     let (mut score, mut max_score) = (0i32, 0i32);
     let mut cigar = Vec::with_capacity(8);
@@ -918,17 +940,20 @@ fn extend_left(read: &[u8], rseq: &[u8], mut rp: usize, mut gp: usize, cfg: &Con
         if eq_base(rb, gb) { score += cfg.match_score; match_run += 1; rp -= 1; gp -= 1; }
         else {
             if match_run > 0 { cigar.push((match_run << 4) | 0); match_run = 0; }
-            let (mm, del, ins) = (score + cfg.mismatch_pen, score + cfg.gap_open, score + cfg.gap_open);
-            if mm >= del && mm >= ins { score = mm; cigar.push((1 << 4) | 0); nm += 1; rp -= 1; gp -= 1; }
-            else if del >= ins && gp > 0 {
-                score = del; let mut glen = 1usize; nm += 1;
-                while glen < cfg.maxindel && gp > glen && score + cfg.gap_ext > max_score - cfg.x_drop {
-                    if rp > 0 && eq_base(read[rp - 1], rseq[gp - glen - 1]) { break; }
-                    glen += 1; nm += 1; score += cfg.gap_ext;
-                }
-                cigar.push(((glen as u32) << 4) | 2); gp = gp.saturating_sub(glen);
-            } else if rp > 0 { score = ins; cigar.push((1 << 4) | 1); nm += 1; rp -= 1; }
-            else { break; }
+            let limit = cfg.lookup_dist;
+            let sub_peek = if rp >= 2 && gp >= 2 { peek_match_count_left(read, rseq, rp - 1, gp - 1, limit) } else { 0 };
+            let del_peek = if rp >= 1 && gp >= 2 { peek_match_count_left(read, rseq, rp, gp - 1, limit) } else { 0 };
+            let ins_peek = if rp >= 2 && gp >= 1 { peek_match_count_left(read, rseq, rp - 1, gp, limit) } else { 0 };
+            let sub_proj = score + cfg.mismatch_pen + sub_peek * cfg.match_score;
+            let del_proj = score + cfg.gap_open + del_peek * cfg.match_score;
+            let ins_proj = score + cfg.gap_open + ins_peek * cfg.match_score;
+            if sub_proj >= del_proj && sub_proj >= ins_proj && rp > 0 && gp > 0 {
+                score += cfg.mismatch_pen; cigar.push((1 << 4) | 0); nm += 1; rp -= 1; gp -= 1;
+            } else if del_proj >= ins_proj && gp > 1 {
+                score += cfg.gap_open; cigar.push((1 << 4) | 2); nm += 1; gp -= 1;
+            } else if rp > 1 {
+                score += cfg.gap_open; cigar.push((1 << 4) | 1); nm += 1; rp -= 1;
+            } else { break; }
         }
         if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
         if score < max_score - cfg.x_drop { break; }
@@ -988,17 +1013,20 @@ fn extend_right(read: &[u8], rseq: &[u8], mut rp: usize, mut gp: usize, cfg: &Co
         if eq_base(rb, gb) { score += cfg.match_score; match_run += 1; rp += 1; gp += 1; }
         else {
             if match_run > 0 { cigar.push((match_run << 4) | 0); match_run = 0; }
-            let (mm, del, ins) = (score + cfg.mismatch_pen, score + cfg.gap_open, score + cfg.gap_open);
-            if mm >= del && mm >= ins { score = mm; cigar.push((1 << 4) | 0); nm += 1; rp += 1; gp += 1; }
-            else if del >= ins && gp < glen {
-                score = del; let mut dlen = 1usize; nm += 1;
-                while dlen < cfg.maxindel && gp + dlen < glen && score + cfg.gap_ext > max_score - cfg.x_drop {
-                    if rp < rlen && eq_base(read[rp], rseq[gp + dlen]) { break; }
-                    dlen += 1; nm += 1; score += cfg.gap_ext;
-                }
-                cigar.push(((dlen as u32) << 4) | 2); gp += dlen;
-            } else if rp < rlen { score = ins; cigar.push((1 << 4) | 1); nm += 1; rp += 1; }
-            else { break; }
+            let limit = cfg.lookup_dist;
+            let sub_peek = if rp + 1 < rlen && gp + 1 < glen { peek_match_count(read, rseq, rp + 1, gp + 1, limit) } else { 0 };
+            let del_peek = if rp < rlen && gp + 1 < glen { peek_match_count(read, rseq, rp, gp + 1, limit) } else { 0 };
+            let ins_peek = if rp + 1 < rlen && gp < glen { peek_match_count(read, rseq, rp + 1, gp, limit) } else { 0 };
+            let sub_proj = score + cfg.mismatch_pen + sub_peek * cfg.match_score;
+            let del_proj = score + cfg.gap_open + del_peek * cfg.match_score;
+            let ins_proj = score + cfg.gap_open + ins_peek * cfg.match_score;
+            if sub_proj >= del_proj && sub_proj >= ins_proj && rp + 1 <= rlen && gp + 1 <= glen {
+                score += cfg.mismatch_pen; cigar.push((1 << 4) | 0); nm += 1; rp += 1; gp += 1;
+            } else if del_proj >= ins_proj && gp + 1 <= glen {
+                score += cfg.gap_open; cigar.push((1 << 4) | 2); nm += 1; gp += 1;
+            } else if rp + 1 <= rlen {
+                score += cfg.gap_open; cigar.push((1 << 4) | 1); nm += 1; rp += 1;
+            } else { break; }
         }
         if score > max_score { max_score = score; best_rp = rp; best_gp = gp; best_cigar_len = cigar.len(); best_match_run = match_run; best_nm = nm; }
         if score < max_score - cfg.x_drop { break; }
