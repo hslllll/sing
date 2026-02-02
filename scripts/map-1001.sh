@@ -8,7 +8,7 @@ SING_BIN="${WORKDIR}/sing"
 INPUT_DIR="${WORKDIR}/1001_raw" 
 REF_DIR="${WORKDIR}/1001/pangenome"
 OUT_BASE_DIR="${WORKDIR}/1001G-stats"
-SUMMARY_CSV="${WORKDIR}/mapping_rate_matrix.csv"
+SUMMARY_CSV="${WORKDIR}/mapping_rate.csv"
 RAM_DISK="/dev/shm/sing_scratch"
 REF_LIST_FILE="${WORKDIR}/ref_list.txt"
 
@@ -49,20 +49,22 @@ run_one_ref() {
     if [ -f "$done_marker" ]; then return; fi
     
     local start_time=$(date +%s.%N)
-    
-    local result
-    result=$("$SING_BIN" map -t "$THREADS_SING" "$index_path" -1 "$R1_RAM" -2 "$R2_RAM" 2>/dev/null | \
-    awk 'BEGIN {t=0;m=0} /^@/ {next} {t++; if(and($2,4)==0) m++} END {print t, m}')
-    
-    read -r total mapped <<< "$result"
+
+    local log_file="${OUT_BASE_DIR}/${ref_id}/${SAMPLE_NAME}.log"
+    "$SING_BIN" map -t "$THREADS_SING" "$index_path" -1 "$R1_RAM" -2 "$R2_RAM" > /dev/null 2> "$log_file"
     
     local end_time=$(date +%s.%N)
     local duration=$(awk "BEGIN {print $end_time - $start_time}")
+
+    local total=$(grep "Total reads:" "$log_file" | awk '{print $3}')
+    local mapped=$(grep "Mapped reads:" "$log_file" | awk '{print $3}')
+    local pct=$(grep "Mapped reads:" "$log_file" | awk -F '[()]' '{print $2}' | sed 's/%//')
+
+    if [ -z "$total" ]; then total=0; fi
+    if [ -z "$mapped" ]; then mapped=0; fi
+    if [ -z "$pct" ]; then pct=0; fi
     
-    local pct=0
-    if [ "$total" -gt 0 ]; then
-        pct=$(awk "BEGIN {printf \"%.2f\", ($mapped/$total)*100}")
-    fi
+    rm -f "$log_file"
     
     flock -x "${SUMMARY_CSV}.lock" -c "echo '$ref_id,$SAMPLE_NAME,$total,$mapped,$pct,$duration' >> '$SUMMARY_CSV'"
     touch "$done_marker"
