@@ -106,11 +106,8 @@ def ensure_filtered_ref(ref_decomp: Path) -> Path:
 
 
 def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
-    unsorted = out_bam.with_suffix(".unsorted.bam")
-    time_log = out_bam.with_suffix(".time.log")
-    elapsed = None
-    mem_kb = None
-    time_bin = Path("./time")
+    # Resolve absolute path for time binary
+    time_bin = Path("./time").resolve()
     if not time_bin.exists():
         time_bin = Path("/usr/bin/time")
     
@@ -118,21 +115,20 @@ def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
         print(f"Error: {time_bin} not found. installation required.")
         return None, None
 
+    sam_path = out_bam.with_suffix(".sam")
+    unsorted = out_bam.with_suffix(".unsorted.bam")
+    time_log = out_bam.with_suffix(".time.log")
+    elapsed = None
+    mem_kb = None
+    
     mapper_cmd = [str(time_bin), "-f", "%e %M", "-o", str(time_log)] + cmd
-    print("+", " | ".join([" ".join(mapper_cmd), f"samtools view -b -o {unsorted} -"]))
+    print("+", " ".join(mapper_cmd), ">", str(sam_path))
     
     try:
-        p1 = subprocess.Popen(mapper_cmd, stdout=subprocess.PIPE)
-        p2 = subprocess.Popen(["samtools", "view", "-b", "-o", str(unsorted), "-"], stdin=p1.stdout)
-        p1.stdout.close()
-        p2.wait()
-        p1.wait()
-        
-        if p1.returncode != 0 or p2.returncode != 0:
-            return None, None
-            
+        with sam_path.open("w") as f_out:
+            subprocess.run(mapper_cmd, stdout=f_out, check=True)
     except Exception as e:
-        print(f"Pipeline error: {e}")
+        print(f"Mapper execution error: {e}")
         return None, None
 
     if time_log.exists():
@@ -143,6 +139,11 @@ def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
                 mem_kb = int(float(log_parts[1]))
             except ValueError:
                 mem_kb = None
+    
+    # SAM -> BAM
+    print("+", f"samtools view -b -o {unsorted} {sam_path}")
+    subprocess.run(["samtools", "view", "-b", "-o", str(unsorted), str(sam_path)], check=True)
+    sam_path.unlink(missing_ok=True)
     
     sort_threads = max(1, min(threads, 8))
     sort_mem = os.environ.get("SAMTOOLS_SORT_MEM", "512M")
@@ -264,8 +265,8 @@ def benchmark_all(mode, threads_override):
 
     filtered_ref = ensure_filtered_ref(ref_decomp)
 
-    coverage_list = [3]
-    mut_rates = [0.01]
+    coverage_list = [1, 3]
+    mut_rates = [0.001, 0.01]
     threads = threads_override
 
     output_csv = Path(f"benchmark_results_f1.{mode}.csv")
@@ -536,7 +537,7 @@ def benchmark_strobe(mode, threads_override):
 
 
 def run_timed_cmd(label, cmd_str: str, log_path: Path):
-    time_bin = Path("./time")
+    time_bin = Path("./time").resolve()
     if not time_bin.exists():
         time_bin = Path("/usr/bin/time")
 
