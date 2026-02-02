@@ -1115,14 +1115,9 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
 
     let mut results = Vec::with_capacity(2);
     if let Some(mut res) = attempt(best_id, best_diag, best_start, best_len, rev) {
-        let diff = best_count.saturating_sub(second_count);
-        let total = total_seeds.max(1) as f32;
-        let d = diff as f32;
-        let x = d / total;
-        let k = 5.0;
-        let t = 0.5;
-        let s = 1.0 / (1.0 + (-(k * (x - t))).exp());
-        let mapq = (60.0 * s).round().min(60.0) as u8;
+        let x = best_count.saturating_sub(second_count) as f32 / total_seeds.max(1) as f32;
+        let p_wrong = 1.0 / (1.0 + (5.0 * (x - 0.5)).exp());
+        let mapq = (-10.0 * p_wrong.max(1e-6).log10()).round().min(60.0) as u8;
         res.mapq = if capped { mapq.min(30) } else { mapq };
         results.push(res);
     }
