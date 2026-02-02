@@ -34,7 +34,7 @@ pub struct Config {
     pub max_candidates: usize,
     pub maxindel: usize,
     pub pair_max_dist: i32,
-    pub min_seeds: usize,
+    pub min_votes: usize,
 }
 
 pub static CONFIG: Config = Config {
@@ -49,7 +49,7 @@ pub static CONFIG: Config = Config {
     max_candidates: 750, // maximum number of candidate hits to consider per read
     pair_max_dist: 1000,
     maxindel: 15,
-    min_seeds: 2,
+    min_votes: 2, // minimum number of votes for an offset
 };
 
 const HASH_WINDOW: usize = CONFIG.hash_window;
@@ -1054,7 +1054,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
 
     group_votes.sort_unstable_by(|a, b| b.2.cmp(&a.2));
     let (best_id, best_diag, best_count, best_start, best_len) = group_votes[0];
-    if best_count < cfg.min_seeds { return Vec::new(); }
+    if best_count < cfg.min_votes { return Vec::new(); }
     let second_count = group_votes.get(1).map(|x| x.2).unwrap_or(0);
     let total_seeds = candidates.len();
 
@@ -1079,7 +1079,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
         results.push(res);
     }
 
-    if group_votes.len() > 1 && second_count >= cfg.min_seeds {
+    if group_votes.len() > 1 && second_count >= cfg.min_votes {
         let (sec_id, sec_diag, _, sec_start, sec_len) = group_votes[1];
         if let Some(mut res) = attempt(sec_id, sec_diag, sec_start, sec_len, rev) { 
             res.mapq = 0; 
