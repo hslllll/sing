@@ -62,6 +62,8 @@ const BASES: [u64; 4] = [
     (1.7320508075688772f64 - 1f64).to_bits(),
 ];
 
+const GOLD: u64 = 0.618033988749f64.to_bits();
+
 const BASE_LUT: [i8; 256] = {
     let mut lut = [(-1i8); 256];
     lut[b'A' as usize] = 0;
@@ -688,6 +690,8 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u64, u32)>) {
     let mut ambig_s = 0u32;
     let mut prev_kpos = u32::MAX;
 
+    let s_count = HASH_WINDOW - SYNC_S + 1;
+
     for i in 0..seq.len() {
         let (base_idx, is_ambig) = match base_to_index(seq[i]) {
             Some(idx) => (idx, false),
@@ -716,7 +720,7 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u64, u32)>) {
 
         if i + 1 >= SYNC_S && ambig_s == 0 {
             let s_pos = (i + 1 - SYNC_S) as u32;
-            let s_hash = h_s.wrapping_mul(0x517cc1b727220a95);
+            let s_hash = h_s.wrapping_mul(GOLD);
             while s_end > s_start && s_queue[(s_end - 1) & 31].1 >= s_hash { s_end -= 1; }
             s_queue[s_end & 31] = (s_pos, s_hash);
             s_end += 1;
@@ -724,13 +728,14 @@ pub fn get_syncmers(seq: &[u8], out: &mut Vec<(u64, u32)>) {
 
         if i + 1 >= HASH_WINDOW && ambig_k == 0 {
             let k_pos = (i + 1 - HASH_WINDOW) as u32;
-            let max_s_pos = k_pos + (HASH_WINDOW - SYNC_S) as u32;
+            let max_s_pos = k_pos + (s_count - 1) as u32;
+            
             while s_start < s_end && s_queue[s_start & 31].0 < k_pos { s_start += 1; }
 
             if s_start < s_end {
                 let min_s_pos = s_queue[s_start & 31].0;
                 if (min_s_pos == k_pos || min_s_pos == max_s_pos) && k_pos != prev_kpos {
-                    out.push((h_k.wrapping_mul(0x517cc1b727220a95), k_pos));
+                    out.push((h_k.wrapping_mul(GOLD), k_pos));
                     prev_kpos = k_pos;
                 }
             }
