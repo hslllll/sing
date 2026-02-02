@@ -62,7 +62,7 @@ const BASES: [u64; 4] = [
     (1.7320508075688772f64 - 1f64).to_bits(),
 ];
 
-const GOLD: u64 = 0.618033988749f64.to_bits();
+const GOLD: u64 = 1.618033988749f64.to_bits();
 
 const BASE_LUT: [i8; 256] = {
     let mut lut = [(-1i8); 256];
