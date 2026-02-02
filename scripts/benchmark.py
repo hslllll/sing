@@ -586,8 +586,7 @@ def benchmark_gatk(mode, threads_override):
 
     truth_vcf = out_dir / "truth.vcf.gz"
     if not truth_vcf.exists():
-        run(["bgzip", "-c", str(raw_truth)], cwd=out_dir)
-        (out_dir / "truth.vcf.gz").rename(truth_vcf)
+        run_shell(f"bgzip -c '{raw_truth}' > '{truth_vcf}'")
         run(["tabix", "-p", "vcf", str(truth_vcf)])
 
     sing_index = out_dir / "index.sing"
