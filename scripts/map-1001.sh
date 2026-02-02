@@ -1,4 +1,7 @@
-#!/bin/bash
+#PBS -N map-1001
+#PBS -l nodes=node02:ppn=128
+#PBS -j oe
+#PBS -o /home/hyunsu.lim/log/map-1001.log
 
 if [ -n "$PBS_O_WORKDIR" ]; then cd "$PBS_O_WORKDIR"; fi
 set -e
