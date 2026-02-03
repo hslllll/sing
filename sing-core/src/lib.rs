@@ -593,8 +593,6 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     eprintln!("  Loaded {} bp across {} references", total_bases, ref_seqs.len());
     eprintln!("  Counted {} total seeds", total_seed_occurrences);
 
-    eprintln!("  Total seed occurrences: {}", total_seed_occurrences);
-
     let mut offsets = vec![0u32; 1 << RADIX];
     let mut running = 0u32;
     for i in 0..offsets.len() {
