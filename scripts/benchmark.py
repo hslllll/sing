@@ -10,7 +10,6 @@ from pathlib import Path
 
 TOLERANCE = 10
 
-
 def run(cmd, cwd=None, env=None, quiet=False):
     if not quiet:
         print("+", " ".join(cmd))
@@ -34,6 +33,7 @@ def get_mode_config(mode: str):
             "ref_name": "Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa",
             "ref_url": "http://ftp.ensembl.org/pub/release-110/fasta/saccharomyces_cerevisiae/dna/Saccharomyces_cerevisiae.R64-1-1.dna.toplevel.fa.gz",
             "index_prefix": "yeast",
+            "top_n": 16,
         }
     if mode == "a":
         return {
@@ -42,6 +42,7 @@ def get_mode_config(mode: str):
             "ref_name": "Arabidopsis_thaliana.TAIR10.dna.toplevel.fa",
             "ref_url": "http://ftp.ensemblgenomes.org/pub/plants/release-57/fasta/arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz",
             "index_prefix": "arabidopsis",
+            "top_n": 5,
         }
     if mode == "m":
         return {
@@ -50,6 +51,7 @@ def get_mode_config(mode: str):
             "ref_name": "Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa",
             "ref_url": "https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/current/fasta/zea_mays/dna/Zea_mays.Zm-B73-REFERENCE-NAM-5.0.dna.toplevel.fa.gz",
             "index_prefix": "maize",
+            "top_n": 10,
         }
     if mode == "h":
         return {
@@ -58,6 +60,7 @@ def get_mode_config(mode: str):
             "ref_name": "GRCh38_latest_genomic.fna",
             "ref_url": "https://ftp.ncbi.nlm.nih.gov/refseq/H_sapiens/annotation/GRCh38_latest/refseq_identifiers/GRCh38_latest_genomic.fna.gz",
             "index_prefix": "human",
+            "top_n": 23,
         }
     if mode == "b":
         return {
@@ -66,6 +69,7 @@ def get_mode_config(mode: str):
             "ref_name": "Brassica_rapa.Brapa_1.0.dna.toplevel.fa",
             "ref_url": "https://ftp.ensemblgenomes.ebi.ac.uk/pub/plants/release-57/fasta/brassica_rapa/dna/Brassica_rapa.Brapa_1.0.dna.toplevel.fa.gz",
             "index_prefix": "brassica",
+            "top_n": 10,
         }
     raise SystemExit("Unknown mode. Use one of: y/a/m/h/b")
 
@@ -75,6 +79,35 @@ def download_and_decompress(ref_gz: Path, ref_url: str, ref_decomp: Path):
         run(["wget", "-c", "-O", str(ref_gz), ref_url])
     if not ref_decomp.exists():
         run_shell(f"pigz -p 8 -cd '{ref_gz}' > '{ref_decomp}'")
+
+
+def ensure_top_n_ref(ref_input: Path, n: int) -> Path:
+    if n is None:
+        return ref_input
+
+    top_n_ref = Path(str(ref_input).replace(".fa", f".top{n}.fa").replace(".fna", f".top{n}.fna"))
+    if top_n_ref == ref_input:
+         top_n_ref = Path(str(ref_input) + f".top{n}.fa")
+
+    if top_n_ref.exists():
+        return top_n_ref
+
+    if not Path(str(ref_input) + ".fai").exists():
+        run(["samtools", "faidx", str(ref_input)])
+
+    cmd = f"sort -k2,2nr '{str(ref_input)}.fai' | head -n {n} | cut -f1"
+    res = subprocess.run(cmd, shell=True, check=True, executable="/bin/bash", capture_output=True, text=True)
+    top_names = res.stdout.strip().split('\n')
+
+    cmd_extract = ["samtools", "faidx", str(ref_input)] + top_names
+
+    print(f"+ Extracting top {n} sequences to {top_n_ref}")
+    with open(top_n_ref, "w") as f:
+        subprocess.run(cmd_extract, stdout=f, check=True)
+
+    run(["samtools", "faidx", str(top_n_ref)])
+
+    return top_n_ref
 
 
 def ensure_sing_binary():
@@ -107,23 +140,32 @@ def ensure_filtered_ref(ref_decomp: Path) -> Path:
 
 
 def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
+    # Resolve absolute path for time binary
+    time_bin = Path("./time").resolve()
+    if not time_bin.exists():
+        time_bin = Path("/usr/bin/time")
+    
+    if not time_bin.exists():
+        print(f"Error: {time_bin} not found. installation required.")
+        return None, None
+
     sam_path = out_bam.with_suffix(".sam")
     unsorted = out_bam.with_suffix(".unsorted.bam")
     time_log = out_bam.with_suffix(".time.log")
-    start = time.perf_counter()
     elapsed = None
     mem_kb = None
+    
+    mapper_cmd = [str(time_bin), "-f", "%e %M", "-o", str(time_log)] + cmd
+    print("+", " ".join(mapper_cmd), ">", str(sam_path))
+    
+    try:
+        with sam_path.open("w") as f_out:
+            subprocess.run(mapper_cmd, stdout=f_out, check=True)
+    except Exception as e:
+        print(f"Mapper execution error: {e}")
+        return None, None
 
-    time_bin = Path("/usr/bin/time")
-    # Prefer /usr/bin/time to capture peak memory; fall back to manual timing if unavailable.
-    if time_bin.exists():
-        with sam_path.open("w") as sam_out:
-            mapper = subprocess.run(
-                [str(time_bin), "-f", "%e %M", "-o", str(time_log), *cmd],
-                stdout=sam_out,
-            )
-        if mapper.returncode != 0:
-            return None, None
+    if time_log.exists():
         log_parts = time_log.read_text().strip().split()
         if len(log_parts) == 2:
             elapsed = float(log_parts[0])
@@ -131,17 +173,12 @@ def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
                 mem_kb = int(float(log_parts[1]))
             except ValueError:
                 mem_kb = None
-    else:
-        with sam_path.open("w") as sam_out:
-            mapper = subprocess.run(cmd, stdout=sam_out)
-        if mapper.returncode != 0:
-            return None, None
-        elapsed = time.perf_counter() - start
-
-    view = subprocess.run(["samtools", "view", "-b", "-o", str(unsorted), str(sam_path)])
-    if view.returncode != 0:
-        return None, None
-
+    
+    # SAM -> BAM
+    print("+", f"samtools view -b -o {unsorted} {sam_path}")
+    subprocess.run(["samtools", "view", "-b", "-o", str(unsorted), str(sam_path)], check=True)
+    sam_path.unlink(missing_ok=True)
+    
     sort_threads = max(1, min(threads, 8))
     sort_mem = os.environ.get("SAMTOOLS_SORT_MEM", "512M")
     tmp_prefix = str(out_bam.with_suffix(""))
@@ -162,10 +199,7 @@ def run_mapper_to_sorted_bam(cmd, out_bam: Path, threads: int):
     ])
     run(["samtools", "index", "-@", str(sort_threads), str(out_bam)])
     unsorted.unlink(missing_ok=True)
-    sam_path.unlink(missing_ok=True)
     time_log.unlink(missing_ok=True)
-    if elapsed is None:
-        elapsed = time.perf_counter() - start
     return elapsed, mem_kb
 
 
@@ -259,14 +293,17 @@ def benchmark_all(mode, threads_override):
 
     ensure_tools("dwgsim", "minimap2", "bowtie2", "bwa-mem2", "samtools", "wget", "pigz")
     download_and_decompress(ref_gz, ref_url, ref_decomp)
-    ensure_bwa_index(ref_decomp)
-    ensure_bowtie2_index(ref_decomp)
-    ensure_sing_index(ref_decomp, index_prefix)
 
-    filtered_ref = ensure_filtered_ref(ref_decomp)
+    filtered_ref = ensure_top_n_ref(ref_decomp, cfg.get("top_n"))
+    if cfg.get("top_n"):
+        index_prefix = Path(str(index_prefix).replace(".idx", f".top{cfg['top_n']}.idx"))
 
-    coverage_list = [3]
-    mut_rates = [0.01]
+    ensure_bwa_index(filtered_ref)
+    ensure_bowtie2_index(filtered_ref)
+    ensure_sing_index(filtered_ref, index_prefix)
+
+    coverage_list = [1, 3]
+    mut_rates = [0.001, 0.01]
     threads = threads_override
 
     output_csv = Path(f"benchmark_results_f1.{mode}.csv")
@@ -290,10 +327,10 @@ def benchmark_all(mode, threads_override):
                 run(["dwgsim", "-C", str(coverage), "-1", "150", "-2", "150", "-R", "0", "-X", "0", "-r", str(mut_rate), "-y", "0", "-H", str(filtered_ref), f"sim_{exp_id}"])
 
             tool_cmds = {
-                "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(ref_decomp), str(r1), str(r2)],
-                "BWA-MEM2": ["bwa-mem2", "mem", "-t", str(threads), str(ref_decomp), str(r1), str(r2)],
+                "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(filtered_ref), str(r1), str(r2)],
+                "BWA-MEM2": ["bwa-mem2", "mem", "-t", str(threads), str(filtered_ref), str(r1), str(r2)],
                 "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
-                "Bowtie2": ["bowtie2", "-p", str(threads), "-x", str(ref_decomp), "-1", str(r1), "-2", str(r2)],
+                "Bowtie2": ["bowtie2", "-p", str(threads), "-x", str(filtered_ref), "-1", str(r1), "-2", str(r2)],
             }
 
             bam_paths = {}
@@ -359,8 +396,12 @@ def benchmark_minimap(mode, threads_override):
 
     ensure_tools("dwgsim", "minimap2", "samtools", "wget", "pigz")
     download_and_decompress(ref_gz, ref_url, ref_decomp)
-    ensure_sing_index(ref_decomp, index_prefix)
-    filtered_ref = ensure_filtered_ref(ref_decomp)
+    
+    filtered_ref = ensure_top_n_ref(ref_decomp, cfg.get("top_n"))
+    if cfg.get("top_n"):
+        index_prefix = Path(str(index_prefix).replace(".idx", f".top{cfg['top_n']}.idx"))
+
+    ensure_sing_index(filtered_ref, index_prefix)
 
     reads_n = 100000
     mut_rates = [0.001, 0.01]
@@ -386,7 +427,7 @@ def benchmark_minimap(mode, threads_override):
             run(["dwgsim", "-N", str(reads_n), "-1", "150", "-2", "150", "-R", "0", "-X", "0", "-r", str(mut_rate), "-y", "0", "-H", str(filtered_ref), f"sim_{exp_id}"])
 
         tool_cmds = {
-            "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(ref_decomp), str(r1), str(r2)],
+            "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(filtered_ref), str(r1), str(r2)],
             "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
         }
 
@@ -453,8 +494,12 @@ def benchmark_strobe(mode, threads_override):
 
     ensure_tools("dwgsim", "samtools", "wget", "pigz")
     download_and_decompress(ref_gz, ref_url, ref_decomp)
-    ensure_sing_index(ref_decomp, index_prefix)
-    filtered_ref = ensure_filtered_ref(ref_decomp)
+
+    filtered_ref = ensure_top_n_ref(ref_decomp, cfg.get("top_n"))
+    if cfg.get("top_n"):
+        index_prefix = Path(str(index_prefix).replace(".idx", f".top{cfg['top_n']}.idx"))
+    
+    ensure_sing_index(filtered_ref, index_prefix)
 
     reads_n = 100000
     mut_rates = [0.001, 0.01]
@@ -480,7 +525,7 @@ def benchmark_strobe(mode, threads_override):
 
         tool_cmds = {
             "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
-            "Strobealign": ["strobealign", "-t", str(threads), str(ref_decomp), str(r1), str(r2)],
+            "Strobealign": ["strobealign", "-t", str(threads), str(filtered_ref), str(r1), str(r2)],
         }
 
         bam_paths = {}
@@ -537,14 +582,14 @@ def benchmark_strobe(mode, threads_override):
 
 
 def run_timed_cmd(label, cmd_str: str, log_path: Path):
-    time_bin = Path("/usr/bin/time")
+    time_bin = Path("./time").resolve()
     if not time_bin.exists():
-        start = time.perf_counter()
-        run_shell(cmd_str)
-        elapsed = time.perf_counter() - start
-        log_path.write_text(f"{elapsed:.2f} 0")
+        time_bin = Path("/usr/bin/time")
+
+    if not time_bin.exists():
+        print(f"Error: {time_bin} not found. installation required.")
         return
-    run_shell(f"/usr/bin/time -f '%e %M' -o '{log_path}' {cmd_str}")
+    run_shell(f"{time_bin} -f '%e %M' -o '{log_path}' {cmd_str}")
 
 
 def benchmark_gatk(mode, threads_override):
@@ -563,6 +608,8 @@ def benchmark_gatk(mode, threads_override):
     ref = out_dir / ref_decomp.name
     if not ref.exists():
         run_shell(f"sed 's/ .*//' <(pigz -p 8 -cd '{ref_gz}') > '{ref}'")
+
+    ref = ensure_top_n_ref(ref, cfg.get("top_n"))
 
     r1 = out_dir / "sim_reads.bwa.read1.fastq.gz"
     r2 = out_dir / "sim_reads.bwa.read2.fastq.gz"
@@ -586,11 +633,10 @@ def benchmark_gatk(mode, threads_override):
 
     truth_vcf = out_dir / "truth.vcf.gz"
     if not truth_vcf.exists():
-        run(["bgzip", "-c", str(raw_truth)], cwd=out_dir)
-        (out_dir / "truth.vcf.gz").rename(truth_vcf)
+        run_shell(f"bgzip -c '{raw_truth}' > '{truth_vcf}'")
         run(["tabix", "-p", "vcf", str(truth_vcf)])
 
-    sing_index = out_dir / "index.sing"
+    sing_index = out_dir / f"index.top{cfg.get('top_n', 'all')}.sing"
     if not sing_index.exists():
         run(["cargo", "run", "--release", "--", "build", str(ref), str(sing_index)])
 
@@ -601,37 +647,31 @@ def benchmark_gatk(mode, threads_override):
     seconds_map = {}
     mem_map = {}
 
-    def map_and_sort(tool, cmd_str: str):
+    def map_and_track(tool, cmd_list):
         bam = out_dir / f"{tool}.bam"
         if bam.exists():
+            # If bam exists, try to recover stats from unsorted log if possible or just skip time
             return
-        elapsed_log = out_dir / f"{tool}.time_log"
-        run_timed_cmd(tool, cmd_str, elapsed_log)
-        read_time, read_mem = elapsed_log.read_text().strip().split()
-        seconds_map[tool] = read_time
-        mem_map[tool] = read_mem
-        sam = out_dir / f"{tool}.sam"
-        run(["samtools", "view", "-b", "-@", "4", "-o", str(out_dir / f"{tool}.unsorted.bam"), str(sam)])
-        run(["samtools", "sort", "-@", str(threads), "-O", "BAM", "-o", str(bam), str(out_dir / f"{tool}.unsorted.bam")])
-        run(["samtools", "index", "-@", str(threads), str(bam)])
-        (out_dir / f"{tool}.unsorted.bam").unlink(missing_ok=True)
-        sam.unlink(missing_ok=True)
+
+        print(f"Running {tool}...")
+        elapsed, mem_kb = run_mapper_to_sorted_bam(cmd_list, bam, threads)
+        
+        if elapsed is not None:
+             seconds_map[tool] = f"{elapsed:.2f}"
+             mem_map[tool] = str(mem_kb) if mem_kb is not None else "N/A"
+        else:
+             seconds_map[tool] = "N/A"
+             mem_map[tool] = "N/A"
 
     if not (out_dir / "sing.bam").exists():
-        map_and_sort(
-            "sing",
-            f"./target/release/sing map -t {threads} {sing_index} -1 {r1} -2 {r2} > {out_dir / 'sing.sam'}",
-        )
+        map_and_track("sing", ["./target/release/sing", "map", "-t", str(threads), str(sing_index), "-1", str(r1), "-2", str(r2)])
+
     if not (out_dir / "bwa.bam").exists():
-        map_and_sort(
-            "bwa",
-            f"bwa-mem2 mem -t {threads} -R '@RG\\tID:bwa\\tSM:{cfg['species']}\\tPL:ILLUMINA' {ref} {r1} {r2} > {out_dir / 'bwa.sam'}",
-        )
+        # Note: No single quotes around RG string in list mode
+        map_and_track("bwa", ["bwa-mem2", "mem", "-t", str(threads), "-R", f"@RG\\tID:bwa\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(ref), str(r1), str(r2)])
+
     if not (out_dir / "mini.bam").exists():
-        map_and_sort(
-            "mini",
-            f"minimap2 -t {threads} -ax sr -R '@RG\\tID:mini\\tSM:{cfg['species']}\\tPL:ILLUMINA' {ref} {r1} {r2} > {out_dir / 'mini.sam'}",
-        )
+        map_and_track("mini", ["minimap2", "-t", str(threads), "-ax", "sr", "-R", f"@RG\\tID:mini\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(ref), str(r1), str(r2)])
 
     dict_path = Path(str(ref).replace(".fa", ".dict"))
     if ref.suffix != ".fa":

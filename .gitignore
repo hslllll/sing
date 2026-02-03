@@ -47,3 +47,4 @@ log
 dist
 
 *.bai
+*gatk*
