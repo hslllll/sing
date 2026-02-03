@@ -45,7 +45,7 @@ pub static CONFIG: Config = Config {
     gap_ext: -1,
     x_drop: 15,
     max_seed_occ: 100,
-    max_candidates: 450,
+    max_candidates: 1500,
     min_votes: 2,
     lookup_dist: 4,
     pair_max_dist: 1000,
@@ -192,6 +192,12 @@ impl Index {
             pos = end;
         }
 
+        // Align to 8 bytes before seed_counts block
+        let padding = (8 - (pos % 8)) % 8;
+        let padded = pos.checked_add(padding).filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read seed_counts padding: unexpected EOF"))?;
+        pos = padded;
+
         let (total_seed_occurrences, seed_counts) = if pos + 16 <= data.len() {
             let total = read_u64(data, &mut pos, "read total_seed_occurrences")?;
             let counts_len = read_u64(data, &mut pos, "read seed_counts len")? as usize;
@@ -272,6 +278,19 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
+        // Align to 8 bytes before seed_counts block
+        let pos_offsets = 8usize + offsets.len().saturating_mul(4);
+        let pad_offsets = (8 - (pos_offsets % 8)) % 8;
+        let pos_after_offsets = pos_offsets + pad_offsets;
+        let pos_seeds = pos_after_offsets + 8 + seeds.len().saturating_mul(8);
+        let pos_refs = pos_seeds + 8 + ref_seqs.iter().map(|s| 8 + s.len()).sum::<usize>();
+        let pos_names = pos_refs + 8 + ref_names.iter().map(|n| 8 + n.len()).sum::<usize>();
+        let padding = (8 - (pos_names % 8)) % 8;
+        if padding != 0 {
+            let mut pad = [0u8; 8];
+            r.read_exact(&mut pad[..padding]).context("read seed_counts padding")?;
+        }
+
         let (total_seed_occurrences, seed_counts) = {
             let mut buf = [0u8; 8];
             let total = match r.read(&mut buf).context("read total_seed_occurrences")? {
@@ -339,6 +358,16 @@ impl Index {
             w.write_all(bytes)?;
         }
 
+        // Align to 8 bytes before seed_counts block
+        let pos = 8usize + self.offsets.len().saturating_mul(4) + 8 + self.seeds.len().saturating_mul(8)
+            + 8 + self.ref_seqs.iter().map(|s| 8 + s.len()).sum::<usize>()
+            + 8 + self.ref_names.iter().map(|n| 8 + n.len()).sum::<usize>();
+        let padding = (8 - (pos % 8)) % 8;
+        if padding != 0 {
+            let pad = [0u8; 8];
+            w.write_all(&pad[..padding])?;
+        }
+
         w.write_all(&self.total_seed_occurrences.to_le_bytes())?;
         w.write_all(&(self.seed_counts.len() as u64).to_le_bytes())?;
         for v in &self.seed_counts {
@@ -387,7 +416,8 @@ pub struct MemoryIndex {
     seeds_len: usize,
     genome_size: u64,
     total_seed_occurrences: u64,
-    seed_counts: Vec<u64>,
+    seed_counts_ptr: *const u64,
+    seed_counts_len: usize,
     ref_seq_ranges: Vec<Range<usize>>,
     ref_name_ranges: Vec<Range<usize>>,
 }
@@ -398,9 +428,7 @@ unsafe impl Sync for MemoryIndex {}
 impl MemoryIndex {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path)?;
-        let mmap = unsafe {
-            MmapOptions::new().populate().map(&file).context("mmap index file")?
-        };
+        let mmap = unsafe { MmapOptions::new().map(&file).context("mmap index file")? };
         Self::from_data(IndexBuffer::Mmap(mmap))
     }
 
@@ -458,21 +486,26 @@ impl MemoryIndex {
             pos = end;
         }
 
-        let (total_seed_occurrences, seed_counts) = if pos + 16 <= data.len() {
+        // Align to 8 bytes before seed_counts block
+        let padding = (8 - (pos % 8)) % 8;
+        pos = pos.checked_add(padding).filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read seed_counts padding: unexpected EOF"))?;
+
+        let (total_seed_occurrences, seed_counts_ptr, seed_counts_len) = if pos + 16 <= data.len() {
             let total = read_u64(data, &mut pos, "read total_seed_occurrences")?;
             let counts_len = read_u64(data, &mut pos, "read seed_counts len")? as usize;
             let counts_bytes = counts_len.checked_mul(8).and_then(|n| pos.checked_add(n))
                 .filter(|&end| end <= data.len())
                 .ok_or_else(|| anyhow::anyhow!("read seed_counts: unexpected EOF"))?;
-            let mut counts = Vec::with_capacity(counts_len);
-            for chunk in data[pos..counts_bytes].chunks_exact(8) {
-                counts.push(u64::from_le_bytes(chunk.try_into().unwrap()));
-            }
-            (total, counts)
-        } else { (0, Vec::new()) };
+            let counts_slice = try_cast_slice::<u8, u64>(&data[pos..counts_bytes])
+                .map_err(|_| anyhow::anyhow!("read seed_counts: unaligned data"))?;
+            let ptr = counts_slice.as_ptr();
+            let len = counts_slice.len();
+            (total, ptr, len)
+        } else { (0, std::ptr::null(), 0) };
 
         Ok(Self { buf, offsets_ptr, offsets_len, seeds_ptr, seeds_len, genome_size,
-            total_seed_occurrences, seed_counts, ref_seq_ranges, ref_name_ranges })
+            total_seed_occurrences, seed_counts_ptr, seed_counts_len, ref_seq_ranges, ref_name_ranges })
     }
 }
 
@@ -482,10 +515,11 @@ impl IndexLike for MemoryIndex {
     fn genome_size(&self) -> u64 { self.genome_size }
     fn total_seed_occurrences(&self) -> u64 { self.total_seed_occurrences }
     fn seed_count(&self, hash: u64) -> u32 {
-        if self.seed_counts.is_empty() { return 0; }
+        if self.seed_counts_len == 0 { return 0; }
+        let seed_counts = unsafe { std::slice::from_raw_parts(self.seed_counts_ptr, self.seed_counts_len) };
         let key = hash >> 32;
-        match self.seed_counts.binary_search_by_key(&key, |v| v >> 32) {
-            Ok(idx) => (self.seed_counts[idx] & 0xFFFF_FFFF) as u32,
+        match seed_counts.binary_search_by_key(&key, |v| v >> 32) {
+            Ok(idx) => (seed_counts[idx] & 0xFFFF_FFFF) as u32,
             Err(_) => 0,
         }
     }
@@ -758,7 +792,7 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
 fn best_diag_for_group(hits: &[Hit], counts: &mut Vec<(i32, u16)>) -> Option<(i32, usize)> {
     if hits.is_empty() { return None; }
     counts.clear();
-    
+
     for hit in hits {
         let d = hit.diag;
         if let Some(entry) = counts.iter_mut().find(|(diag, _)| *diag == d) {
@@ -767,20 +801,26 @@ fn best_diag_for_group(hits: &[Hit], counts: &mut Vec<(i32, u16)>) -> Option<(i3
             counts.push((d, 1));
         }
     }
-    
-    let (best_diag, best_count) = counts.iter().max_by_key(|&&(_, c)| c).copied()?;
-    Some((best_diag, best_count as usize))
+
+    let mut best: Option<(i32, usize)> = None;
+    for &(diag, count) in counts.iter() {
+        let count_usize = count as usize;
+        match best {
+            Some((_, best_count)) if best_count >= count_usize => {}
+            _ => best = Some((diag, count_usize)),
+        }
+    }
+
+    best
 }
 
 #[inline(always)]
-fn anchor_for_diag(group: &[Hit], diag: i32) -> Option<(i32, u32)> {
-    let mut first = None;
-    let mut last = None;
-    for hit in group { if hit.diag == diag { if first.is_none() { first = Some(hit.read_pos); } last = Some(hit.read_pos); } }
-    Some((diag, (first? + last?) / 2))
+fn anchor_for_diag(hits: &[Hit], target_diag: i32) -> Option<(i32, u32)> {
+    hits
+        .iter()
+        .find(|h| h.diag == target_diag)
+        .map(|h| (target_diag, h.read_pos))
 }
-
-const CASE_MASK: u64 = 0x2020202020202020;
 
 #[inline(always)]
 fn eq_base(a: u8, b: u8) -> bool {
@@ -820,6 +860,7 @@ unsafe fn simd_cmp_16(a: &[u8], b: &[u8]) -> u16 {
 #[inline(always)]
 fn scalar_cmp_8(a: &[u8], b: &[u8]) -> bool {
     unsafe {
+        const CASE_MASK: u64 = 0x2020_2020_2020_2020;
         let r_val = std::ptr::read_unaligned(a.as_ptr() as *const u64) | CASE_MASK;
         let g_val = std::ptr::read_unaligned(b.as_ptr() as *const u64) | CASE_MASK;
         r_val == g_val
