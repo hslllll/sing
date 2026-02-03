@@ -2,7 +2,6 @@ use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
 use memmap2::MmapOptions;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::ops::Range;
@@ -39,14 +38,14 @@ pub struct Config {
 
 pub static CONFIG: Config = Config {
     hash_window: 21,
-    sync_s: 6,
+    sync_s: 16,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
     max_seed_occ: 100,
-    max_candidates: 1500,
+    max_candidates: 450,
     min_votes: 2,
     lookup_dist: 4,
     pair_max_dist: 1000,
@@ -112,7 +111,6 @@ pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
     pub genome_size: u64,
-    pub max_hits: u32,
     pub total_seed_occurrences: u64,
     pub seed_counts: Vec<u64>,
     pub ref_seqs: Vec<Vec<u8>>,
@@ -123,7 +121,6 @@ pub trait IndexLike {
     fn offsets(&self) -> &[u32];
     fn seeds(&self) -> &[u64];
     fn genome_size(&self) -> u64;
-    fn max_hits(&self) -> usize;
     fn total_seed_occurrences(&self) -> u64;
     fn seed_count(&self, hash: u64) -> u32;
     fn ref_count(&self) -> usize;
@@ -195,12 +192,6 @@ impl Index {
             pos = end;
         }
 
-        let max_hits = if pos + 8 <= data.len() {
-            read_u64(data, &mut pos, "read max_hits")? as u32
-        } else {
-            u32::MAX
-        };
-
         let (total_seed_occurrences, seed_counts) = if pos + 16 <= data.len() {
             let total = read_u64(data, &mut pos, "read total_seed_occurrences")?;
             let counts_len = read_u64(data, &mut pos, "read seed_counts len")? as usize;
@@ -222,7 +213,6 @@ impl Index {
             offsets,
             seeds,
             genome_size,
-            max_hits,
             total_seed_occurrences,
             seed_counts,
             ref_seqs,
@@ -282,18 +272,6 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
-        let max_hits = {
-            let mut buf = [0u8; 8];
-            match r.read(&mut buf).context("read max_hits")? {
-                0 => u32::MAX,
-                n if n < 8 => {
-                    r.read_exact(&mut buf[n..]).context("read max_hits")?;
-                    u64::from_le_bytes(buf) as u32
-                }
-                _ => u64::from_le_bytes(buf) as u32,
-            }
-        };
-
         let (total_seed_occurrences, seed_counts) = {
             let mut buf = [0u8; 8];
             let total = match r.read(&mut buf).context("read total_seed_occurrences")? {
@@ -322,7 +300,6 @@ impl Index {
             offsets,
             seeds,
             genome_size,
-            max_hits,
             total_seed_occurrences,
             seed_counts,
             ref_seqs,
@@ -362,7 +339,6 @@ impl Index {
             w.write_all(bytes)?;
         }
 
-        w.write_all(&(self.max_hits as u64).to_le_bytes())?;
         w.write_all(&self.total_seed_occurrences.to_le_bytes())?;
         w.write_all(&(self.seed_counts.len() as u64).to_le_bytes())?;
         for v in &self.seed_counts {
@@ -377,7 +353,6 @@ impl IndexLike for Index {
     fn offsets(&self) -> &[u32] { &self.offsets }
     fn seeds(&self) -> &[u64] { &self.seeds }
     fn genome_size(&self) -> u64 { self.genome_size }
-    fn max_hits(&self) -> usize { self.max_hits as usize }
     fn total_seed_occurrences(&self) -> u64 { self.total_seed_occurrences }
 
     fn seed_count(&self, hash: u64) -> u32 {
@@ -411,7 +386,6 @@ pub struct MemoryIndex {
     seeds_ptr: *const u64,
     seeds_len: usize,
     genome_size: u64,
-    max_hits: u32,
     total_seed_occurrences: u64,
     seed_counts: Vec<u64>,
     ref_seq_ranges: Vec<Range<usize>>,
@@ -484,10 +458,6 @@ impl MemoryIndex {
             pos = end;
         }
 
-        let max_hits = if pos + 8 <= data.len() {
-            read_u64(data, &mut pos, "read max_hits")? as u32
-        } else { u32::MAX };
-
         let (total_seed_occurrences, seed_counts) = if pos + 16 <= data.len() {
             let total = read_u64(data, &mut pos, "read total_seed_occurrences")?;
             let counts_len = read_u64(data, &mut pos, "read seed_counts len")? as usize;
@@ -501,7 +471,7 @@ impl MemoryIndex {
             (total, counts)
         } else { (0, Vec::new()) };
 
-        Ok(Self { buf, offsets_ptr, offsets_len, seeds_ptr, seeds_len, genome_size, max_hits,
+        Ok(Self { buf, offsets_ptr, offsets_len, seeds_ptr, seeds_len, genome_size,
             total_seed_occurrences, seed_counts, ref_seq_ranges, ref_name_ranges })
     }
 }
@@ -510,7 +480,6 @@ impl IndexLike for MemoryIndex {
     fn offsets(&self) -> &[u32] { unsafe { std::slice::from_raw_parts(self.offsets_ptr, self.offsets_len) } }
     fn seeds(&self) -> &[u64] { unsafe { std::slice::from_raw_parts(self.seeds_ptr, self.seeds_len) } }
     fn genome_size(&self) -> u64 { self.genome_size }
-    fn max_hits(&self) -> usize { self.max_hits as usize }
     fn total_seed_occurrences(&self) -> u64 { self.total_seed_occurrences }
     fn seed_count(&self, hash: u64) -> u32 {
         if self.seed_counts.is_empty() { return 0; }
@@ -531,7 +500,6 @@ impl<T: IndexLike> IndexLike for std::sync::Arc<T> {
     fn offsets(&self) -> &[u32] { self.as_ref().offsets() }
     fn seeds(&self) -> &[u64] { self.as_ref().seeds() }
     fn genome_size(&self) -> u64 { self.as_ref().genome_size() }
-    fn max_hits(&self) -> usize { self.as_ref().max_hits() }
     fn total_seed_occurrences(&self) -> u64 { self.as_ref().total_seed_occurrences() }
     fn seed_count(&self, hash: u64) -> u32 { self.as_ref().seed_count(hash) }
     fn ref_count(&self) -> usize { self.as_ref().ref_count() }
@@ -561,7 +529,7 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     let mut total_bases: u64 = 0;
     let mut total_seed_occurrences: u64 = 0;
     let mut mins = Vec::with_capacity(1024);
-    let mut counts: HashMap<u64, u32> = HashMap::new();
+    let mut bucket_counts = vec![0u32; 1 << RADIX];
 
     eprintln!("Building streaming index...");
 
@@ -571,7 +539,10 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
         get_syncmers(&seq, &mut mins);
         total_seed_occurrences = total_seed_occurrences.saturating_add(mins.len() as u64);
         for &(h, _p) in mins.iter() {
-            *counts.entry(h).or_insert(0) = counts.get(&h).unwrap_or(&0).saturating_add(1);
+            let bucket = (h >> SHIFT) as usize;
+            if bucket < bucket_counts.len() {
+                bucket_counts[bucket] = bucket_counts[bucket].saturating_add(1);
+            }
         }
         ref_seqs.push(seq);
     }
@@ -586,22 +557,9 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     }
 
     eprintln!("  Loaded {} bp across {} references", total_bases, ref_seqs.len());
-    eprintln!("  Counted {} unique seeds", counts.len());
+    eprintln!("  Counted {} total seeds", total_seed_occurrences);
 
-    let max_hits = CONFIG.max_seed_occ;
-
-    eprintln!("  Total seed occurrences: {}, max_hits={}", total_seed_occurrences, max_hits);
-
-    let mut bucket_counts = vec![0u32; 1 << RADIX];
-    for seq in ref_seqs.iter() {
-        get_syncmers(seq, &mut mins);
-        for &(h, _p) in mins.iter() {
-            let bucket = (h >> SHIFT) as usize;
-            if bucket < bucket_counts.len() {
-                bucket_counts[bucket] = bucket_counts[bucket].saturating_add(1);
-            }
-        }
-    }
+    eprintln!("  Total seed occurrences: {}", total_seed_occurrences);
 
     let mut offsets = vec![0u32; 1 << RADIX];
     let mut running = 0u32;
@@ -616,7 +574,6 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p) in mins.iter() {
-            if counts.get(&h).map_or(false, |&c| c as usize > max_hits) { continue; }
             let bucket = (h >> SHIFT) as usize;
             if bucket >= write_offsets.len() { continue; }
             let idx = write_offsets[bucket] as usize;
@@ -638,10 +595,9 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
 
     eprintln!("  Index built: {} seeds", final_seeds.len());
 
-    let mut seed_counts: Vec<u64> = counts.iter().map(|(&h, &c)| ((h >> 32) << 32) | (c as u64)).collect();
-    seed_counts.sort_unstable_by_key(|v| v >> 32);
+    let seed_counts: Vec<u64> = Vec::new();
 
-    Ok(Index { offsets, seeds: final_seeds, genome_size: total_bases, max_hits: max_hits as u32,
+    Ok(Index { offsets, seeds: final_seeds, genome_size: total_bases,
         total_seed_occurrences, seed_counts, ref_seqs, ref_names })
 }
 
@@ -1055,7 +1011,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let State { mins, candidates, diag_counts, group_buf, cigar_buf: _ } = state;
     let cfg = &CONFIG;
     candidates.clear();
-    let max_hits = idx.max_hits();
+    let max_hits = cfg.max_seed_occ;
     let mut capped = false;
 
     get_syncmers(seq, mins);
