@@ -131,6 +131,12 @@ def ensure_bowtie2_index(ref_decomp: Path):
         run(["bowtie2-build", "-t", "8", str(ref_decomp), str(ref_decomp)])
 
 
+def ensure_minimap2_index(ref_decomp: Path):
+    idx = Path(str(ref_decomp) + ".mmi")
+    if not idx.exists():
+        run(["minimap2", "-d", str(idx), str(ref_decomp)])
+
+
 def ensure_filtered_ref(ref_decomp: Path) -> Path:
     filtered = Path(str(ref_decomp).replace(".fa", ".filtered.fa"))
     if not filtered.exists():
@@ -300,7 +306,10 @@ def benchmark_all(mode, threads_override):
 
     ensure_bwa_index(filtered_ref)
     ensure_bowtie2_index(filtered_ref)
+    ensure_minimap2_index(filtered_ref)
     ensure_sing_index(filtered_ref, index_prefix)
+
+    minimap_idx = Path(str(filtered_ref) + ".mmi")
 
     coverage_list = [1, 3]
     mut_rates = [0.001, 0.01]
@@ -327,7 +336,7 @@ def benchmark_all(mode, threads_override):
                 run(["dwgsim", "-C", str(coverage), "-1", "150", "-2", "150", "-R", "0", "-X", "0", "-r", str(mut_rate), "-y", "0", "-H", str(filtered_ref), f"sim_{exp_id}"])
 
             tool_cmds = {
-                "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(filtered_ref), str(r1), str(r2)],
+                "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(minimap_idx), str(r1), str(r2)],
                 "BWA-MEM2": ["bwa-mem2", "mem", "-t", str(threads), str(filtered_ref), str(r1), str(r2)],
                 "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
                 "Bowtie2": ["bowtie2", "-p", str(threads), "-x", str(filtered_ref), "-1", str(r1), "-2", str(r2)],
@@ -402,6 +411,9 @@ def benchmark_minimap(mode, threads_override):
         index_prefix = Path(str(index_prefix).replace(".idx", f".top{cfg['top_n']}.idx"))
 
     ensure_sing_index(filtered_ref, index_prefix)
+    ensure_minimap2_index(filtered_ref)
+
+    minimap_idx = Path(str(filtered_ref) + ".mmi")
 
     reads_n = 100000
     mut_rates = [0.001, 0.01]
@@ -427,7 +439,7 @@ def benchmark_minimap(mode, threads_override):
             run(["dwgsim", "-N", str(reads_n), "-1", "150", "-2", "150", "-R", "0", "-X", "0", "-r", str(mut_rate), "-y", "0", "-H", str(filtered_ref), f"sim_{exp_id}"])
 
         tool_cmds = {
-            "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(filtered_ref), str(r1), str(r2)],
+            "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(minimap_idx), str(r1), str(r2)],
             "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
         }
 
@@ -610,6 +622,9 @@ def benchmark_gatk(mode, threads_override):
         run_shell(f"sed 's/ .*//' <(pigz -p 8 -cd '{ref_gz}') > '{ref}'")
 
     ref = ensure_top_n_ref(ref, cfg.get("top_n"))
+    ensure_minimap2_index(ref)
+
+    minimap_idx = Path(str(ref) + ".mmi")
 
     r1 = out_dir / "sim_reads.bwa.read1.fastq.gz"
     r2 = out_dir / "sim_reads.bwa.read2.fastq.gz"
@@ -671,7 +686,7 @@ def benchmark_gatk(mode, threads_override):
         map_and_track("bwa", ["bwa-mem2", "mem", "-t", str(threads), "-R", f"@RG\\tID:bwa\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(ref), str(r1), str(r2)])
 
     if not (out_dir / "mini.bam").exists():
-        map_and_track("mini", ["minimap2", "-t", str(threads), "-ax", "sr", "-R", f"@RG\\tID:mini\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(ref), str(r1), str(r2)])
+        map_and_track("mini", ["minimap2", "-t", str(threads), "-ax", "sr", "-R", f"@RG\\tID:mini\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(minimap_idx), str(r1), str(r2)])
 
     dict_path = Path(str(ref).replace(".fa", ".dict"))
     if ref.suffix != ".fa":
