@@ -313,9 +313,9 @@
 
                     if (totalSize < BAM_LIMIT) {
                         effectiveChunkSize = totalSize + 1024;
-                        log(`Small input detected (<100MB). Using single-pass for valid BAM generation.`);
+                        log(`Small input detected. Using single-pass for valid BAM generation.`);
                     } else {
-                        log(`Large input detected (>100MB). Proceeding with chunked BAM merge; ensure downstream tools accept merged BGZF blocks.`);
+                        log(`Large input detected. Proceeding with chunked BAM merge; ensure downstream tools accept merged BGZF blocks.`);
                     }
                 }
 
