@@ -496,7 +496,7 @@ async function streamReference(file, chunkSize, onChunk) {
 
 
 
-const READ_CHUNK_SIZE = 1024 * 1024 * 1024;
+const READ_CHUNK_SIZE = 100 * 1024 * 1024;
 
 
 export async function partitionedWorkflow(referenceFile, read1File, read2File, sortOutput = false, outputFormat = 'bam', chunkSize = READ_CHUNK_SIZE, logger = console.log, onProgress = null) {
