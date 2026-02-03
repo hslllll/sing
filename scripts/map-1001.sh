@@ -1,5 +1,5 @@
 #PBS -N map-1001
-#PBS -l nodes=node02:ppn=128
+#PBS -l nodes=node03:ppn=128
 #PBS -j oe
 #PBS -o /home/hyunsu.lim/log/map-1001.log
 
@@ -27,7 +27,7 @@ if [ ! -f "$SUMMARY_CSV" ]; then
 fi
 
 rm -f "$REF_LIST_FILE"
-find "$REF_DIR" -name "*.fasta.gz" -o -name "*.fna.gz" | sort | while read -r REF_FASTA; do
+find -L "${REF_DIR}/" -name "*.fasta.gz" -o -name "*.fna.gz" | sort | while read -r REF_FASTA; do
     bname=$(basename "$REF_FASTA")
     RID="${bname%%.*}"
     INDEX_PATH="${REF_DIR}/${RID}.sing"
@@ -77,7 +77,7 @@ export SING_BIN OUT_BASE_DIR SUMMARY_CSV THREADS_SING
 
 echo "Starting Sample-Centric Mapping (From RAW)..."
 
-find "$INPUT_DIR" -maxdepth 1 -name "*_1.fastq" | sort | while read -r R1_RAW; do
+find -L "${INPUT_DIR}/" -maxdepth 1 -name "*_1.fastq" | sort | while read -r R1_RAW; do
     R2_RAW="${R1_RAW/_1.fastq/_2.fastq}"
     
     if [ ! -f "$R2_RAW" ]; then continue; fi
