@@ -29,6 +29,7 @@ pub struct Config {
     pub gap_open: i32,
     pub gap_ext: i32,
     pub x_drop: i32,
+    pub max_seed_hard_occ: usize,
     pub max_seed_occ: usize,
     pub max_candidates: usize,
     pub min_votes: usize,
@@ -44,6 +45,7 @@ pub static CONFIG: Config = Config {
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
+    max_seed_hard_occ: 100,
     max_seed_occ: 100,
     max_candidates: 750,
     min_votes: 2,
@@ -561,9 +563,11 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     let mut ref_seqs = Vec::new();
     let mut ref_names = Vec::new();
     let mut total_bases: u64 = 0;
-    let mut total_seed_occurrences: u64 = 0;
+    let mut total_seed_occurrences_raw: u64 = 0;
+    let mut total_seed_occurrences_kept: u64 = 0;
     let mut mins = Vec::with_capacity(1024);
     let mut bucket_counts = vec![0u32; 1 << RADIX];
+    let mut hash_counts = vec![0u32; 1 << HASH_BITS];
 
     eprintln!("Building streaming index...");
 
@@ -571,11 +575,11 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
         ref_names.push(name.into());
         total_bases += seq.len() as u64;
         get_syncmers(&seq, &mut mins);
-        total_seed_occurrences = total_seed_occurrences.saturating_add(mins.len() as u64);
+        total_seed_occurrences_raw = total_seed_occurrences_raw.saturating_add(mins.len() as u64);
         for &(h, _p) in mins.iter() {
-            let bucket = (h >> SHIFT) as usize;
-            if bucket < bucket_counts.len() {
-                bucket_counts[bucket] = bucket_counts[bucket].saturating_add(1);
+            let hash_idx = ((h >> (SHIFT - HASH_BITS)) & HASH_MASK) as usize;
+            if let Some(slot) = hash_counts.get_mut(hash_idx) {
+                *slot = slot.saturating_add(1);
             }
         }
         ref_seqs.push(seq);
@@ -591,7 +595,24 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     }
 
     eprintln!("  Loaded {} bp across {} references", total_bases, ref_seqs.len());
-    eprintln!("  Counted {} total seeds", total_seed_occurrences);
+    eprintln!("  Counted {} total seeds (raw)", total_seed_occurrences_raw);
+
+    let hard_cap = CONFIG.max_seed_hard_occ as u32;
+
+    // Second pass: count buckets for seeds under the hard occurrence cap
+    bucket_counts.fill(0);
+    for seq in ref_seqs.iter() {
+        get_syncmers(seq, &mut mins);
+        for &(h, _p) in mins.iter() {
+            let hash_idx = ((h >> (SHIFT - HASH_BITS)) & HASH_MASK) as usize;
+            if hash_counts[hash_idx] > hard_cap { continue; }
+            total_seed_occurrences_kept = total_seed_occurrences_kept.saturating_add(1);
+            let bucket = (h >> SHIFT) as usize;
+            if bucket < bucket_counts.len() {
+                bucket_counts[bucket] = bucket_counts[bucket].saturating_add(1);
+            }
+        }
+    }
 
     let mut offsets = vec![0u32; 1 << RADIX];
     let mut running = 0u32;
@@ -603,14 +624,17 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     let mut final_seeds: Vec<u64> = vec![0u64; running as usize];
     let mut write_offsets = offsets.clone();
 
+    // Third pass: write only seeds under the hard occurrence cap
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p) in mins.iter() {
+            let hash_idx = ((h >> (SHIFT - HASH_BITS)) & HASH_MASK) as usize;
+            if hash_counts[hash_idx] > hard_cap { continue; }
             let bucket = (h >> SHIFT) as usize;
             if bucket >= write_offsets.len() { continue; }
             let idx = write_offsets[bucket] as usize;
             if idx >= final_seeds.len() { continue; }
-            
+
             let hash_rem = (h >> (SHIFT - HASH_BITS)) & HASH_MASK;
             let rid_part = (rid as u64) & RID_MASK;
             let pos_part = (p as u64) & POS_MASK;
@@ -625,12 +649,13 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
         if start < end { final_seeds[start..end].sort_unstable_by_key(|s| s >> (RID_BITS + POS_BITS)); }
     }
 
+    eprintln!("  Keeping {} seeds after hard cap {}", total_seed_occurrences_kept, CONFIG.max_seed_hard_occ);
     eprintln!("  Index built: {} seeds", final_seeds.len());
 
     let seed_counts: Vec<u64> = Vec::new();
 
     Ok(Index { offsets, seeds: final_seeds, genome_size: total_bases,
-        total_seed_occurrences, seed_counts, ref_seqs, ref_names })
+        total_seed_occurrences: total_seed_occurrences_kept, seed_counts, ref_seqs, ref_names })
 }
 
 #[derive(Clone, Copy, Default, Debug)]
