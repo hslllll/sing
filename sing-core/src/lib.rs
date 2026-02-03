@@ -428,7 +428,7 @@ unsafe impl Sync for MemoryIndex {}
 impl MemoryIndex {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file).context("mmap index file")? };
+        let mmap = unsafe { MmapOptions::new().populate().map(&file).context("mmap index file")? };
         Self::from_data(IndexBuffer::Mmap(mmap))
     }
 
