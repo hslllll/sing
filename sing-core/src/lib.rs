@@ -42,7 +42,7 @@ pub static CONFIG: Config = Config {
     sync_s: 3,
     match_score: 2,
     mismatch_pen: -2,
-    gap_open: -2,
+    gap_open: -1,
     gap_ext: -1,
     x_drop: 15,
     max_seed_occ: 100,
