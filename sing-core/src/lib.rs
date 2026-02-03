@@ -45,7 +45,7 @@ pub static CONFIG: Config = Config {
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
-    max_seed_hard_occ: 450,
+    max_seed_hard_occ: 50,
     max_seed_occ: 100,
     max_candidates: 750,
     min_votes: 2,
