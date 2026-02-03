@@ -39,14 +39,14 @@ pub struct Config {
 
 pub static CONFIG: Config = Config {
     hash_window: 21,
-    sync_s: 3,
+    sync_s: 6,
     match_score: 2,
     mismatch_pen: -2,
-    gap_open: -1,
+    gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
     max_seed_occ: 100,
-    max_candidates: 1500,
+    max_candidates: 750,
     min_votes: 2,
     lookup_dist: 4,
     pair_max_dist: 1000,
