@@ -39,7 +39,7 @@ pub struct Config {
 
 pub static CONFIG: Config = Config {
     hash_window: 21,
-    sync_s: 16,
+    sync_s: 6,
     match_score: 2,
     mismatch_pen: -2,
     gap_open: -2,
