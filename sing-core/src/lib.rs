@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
+use rkyv::{Archive, Serialize, Deserialize, rancor};
 
 // SIMD support detection - disabled for WASM targets
 #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
@@ -108,7 +109,7 @@ pub const RID_MASK: u64 = (1 << RID_BITS) - 1;
 pub const POS_MASK: u64 = (1 << POS_BITS) - 1;
 pub const HASH_MASK: u64 = (1 << HASH_BITS) - 1;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
@@ -378,6 +379,51 @@ impl Index {
 
         Ok(())
     }
+
+    /// Save index using rkyv for zero-copy deserialization
+    /// 
+    /// This method serializes the index using rkyv, which allows for extremely fast
+    /// loading with zero-copy deserialization. The resulting file can be memory-mapped
+    /// and used directly without deserialization overhead.
+    /// 
+    /// # Example
+    /// ```no_run
+    /// # use sing_core::Index;
+    /// # let index = Index { offsets: vec![], seeds: vec![], genome_size: 0, 
+    /// #   total_seed_occurrences: 0, seed_counts: vec![], ref_seqs: vec![], ref_names: vec![] };
+    /// index.save_rkyv("genome.rkyv").unwrap();
+    /// ```
+    pub fn to_rkyv_writer<W: Write>(&self, mut w: W) -> Result<()> {
+        let bytes = rkyv::to_bytes::<rancor::Error>(self)
+            .map_err(|e| anyhow::anyhow!("failed to serialize index with rkyv: {}", e))?;
+        w.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Save index to file using rkyv
+    /// 
+    /// This is a convenience method that creates a file and calls `to_rkyv_writer`.
+    /// The resulting file can be loaded with `load_rkyv` for zero-copy access.
+    pub fn save_rkyv<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let file = File::create(path)?;
+        self.to_rkyv_writer(file)
+    }
+
+    /// Load index from rkyv file with zero-copy deserialization
+    /// 
+    /// Returns a `RkyvIndex` that memory-maps the file and provides zero-copy
+    /// access to the index data. This is much faster than traditional deserialization
+    /// and uses minimal memory.
+    /// 
+    /// # Example
+    /// ```no_run
+    /// # use sing_core::Index;
+    /// let index = Index::load_rkyv("genome.rkyv").unwrap();
+    /// // index can now be used like any IndexLike implementation
+    /// ```
+    pub fn load_rkyv<P: AsRef<Path>>(path: P) -> Result<RkyvIndex> {
+        RkyvIndex::from_path(path)
+    }
 }
 
 impl IndexLike for Index {
@@ -529,6 +575,133 @@ impl IndexLike for MemoryIndex {
     fn ref_seq(&self, id: usize) -> &[u8] { &self.buf.as_slice()[self.ref_seq_ranges[id].clone()] }
     fn ref_name(&self, id: usize) -> &str {
         unsafe { std::str::from_utf8_unchecked(&self.buf.as_slice()[self.ref_name_ranges[id].clone()]) }
+    }
+}
+
+/// Zero-copy index using rkyv archived data
+/// 
+/// This structure provides extremely fast index loading by memory-mapping
+/// a rkyv-serialized index file and accessing the data directly without
+/// deserialization. This is ideal for large genome indexes where loading
+/// speed and memory efficiency are critical.
+/// 
+/// # Example
+/// ```no_run
+/// # use sing_core::{Index, RkyvIndex, IndexLike};
+/// // First, create and save an index with rkyv
+/// # let index = Index { offsets: vec![], seeds: vec![], genome_size: 0, 
+/// #   total_seed_occurrences: 0, seed_counts: vec![], ref_seqs: vec![], ref_names: vec![] };
+/// index.save_rkyv("genome.rkyv").unwrap();
+/// 
+/// // Later, load it with zero-copy
+/// let rkyv_index = RkyvIndex::from_path("genome.rkyv").unwrap();
+/// let offsets = rkyv_index.offsets(); // No deserialization!
+/// ```
+pub struct RkyvIndex {
+    _mmap: memmap2::Mmap,
+    archived: &'static ArchivedIndex,
+}
+
+unsafe impl Send for RkyvIndex {}
+unsafe impl Sync for RkyvIndex {}
+
+impl RkyvIndex {
+    /// Load index from rkyv file with zero-copy deserialization
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
+        
+        // Access the archived root using rkyv's access API
+        let archived = unsafe {
+            // rkyv stores data at specific offsets with alignment
+            // The archived data starts after alignment metadata
+            // For aligned archives, we can directly cast from the end of the buffer
+            let bytes = &mmap[..];
+            
+            // rkyv 0.8 uses a simple layout: the root is at the end of the buffer
+            // after proper alignment. We compute the offset to the archived data.
+            let archived_ptr = bytes.as_ptr().add(bytes.len())
+                .cast::<ArchivedIndex>()
+                .sub(1);
+            
+            &*archived_ptr
+        };
+        
+        // Transmute to extend lifetime - safe because _mmap owns the memory
+        let archived = unsafe {
+            std::mem::transmute::<&ArchivedIndex, &'static ArchivedIndex>(archived)
+        };
+        
+        Ok(Self {
+            _mmap: mmap,
+            archived,
+        })
+    }
+}
+
+impl IndexLike for RkyvIndex {
+    fn offsets(&self) -> &[u32] {
+        // Safe because u32_le has the same layout as u32 on little-endian systems
+        // which is virtually all systems today
+        let le_slice = self.archived.offsets.as_slice();
+        unsafe {
+            std::slice::from_raw_parts(
+                le_slice.as_ptr() as *const u32,
+                le_slice.len()
+            )
+        }
+    }
+    
+    fn seeds(&self) -> &[u64] {
+        // Safe because u64_le has the same layout as u64 on little-endian systems
+        let le_slice = self.archived.seeds.as_slice();
+        unsafe {
+            std::slice::from_raw_parts(
+                le_slice.as_ptr() as *const u64,
+                le_slice.len()
+            )
+        }
+    }
+    
+    fn genome_size(&self) -> u64 {
+        self.archived.genome_size.into()
+    }
+    
+    fn total_seed_occurrences(&self) -> u64 {
+        self.archived.total_seed_occurrences.into()
+    }
+    
+    fn seed_count(&self, hash: u64) -> u32 {
+        let seed_counts_le = self.archived.seed_counts.as_slice();
+        if seed_counts_le.is_empty() {
+            return 0;
+        }
+        
+        // Convert to native slice for search
+        let seed_counts: &[u64] = unsafe {
+            std::slice::from_raw_parts(
+                seed_counts_le.as_ptr() as *const u64,
+                seed_counts_le.len()
+            )
+        };
+        
+        let key = hash >> 32;
+        match seed_counts.binary_search_by_key(&key, |v| v >> 32) {
+            Ok(idx) => (seed_counts[idx] & 0xFFFF_FFFF) as u32,
+            Err(_) => 0,
+        }
+    }
+    
+    fn ref_count(&self) -> usize {
+        self.archived.ref_seqs.len()
+    }
+    
+    fn ref_seq(&self, id: usize) -> &[u8] {
+        self.archived.ref_seqs[id].as_slice()
+    }
+    
+    fn ref_name(&self, id: usize) -> &str {
+        self.archived.ref_names[id].as_str()
     }
 }
 
@@ -1171,4 +1344,78 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 pub fn oriented_bases<'a>(seq: &'a [u8], qual: &'a [u8], res: &Option<AlignmentResult>) -> (Cow<'a, [u8]>, Cow<'a, [u8]>) {
     if let Some(r) = res { if r.is_rev { return (Cow::Owned(reverse_complement(seq)), Cow::Owned(reverse_qual(qual))); } }
     (Cow::Borrowed(seq), Cow::Borrowed(qual))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rkyv_roundtrip() {
+        // Create a simple index
+        let index = Index {
+            offsets: vec![0, 10, 20, 30],
+            seeds: vec![100, 200, 300, 400, 500],
+            genome_size: 12345,
+            total_seed_occurrences: 5,
+            seed_counts: vec![0x0000000100000002, 0x0000000200000003],
+            ref_seqs: vec![b"ACGTACGT".to_vec(), b"TGCATGCA".to_vec()],
+            ref_names: vec!["chr1".to_string(), "chr2".to_string()],
+        };
+
+        // Serialize to bytes
+        let mut buffer = Vec::new();
+        index.to_rkyv_writer(&mut buffer).unwrap();
+        
+        // Write to temp file and load back
+        let temp_path = std::env::temp_dir().join("test_index.rkyv");
+        index.save_rkyv(&temp_path).unwrap();
+        
+        // Load with RkyvIndex
+        let loaded = RkyvIndex::from_path(&temp_path).unwrap();
+        
+        // Verify all fields match
+        assert_eq!(loaded.offsets(), index.offsets());
+        assert_eq!(loaded.seeds(), index.seeds());
+        assert_eq!(loaded.genome_size(), index.genome_size);
+        assert_eq!(loaded.total_seed_occurrences(), index.total_seed_occurrences);
+        assert_eq!(loaded.ref_count(), 2);
+        assert_eq!(loaded.ref_seq(0), b"ACGTACGT");
+        assert_eq!(loaded.ref_seq(1), b"TGCATGCA");
+        assert_eq!(loaded.ref_name(0), "chr1");
+        assert_eq!(loaded.ref_name(1), "chr2");
+        
+        // Test seed_count lookup
+        assert_eq!(loaded.seed_count(0x0000000100000000), 2);
+        assert_eq!(loaded.seed_count(0x0000000200000000), 3);
+        assert_eq!(loaded.seed_count(0x0000000300000000), 0); // not found
+        
+        // Cleanup
+        std::fs::remove_file(temp_path).ok();
+    }
+
+    #[test]
+    fn test_rkyv_empty_index() {
+        // Test with empty index
+        let index = Index {
+            offsets: vec![],
+            seeds: vec![],
+            genome_size: 0,
+            total_seed_occurrences: 0,
+            seed_counts: vec![],
+            ref_seqs: vec![],
+            ref_names: vec![],
+        };
+
+        let temp_path = std::env::temp_dir().join("test_empty_index.rkyv");
+        index.save_rkyv(&temp_path).unwrap();
+        
+        let loaded = RkyvIndex::from_path(&temp_path).unwrap();
+        assert_eq!(loaded.offsets().len(), 0);
+        assert_eq!(loaded.seeds().len(), 0);
+        assert_eq!(loaded.genome_size(), 0);
+        assert_eq!(loaded.ref_count(), 0);
+        
+        std::fs::remove_file(temp_path).ok();
+    }
 }

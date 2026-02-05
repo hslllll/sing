@@ -1,7 +1,7 @@
 [package]
 name = "sing-browser"
 version = "0.6.0"
-edition = "2024"
+edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 sing-core = { path = "../sing-core" }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+rkyv = { version = "0.8", default-features = false, features = ["std", "alloc"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 anyhow = "1.0"
