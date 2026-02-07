@@ -131,6 +131,12 @@ def ensure_bowtie2_index(ref_decomp: Path):
         run(["bowtie2-build", "-t", "8", str(ref_decomp), str(ref_decomp)])
 
 
+def ensure_minimap2_index(ref_decomp: Path):
+    idx = Path(str(ref_decomp) + ".mmi")
+    if not idx.exists():
+        run(["minimap2", "-d", str(idx), str(ref_decomp)])
+
+
 def ensure_filtered_ref(ref_decomp: Path) -> Path:
     filtered = Path(str(ref_decomp).replace(".fa", ".filtered.fa"))
     if not filtered.exists():
@@ -300,7 +306,10 @@ def benchmark_all(mode, threads_override):
 
     ensure_bwa_index(filtered_ref)
     ensure_bowtie2_index(filtered_ref)
+    ensure_minimap2_index(filtered_ref)
     ensure_sing_index(filtered_ref, index_prefix)
+
+    minimap_idx = Path(str(filtered_ref) + ".mmi")
 
     coverage_list = [1, 3]
     mut_rates = [0.001, 0.01]
@@ -327,7 +336,7 @@ def benchmark_all(mode, threads_override):
                 run(["dwgsim", "-C", str(coverage), "-1", "150", "-2", "150", "-R", "0", "-X", "0", "-r", str(mut_rate), "-y", "0", "-H", str(filtered_ref), f"sim_{exp_id}"])
 
             tool_cmds = {
-                "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(filtered_ref), str(r1), str(r2)],
+                "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(minimap_idx), str(r1), str(r2)],
                 "BWA-MEM2": ["bwa-mem2", "mem", "-t", str(threads), str(filtered_ref), str(r1), str(r2)],
                 "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
                 "Bowtie2": ["bowtie2", "-p", str(threads), "-x", str(filtered_ref), "-1", str(r1), "-2", str(r2)],
@@ -387,6 +396,103 @@ def benchmark_all(mode, threads_override):
             pass
 
 
+def benchmark_all_sing(mode, threads_override):
+    """Run only Sing on the same dataset as benchmark_all"""
+    cfg = get_mode_config(mode)
+    ref_gz = Path(cfg["ref_name"] + ".gz")
+    ref_decomp = Path(cfg["ref_name"])
+    ref_url = cfg["ref_url"]
+    index_prefix = Path(cfg["index_prefix"] + ".idx")
+
+    ensure_tools("dwgsim", "samtools", "wget", "pigz")
+    download_and_decompress(ref_gz, ref_url, ref_decomp)
+
+    filtered_ref = ensure_top_n_ref(ref_decomp, cfg.get("top_n"))
+    if cfg.get("top_n"):
+        index_prefix = Path(str(index_prefix).replace(".idx", f".top{cfg['top_n']}.idx"))
+
+    ensure_sing_index(filtered_ref, index_prefix)
+
+    coverage_list = [1, 3]
+    mut_rates = [0.001, 0.01]
+    threads = threads_override
+
+    output_csv = Path(f"benchmark_results_f1_sing_only.{mode}.csv")
+    if not output_csv.exists():
+        output_csv.write_text("Exp_ID,Tool,Time_ms,Mem_kb,TotalReads,TP,FP,FN,Precision,Recall,F1,Mode\n")
+
+    workdir = Path(f"bench_all_sing_{mode}")
+    ensure_dir(workdir)
+
+    for coverage in coverage_list:
+        for mut_rate in mut_rates:
+            exp_id = f"Cov_{coverage}_Mut_{mut_rate}.{mode}"
+            print("=================================================")
+            print(f"Running: {exp_id} (Cov: {coverage}, Mut: {mut_rate}) - Sing Only")
+            print("=================================================")
+
+            # Use same read files as benchmark_all
+            r1 = Path(f"sim_{exp_id}.bwa.read1.fastq.gz")
+            r2 = Path(f"sim_{exp_id}.bwa.read2.fastq.gz")
+
+            if not (r1.exists() and r2.exists()):
+                run(["dwgsim", "-C", str(coverage), "-1", "150", "-2", "150", "-R", "0", "-X", "0", "-r", str(mut_rate), "-y", "0", "-H", str(filtered_ref), f"sim_{exp_id}"])
+
+            # Run only Sing
+            tool = "Sing"
+            cmd = ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)]
+            bam_path = workdir / "sing.bam"
+            
+            print(f"Running {tool}...")
+            elapsed, mem_kb = run_mapper_to_sorted_bam(cmd, bam_path, threads)
+            
+            if elapsed is None:
+                time_ms = "N/A"
+                mem_kb_val = "N/A"
+            else:
+                time_ms = int(elapsed * 1000)
+                mem_kb_val = mem_kb if mem_kb is not None else "N/A"
+
+            # Load bam and calculate metrics
+            bam_paths = {tool: bam_path}
+            truth_dict, tool_results = load_bams_and_build_truth(bam_paths)
+            total_reads = len(truth_dict)
+
+            if tool in tool_results and len(tool_results[tool]) > 0:
+                tp, fp, fn, prec, rec, f1 = calculate_metrics(truth_dict, tool_results[tool])
+                csv_line = f"{exp_id},{tool},{time_ms},{mem_kb_val},{total_reads},{tp},{fp},{fn},{prec:.4f},{rec:.4f},{f1:.4f},{mode}"
+            else:
+                csv_line = f"{exp_id},{tool},{time_ms},{mem_kb_val},{total_reads},0,0,0,0,0,0,{mode}"
+            
+            with output_csv.open("a") as f:
+                f.write(csv_line + "\n")
+
+            print("\n--- Summary (Sing Only) ---")
+            print("Tool        | Time_ms | Mem_KB  | Precision | Recall   | F1")
+            if tool in tool_results and len(tool_results[tool]) > 0:
+                tp, fp, fn, prec, rec, f1 = calculate_metrics(truth_dict, tool_results[tool])
+                print(f"{tool:<10} | {time_ms:<7} | {mem_kb_val:<7} | {prec:6.2f}%   | {rec:6.2f}%   | {f1:6.2f}")
+            else:
+                print(f"{tool:<10} | {time_ms:<7} | {mem_kb_val:<7} | FAILED")
+
+            # Cleanup
+            bam_path.unlink(missing_ok=True)
+            Path(str(bam_path) + ".bai").unlink(missing_ok=True)
+
+    if output_csv.exists():
+        print(f"CSV saved: {output_csv}")
+    else:
+        print(f"CSV missing: {output_csv}")
+
+    if workdir.exists():
+        for leftover in workdir.glob("*.unsorted.bam"):
+            leftover.unlink(missing_ok=True)
+        try:
+            workdir.rmdir()
+        except OSError:
+            pass
+
+
 def benchmark_minimap(mode, threads_override):
     cfg = get_mode_config(mode)
     ref_gz = Path(cfg["ref_name"] + ".gz")
@@ -402,6 +508,9 @@ def benchmark_minimap(mode, threads_override):
         index_prefix = Path(str(index_prefix).replace(".idx", f".top{cfg['top_n']}.idx"))
 
     ensure_sing_index(filtered_ref, index_prefix)
+    ensure_minimap2_index(filtered_ref)
+
+    minimap_idx = Path(str(filtered_ref) + ".mmi")
 
     reads_n = 100000
     mut_rates = [0.001, 0.01]
@@ -427,7 +536,7 @@ def benchmark_minimap(mode, threads_override):
             run(["dwgsim", "-N", str(reads_n), "-1", "150", "-2", "150", "-R", "0", "-X", "0", "-r", str(mut_rate), "-y", "0", "-H", str(filtered_ref), f"sim_{exp_id}"])
 
         tool_cmds = {
-            "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(filtered_ref), str(r1), str(r2)],
+            "Minimap2": ["minimap2", "-t", str(threads), "-ax", "sr", str(minimap_idx), str(r1), str(r2)],
             "Sing": ["./target/release/sing", "map", "-t", str(threads), str(index_prefix), "-1", str(r1), "-2", str(r2)],
         }
 
@@ -610,6 +719,9 @@ def benchmark_gatk(mode, threads_override):
         run_shell(f"sed 's/ .*//' <(pigz -p 8 -cd '{ref_gz}') > '{ref}'")
 
     ref = ensure_top_n_ref(ref, cfg.get("top_n"))
+    ensure_minimap2_index(ref)
+
+    minimap_idx = Path(str(ref) + ".mmi")
 
     r1 = out_dir / "sim_reads.bwa.read1.fastq.gz"
     r2 = out_dir / "sim_reads.bwa.read2.fastq.gz"
@@ -671,7 +783,7 @@ def benchmark_gatk(mode, threads_override):
         map_and_track("bwa", ["bwa-mem2", "mem", "-t", str(threads), "-R", f"@RG\\tID:bwa\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(ref), str(r1), str(r2)])
 
     if not (out_dir / "mini.bam").exists():
-        map_and_track("mini", ["minimap2", "-t", str(threads), "-ax", "sr", "-R", f"@RG\\tID:mini\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(ref), str(r1), str(r2)])
+        map_and_track("mini", ["minimap2", "-t", str(threads), "-ax", "sr", "-R", f"@RG\\tID:mini\\tSM:{cfg['species']}\\tPL:ILLUMINA", str(minimap_idx), str(r1), str(r2)])
 
     dict_path = Path(str(ref).replace(".fa", ".dict"))
     if ref.suffix != ".fa":
@@ -775,7 +887,7 @@ def benchmark_gatk(mode, threads_override):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("threads", type=int)
-    parser.add_argument("benchmark", choices=["gatk", "all", "minimap", "strobe", "compile"])
+    parser.add_argument("benchmark", choices=["gatk", "all", "all-sing", "minimap", "strobe", "compile"])
     parser.add_argument("mode", nargs="?", choices=["y", "a", "m", "h", "b"])
     args = parser.parse_args()
 
@@ -786,6 +898,8 @@ def main():
         benchmark_gatk(args.mode, args.threads)
     elif args.benchmark == "all":
         benchmark_all(args.mode, args.threads)
+    elif args.benchmark == "all-sing":
+        benchmark_all_sing(args.mode, args.threads)
     elif args.benchmark == "minimap":
         benchmark_minimap(args.mode, args.threads)
     elif args.benchmark == "strobe":

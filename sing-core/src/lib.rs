@@ -2,11 +2,11 @@ use anyhow::{bail, Context, Result};
 use bytemuck::try_cast_slice;
 use memmap2::MmapOptions;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
+use rkyv::{Archive, Serialize, Deserialize, rancor};
 
 // SIMD support detection - disabled for WASM targets
 #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
@@ -30,6 +30,7 @@ pub struct Config {
     pub gap_open: i32,
     pub gap_ext: i32,
     pub x_drop: i32,
+    pub max_seed_hard_occ: usize,
     pub max_seed_occ: usize,
     pub max_candidates: usize,
     pub min_votes: usize,
@@ -45,8 +46,9 @@ pub static CONFIG: Config = Config {
     gap_open: -2,
     gap_ext: -1,
     x_drop: 15,
+    max_seed_hard_occ: 500,
     max_seed_occ: 100,
-    max_candidates: 750,
+    max_candidates: 7500,
     min_votes: 2,
     lookup_dist: 4,
     pair_max_dist: 1000,
@@ -107,12 +109,11 @@ pub const RID_MASK: u64 = (1 << RID_BITS) - 1;
 pub const POS_MASK: u64 = (1 << POS_BITS) - 1;
 pub const HASH_MASK: u64 = (1 << HASH_BITS) - 1;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct Index {
     pub offsets: Vec<u32>,
     pub seeds: Vec<u64>,
     pub genome_size: u64,
-    pub max_hits: u32,
     pub total_seed_occurrences: u64,
     pub seed_counts: Vec<u64>,
     pub ref_seqs: Vec<Vec<u8>>,
@@ -123,7 +124,6 @@ pub trait IndexLike {
     fn offsets(&self) -> &[u32];
     fn seeds(&self) -> &[u64];
     fn genome_size(&self) -> u64;
-    fn max_hits(&self) -> usize;
     fn total_seed_occurrences(&self) -> u64;
     fn seed_count(&self, hash: u64) -> u32;
     fn ref_count(&self) -> usize;
@@ -195,11 +195,11 @@ impl Index {
             pos = end;
         }
 
-        let max_hits = if pos + 8 <= data.len() {
-            read_u64(data, &mut pos, "read max_hits")? as u32
-        } else {
-            u32::MAX
-        };
+        // Align to 8 bytes before seed_counts block
+        let padding = (8 - (pos % 8)) % 8;
+        let padded = pos.checked_add(padding).filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read seed_counts padding: unexpected EOF"))?;
+        pos = padded;
 
         let (total_seed_occurrences, seed_counts) = if pos + 16 <= data.len() {
             let total = read_u64(data, &mut pos, "read total_seed_occurrences")?;
@@ -222,7 +222,6 @@ impl Index {
             offsets,
             seeds,
             genome_size,
-            max_hits,
             total_seed_occurrences,
             seed_counts,
             ref_seqs,
@@ -282,17 +281,18 @@ impl Index {
             ref_names.push(String::from_utf8(name_buf).context("utf8 ref name")?);
         }
 
-        let max_hits = {
-            let mut buf = [0u8; 8];
-            match r.read(&mut buf).context("read max_hits")? {
-                0 => u32::MAX,
-                n if n < 8 => {
-                    r.read_exact(&mut buf[n..]).context("read max_hits")?;
-                    u64::from_le_bytes(buf) as u32
-                }
-                _ => u64::from_le_bytes(buf) as u32,
-            }
-        };
+        // Align to 8 bytes before seed_counts block
+        let pos_offsets = 8usize + offsets.len().saturating_mul(4);
+        let pad_offsets = (8 - (pos_offsets % 8)) % 8;
+        let pos_after_offsets = pos_offsets + pad_offsets;
+        let pos_seeds = pos_after_offsets + 8 + seeds.len().saturating_mul(8);
+        let pos_refs = pos_seeds + 8 + ref_seqs.iter().map(|s| 8 + s.len()).sum::<usize>();
+        let pos_names = pos_refs + 8 + ref_names.iter().map(|n| 8 + n.len()).sum::<usize>();
+        let padding = (8 - (pos_names % 8)) % 8;
+        if padding != 0 {
+            let mut pad = [0u8; 8];
+            r.read_exact(&mut pad[..padding]).context("read seed_counts padding")?;
+        }
 
         let (total_seed_occurrences, seed_counts) = {
             let mut buf = [0u8; 8];
@@ -322,7 +322,6 @@ impl Index {
             offsets,
             seeds,
             genome_size,
-            max_hits,
             total_seed_occurrences,
             seed_counts,
             ref_seqs,
@@ -362,7 +361,16 @@ impl Index {
             w.write_all(bytes)?;
         }
 
-        w.write_all(&(self.max_hits as u64).to_le_bytes())?;
+        // Align to 8 bytes before seed_counts block
+        let pos = 8usize + self.offsets.len().saturating_mul(4) + 8 + self.seeds.len().saturating_mul(8)
+            + 8 + self.ref_seqs.iter().map(|s| 8 + s.len()).sum::<usize>()
+            + 8 + self.ref_names.iter().map(|n| 8 + n.len()).sum::<usize>();
+        let padding = (8 - (pos % 8)) % 8;
+        if padding != 0 {
+            let pad = [0u8; 8];
+            w.write_all(&pad[..padding])?;
+        }
+
         w.write_all(&self.total_seed_occurrences.to_le_bytes())?;
         w.write_all(&(self.seed_counts.len() as u64).to_le_bytes())?;
         for v in &self.seed_counts {
@@ -371,13 +379,57 @@ impl Index {
 
         Ok(())
     }
+
+    /// Save index using rkyv for zero-copy deserialization
+    /// 
+    /// This method serializes the index using rkyv, which allows for extremely fast
+    /// loading with zero-copy deserialization. The resulting file can be memory-mapped
+    /// and used directly without deserialization overhead.
+    /// 
+    /// # Example
+    /// ```no_run
+    /// # use sing_core::Index;
+    /// # let index = Index { offsets: vec![], seeds: vec![], genome_size: 0, 
+    /// #   total_seed_occurrences: 0, seed_counts: vec![], ref_seqs: vec![], ref_names: vec![] };
+    /// index.save_rkyv("genome.rkyv").unwrap();
+    /// ```
+    pub fn to_rkyv_writer<W: Write>(&self, mut w: W) -> Result<()> {
+        let bytes = rkyv::to_bytes::<rancor::Error>(self)
+            .map_err(|e| anyhow::anyhow!("failed to serialize index with rkyv: {}", e))?;
+        w.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Save index to file using rkyv
+    /// 
+    /// This is a convenience method that creates a file and calls `to_rkyv_writer`.
+    /// The resulting file can be loaded with `load_rkyv` for zero-copy access.
+    pub fn save_rkyv<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let file = File::create(path)?;
+        self.to_rkyv_writer(file)
+    }
+
+    /// Load index from rkyv file with zero-copy deserialization
+    /// 
+    /// Returns a `RkyvIndex` that memory-maps the file and provides zero-copy
+    /// access to the index data. This is much faster than traditional deserialization
+    /// and uses minimal memory.
+    /// 
+    /// # Example
+    /// ```no_run
+    /// # use sing_core::Index;
+    /// let index = Index::load_rkyv("genome.rkyv").unwrap();
+    /// // index can now be used like any IndexLike implementation
+    /// ```
+    pub fn load_rkyv<P: AsRef<Path>>(path: P) -> Result<RkyvIndex> {
+        RkyvIndex::from_path(path)
+    }
 }
 
 impl IndexLike for Index {
     fn offsets(&self) -> &[u32] { &self.offsets }
     fn seeds(&self) -> &[u64] { &self.seeds }
     fn genome_size(&self) -> u64 { self.genome_size }
-    fn max_hits(&self) -> usize { self.max_hits as usize }
     fn total_seed_occurrences(&self) -> u64 { self.total_seed_occurrences }
 
     fn seed_count(&self, hash: u64) -> u32 {
@@ -411,9 +463,9 @@ pub struct MemoryIndex {
     seeds_ptr: *const u64,
     seeds_len: usize,
     genome_size: u64,
-    max_hits: u32,
     total_seed_occurrences: u64,
-    seed_counts: Vec<u64>,
+    seed_counts_ptr: *const u64,
+    seed_counts_len: usize,
     ref_seq_ranges: Vec<Range<usize>>,
     ref_name_ranges: Vec<Range<usize>>,
 }
@@ -424,9 +476,7 @@ unsafe impl Sync for MemoryIndex {}
 impl MemoryIndex {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path)?;
-        let mmap = unsafe {
-            MmapOptions::new().populate().map(&file).context("mmap index file")?
-        };
+        let mmap = unsafe { MmapOptions::new().populate().map(&file).context("mmap index file")? };
         Self::from_data(IndexBuffer::Mmap(mmap))
     }
 
@@ -484,25 +534,26 @@ impl MemoryIndex {
             pos = end;
         }
 
-        let max_hits = if pos + 8 <= data.len() {
-            read_u64(data, &mut pos, "read max_hits")? as u32
-        } else { u32::MAX };
+        // Align to 8 bytes before seed_counts block
+        let padding = (8 - (pos % 8)) % 8;
+        pos = pos.checked_add(padding).filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("read seed_counts padding: unexpected EOF"))?;
 
-        let (total_seed_occurrences, seed_counts) = if pos + 16 <= data.len() {
+        let (total_seed_occurrences, seed_counts_ptr, seed_counts_len) = if pos + 16 <= data.len() {
             let total = read_u64(data, &mut pos, "read total_seed_occurrences")?;
             let counts_len = read_u64(data, &mut pos, "read seed_counts len")? as usize;
             let counts_bytes = counts_len.checked_mul(8).and_then(|n| pos.checked_add(n))
                 .filter(|&end| end <= data.len())
                 .ok_or_else(|| anyhow::anyhow!("read seed_counts: unexpected EOF"))?;
-            let mut counts = Vec::with_capacity(counts_len);
-            for chunk in data[pos..counts_bytes].chunks_exact(8) {
-                counts.push(u64::from_le_bytes(chunk.try_into().unwrap()));
-            }
-            (total, counts)
-        } else { (0, Vec::new()) };
+            let counts_slice = try_cast_slice::<u8, u64>(&data[pos..counts_bytes])
+                .map_err(|_| anyhow::anyhow!("read seed_counts: unaligned data"))?;
+            let ptr = counts_slice.as_ptr();
+            let len = counts_slice.len();
+            (total, ptr, len)
+        } else { (0, std::ptr::null(), 0) };
 
-        Ok(Self { buf, offsets_ptr, offsets_len, seeds_ptr, seeds_len, genome_size, max_hits,
-            total_seed_occurrences, seed_counts, ref_seq_ranges, ref_name_ranges })
+        Ok(Self { buf, offsets_ptr, offsets_len, seeds_ptr, seeds_len, genome_size,
+            total_seed_occurrences, seed_counts_ptr, seed_counts_len, ref_seq_ranges, ref_name_ranges })
     }
 }
 
@@ -510,13 +561,13 @@ impl IndexLike for MemoryIndex {
     fn offsets(&self) -> &[u32] { unsafe { std::slice::from_raw_parts(self.offsets_ptr, self.offsets_len) } }
     fn seeds(&self) -> &[u64] { unsafe { std::slice::from_raw_parts(self.seeds_ptr, self.seeds_len) } }
     fn genome_size(&self) -> u64 { self.genome_size }
-    fn max_hits(&self) -> usize { self.max_hits as usize }
     fn total_seed_occurrences(&self) -> u64 { self.total_seed_occurrences }
     fn seed_count(&self, hash: u64) -> u32 {
-        if self.seed_counts.is_empty() { return 0; }
+        if self.seed_counts_len == 0 { return 0; }
+        let seed_counts = unsafe { std::slice::from_raw_parts(self.seed_counts_ptr, self.seed_counts_len) };
         let key = hash >> 32;
-        match self.seed_counts.binary_search_by_key(&key, |v| v >> 32) {
-            Ok(idx) => (self.seed_counts[idx] & 0xFFFF_FFFF) as u32,
+        match seed_counts.binary_search_by_key(&key, |v| v >> 32) {
+            Ok(idx) => (seed_counts[idx] & 0xFFFF_FFFF) as u32,
             Err(_) => 0,
         }
     }
@@ -527,11 +578,137 @@ impl IndexLike for MemoryIndex {
     }
 }
 
+/// Zero-copy index using rkyv archived data
+/// 
+/// This structure provides extremely fast index loading by memory-mapping
+/// a rkyv-serialized index file and accessing the data directly without
+/// deserialization. This is ideal for large genome indexes where loading
+/// speed and memory efficiency are critical.
+/// 
+/// # Example
+/// ```no_run
+/// # use sing_core::{Index, RkyvIndex, IndexLike};
+/// // First, create and save an index with rkyv
+/// # let index = Index { offsets: vec![], seeds: vec![], genome_size: 0, 
+/// #   total_seed_occurrences: 0, seed_counts: vec![], ref_seqs: vec![], ref_names: vec![] };
+/// index.save_rkyv("genome.rkyv").unwrap();
+/// 
+/// // Later, load it with zero-copy
+/// let rkyv_index = RkyvIndex::from_path("genome.rkyv").unwrap();
+/// let offsets = rkyv_index.offsets(); // No deserialization!
+/// ```
+pub struct RkyvIndex {
+    _mmap: memmap2::Mmap,
+    archived: &'static ArchivedIndex,
+}
+
+unsafe impl Send for RkyvIndex {}
+unsafe impl Sync for RkyvIndex {}
+
+impl RkyvIndex {
+    /// Load index from rkyv file with zero-copy deserialization
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { MmapOptions::new().populate().map(&file)? };
+        
+        // Access the archived root using rkyv's access API
+        let archived = unsafe {
+            // rkyv stores data at specific offsets with alignment
+            // The archived data starts after alignment metadata
+            // For aligned archives, we can directly cast from the end of the buffer
+            let bytes = &mmap[..];
+            
+            // rkyv 0.8 uses a simple layout: the root is at the end of the buffer
+            // after proper alignment. We compute the offset to the archived data.
+            let archived_ptr = bytes.as_ptr().add(bytes.len())
+                .cast::<ArchivedIndex>()
+                .sub(1);
+            
+            &*archived_ptr
+        };
+        
+        // Transmute to extend lifetime - safe because _mmap owns the memory
+        let archived = unsafe {
+            std::mem::transmute::<&ArchivedIndex, &'static ArchivedIndex>(archived)
+        };
+        
+        Ok(Self {
+            _mmap: mmap,
+            archived,
+        })
+    }
+}
+
+impl IndexLike for RkyvIndex {
+    fn offsets(&self) -> &[u32] {
+        // Safe because u32_le has the same layout as u32 on little-endian systems
+        // which is virtually all systems today
+        let le_slice = self.archived.offsets.as_slice();
+        unsafe {
+            std::slice::from_raw_parts(
+                le_slice.as_ptr() as *const u32,
+                le_slice.len()
+            )
+        }
+    }
+    
+    fn seeds(&self) -> &[u64] {
+        // Safe because u64_le has the same layout as u64 on little-endian systems
+        let le_slice = self.archived.seeds.as_slice();
+        unsafe {
+            std::slice::from_raw_parts(
+                le_slice.as_ptr() as *const u64,
+                le_slice.len()
+            )
+        }
+    }
+    
+    fn genome_size(&self) -> u64 {
+        self.archived.genome_size.into()
+    }
+    
+    fn total_seed_occurrences(&self) -> u64 {
+        self.archived.total_seed_occurrences.into()
+    }
+    
+    fn seed_count(&self, hash: u64) -> u32 {
+        let seed_counts_le = self.archived.seed_counts.as_slice();
+        if seed_counts_le.is_empty() {
+            return 0;
+        }
+        
+        // Convert to native slice for search
+        let seed_counts: &[u64] = unsafe {
+            std::slice::from_raw_parts(
+                seed_counts_le.as_ptr() as *const u64,
+                seed_counts_le.len()
+            )
+        };
+        
+        let key = hash >> 32;
+        match seed_counts.binary_search_by_key(&key, |v| v >> 32) {
+            Ok(idx) => (seed_counts[idx] & 0xFFFF_FFFF) as u32,
+            Err(_) => 0,
+        }
+    }
+    
+    fn ref_count(&self) -> usize {
+        self.archived.ref_seqs.len()
+    }
+    
+    fn ref_seq(&self, id: usize) -> &[u8] {
+        self.archived.ref_seqs[id].as_slice()
+    }
+    
+    fn ref_name(&self, id: usize) -> &str {
+        self.archived.ref_names[id].as_str()
+    }
+}
+
 impl<T: IndexLike> IndexLike for std::sync::Arc<T> {
     fn offsets(&self) -> &[u32] { self.as_ref().offsets() }
     fn seeds(&self) -> &[u64] { self.as_ref().seeds() }
     fn genome_size(&self) -> u64 { self.as_ref().genome_size() }
-    fn max_hits(&self) -> usize { self.as_ref().max_hits() }
     fn total_seed_occurrences(&self) -> u64 { self.as_ref().total_seed_occurrences() }
     fn seed_count(&self, hash: u64) -> u32 { self.as_ref().seed_count(hash) }
     fn ref_count(&self) -> usize { self.as_ref().ref_count() }
@@ -559,9 +736,11 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     let mut ref_seqs = Vec::new();
     let mut ref_names = Vec::new();
     let mut total_bases: u64 = 0;
-    let mut total_seed_occurrences: u64 = 0;
+    let mut total_seed_occurrences_raw: u64 = 0;
+    let mut total_seed_occurrences_kept: u64 = 0;
     let mut mins = Vec::with_capacity(1024);
-    let mut counts: HashMap<u64, u32> = HashMap::new();
+    let mut bucket_counts = vec![0u32; 1 << RADIX];
+    let mut hash_counts = vec![0u32; 1 << HASH_BITS];
 
     eprintln!("Building streaming index...");
 
@@ -569,9 +748,12 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
         ref_names.push(name.into());
         total_bases += seq.len() as u64;
         get_syncmers(&seq, &mut mins);
-        total_seed_occurrences = total_seed_occurrences.saturating_add(mins.len() as u64);
+        total_seed_occurrences_raw = total_seed_occurrences_raw.saturating_add(mins.len() as u64);
         for &(h, _p) in mins.iter() {
-            *counts.entry(h).or_insert(0) = counts.get(&h).unwrap_or(&0).saturating_add(1);
+            let hash_idx = ((h >> (SHIFT - HASH_BITS)) & HASH_MASK) as usize;
+            if let Some(slot) = hash_counts.get_mut(hash_idx) {
+                *slot = slot.saturating_add(1);
+            }
         }
         ref_seqs.push(seq);
     }
@@ -586,16 +768,18 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     }
 
     eprintln!("  Loaded {} bp across {} references", total_bases, ref_seqs.len());
-    eprintln!("  Counted {} unique seeds", counts.len());
+    eprintln!("  Counted {} total seeds (raw)", total_seed_occurrences_raw);
 
-    let max_hits = CONFIG.max_seed_occ;
+    let hard_cap = CONFIG.max_seed_hard_occ as u32;
 
-    eprintln!("  Total seed occurrences: {}, max_hits={}", total_seed_occurrences, max_hits);
-
-    let mut bucket_counts = vec![0u32; 1 << RADIX];
+    // Second pass: count buckets for seeds under the hard occurrence cap
+    bucket_counts.fill(0);
     for seq in ref_seqs.iter() {
         get_syncmers(seq, &mut mins);
         for &(h, _p) in mins.iter() {
+            let hash_idx = ((h >> (SHIFT - HASH_BITS)) & HASH_MASK) as usize;
+            if hash_counts[hash_idx] > hard_cap { continue; }
+            total_seed_occurrences_kept = total_seed_occurrences_kept.saturating_add(1);
             let bucket = (h >> SHIFT) as usize;
             if bucket < bucket_counts.len() {
                 bucket_counts[bucket] = bucket_counts[bucket].saturating_add(1);
@@ -613,15 +797,17 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
     let mut final_seeds: Vec<u64> = vec![0u64; running as usize];
     let mut write_offsets = offsets.clone();
 
+    // Third pass: write only seeds under the hard occurrence cap
     for (rid, seq) in ref_seqs.iter().enumerate() {
         get_syncmers(seq, &mut mins);
         for &(h, p) in mins.iter() {
-            if counts.get(&h).map_or(false, |&c| c as usize > max_hits) { continue; }
+            let hash_idx = ((h >> (SHIFT - HASH_BITS)) & HASH_MASK) as usize;
+            if hash_counts[hash_idx] > hard_cap { continue; }
             let bucket = (h >> SHIFT) as usize;
             if bucket >= write_offsets.len() { continue; }
             let idx = write_offsets[bucket] as usize;
             if idx >= final_seeds.len() { continue; }
-            
+
             let hash_rem = (h >> (SHIFT - HASH_BITS)) & HASH_MASK;
             let rid_part = (rid as u64) & RID_MASK;
             let pos_part = (p as u64) & POS_MASK;
@@ -636,13 +822,13 @@ where I: IntoIterator<Item = (S, Vec<u8>)>, S: Into<String>,
         if start < end { final_seeds[start..end].sort_unstable_by_key(|s| s >> (RID_BITS + POS_BITS)); }
     }
 
+    eprintln!("  Keeping {} seeds after hard cap {}", total_seed_occurrences_kept, CONFIG.max_seed_hard_occ);
     eprintln!("  Index built: {} seeds", final_seeds.len());
 
-    let mut seed_counts: Vec<u64> = counts.iter().map(|(&h, &c)| ((h >> 32) << 32) | (c as u64)).collect();
-    seed_counts.sort_unstable_by_key(|v| v >> 32);
+    let seed_counts: Vec<u64> = Vec::new();
 
-    Ok(Index { offsets, seeds: final_seeds, genome_size: total_bases, max_hits: max_hits as u32,
-        total_seed_occurrences, seed_counts, ref_seqs, ref_names })
+    Ok(Index { offsets, seeds: final_seeds, genome_size: total_bases,
+        total_seed_occurrences: total_seed_occurrences_kept, seed_counts, ref_seqs, ref_names })
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -802,7 +988,7 @@ pub fn cigar_ref_span(cigar: &[u32]) -> i32 {
 fn best_diag_for_group(hits: &[Hit], counts: &mut Vec<(i32, u16)>) -> Option<(i32, usize)> {
     if hits.is_empty() { return None; }
     counts.clear();
-    
+
     for hit in hits {
         let d = hit.diag;
         if let Some(entry) = counts.iter_mut().find(|(diag, _)| *diag == d) {
@@ -811,20 +997,26 @@ fn best_diag_for_group(hits: &[Hit], counts: &mut Vec<(i32, u16)>) -> Option<(i3
             counts.push((d, 1));
         }
     }
-    
-    let (best_diag, best_count) = counts.iter().max_by_key(|&&(_, c)| c).copied()?;
-    Some((best_diag, best_count as usize))
+
+    let mut best: Option<(i32, usize)> = None;
+    for &(diag, count) in counts.iter() {
+        let count_usize = count as usize;
+        match best {
+            Some((_, best_count)) if best_count >= count_usize => {}
+            _ => best = Some((diag, count_usize)),
+        }
+    }
+
+    best
 }
 
 #[inline(always)]
-fn anchor_for_diag(group: &[Hit], diag: i32) -> Option<(i32, u32)> {
-    let mut first = None;
-    let mut last = None;
-    for hit in group { if hit.diag == diag { if first.is_none() { first = Some(hit.read_pos); } last = Some(hit.read_pos); } }
-    Some((diag, (first? + last?) / 2))
+fn anchor_for_diag(hits: &[Hit], target_diag: i32) -> Option<(i32, u32)> {
+    hits
+        .iter()
+        .find(|h| h.diag == target_diag)
+        .map(|h| (target_diag, h.read_pos))
 }
-
-const CASE_MASK: u64 = 0x2020202020202020;
 
 #[inline(always)]
 fn eq_base(a: u8, b: u8) -> bool {
@@ -864,6 +1056,7 @@ unsafe fn simd_cmp_16(a: &[u8], b: &[u8]) -> u16 {
 #[inline(always)]
 fn scalar_cmp_8(a: &[u8], b: &[u8]) -> bool {
     unsafe {
+        const CASE_MASK: u64 = 0x2020_2020_2020_2020;
         let r_val = std::ptr::read_unaligned(a.as_ptr() as *const u64) | CASE_MASK;
         let g_val = std::ptr::read_unaligned(b.as_ptr() as *const u64) | CASE_MASK;
         r_val == g_val
@@ -1055,7 +1248,7 @@ pub fn align<I: IndexLike>(seq: &[u8], idx: &I, state: &mut State, rev: &mut Vec
     let State { mins, candidates, diag_counts, group_buf, cigar_buf: _ } = state;
     let cfg = &CONFIG;
     candidates.clear();
-    let max_hits = idx.max_hits();
+    let max_hits = cfg.max_seed_occ;
     let mut capped = false;
 
     get_syncmers(seq, mins);
@@ -1151,4 +1344,78 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 pub fn oriented_bases<'a>(seq: &'a [u8], qual: &'a [u8], res: &Option<AlignmentResult>) -> (Cow<'a, [u8]>, Cow<'a, [u8]>) {
     if let Some(r) = res { if r.is_rev { return (Cow::Owned(reverse_complement(seq)), Cow::Owned(reverse_qual(qual))); } }
     (Cow::Borrowed(seq), Cow::Borrowed(qual))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rkyv_roundtrip() {
+        // Create a simple index
+        let index = Index {
+            offsets: vec![0, 10, 20, 30],
+            seeds: vec![100, 200, 300, 400, 500],
+            genome_size: 12345,
+            total_seed_occurrences: 5,
+            seed_counts: vec![0x0000000100000002, 0x0000000200000003],
+            ref_seqs: vec![b"ACGTACGT".to_vec(), b"TGCATGCA".to_vec()],
+            ref_names: vec!["chr1".to_string(), "chr2".to_string()],
+        };
+
+        // Serialize to bytes
+        let mut buffer = Vec::new();
+        index.to_rkyv_writer(&mut buffer).unwrap();
+        
+        // Write to temp file and load back
+        let temp_path = std::env::temp_dir().join("test_index.rkyv");
+        index.save_rkyv(&temp_path).unwrap();
+        
+        // Load with RkyvIndex
+        let loaded = RkyvIndex::from_path(&temp_path).unwrap();
+        
+        // Verify all fields match
+        assert_eq!(loaded.offsets(), index.offsets());
+        assert_eq!(loaded.seeds(), index.seeds());
+        assert_eq!(loaded.genome_size(), index.genome_size);
+        assert_eq!(loaded.total_seed_occurrences(), index.total_seed_occurrences);
+        assert_eq!(loaded.ref_count(), 2);
+        assert_eq!(loaded.ref_seq(0), b"ACGTACGT");
+        assert_eq!(loaded.ref_seq(1), b"TGCATGCA");
+        assert_eq!(loaded.ref_name(0), "chr1");
+        assert_eq!(loaded.ref_name(1), "chr2");
+        
+        // Test seed_count lookup
+        assert_eq!(loaded.seed_count(0x0000000100000000), 2);
+        assert_eq!(loaded.seed_count(0x0000000200000000), 3);
+        assert_eq!(loaded.seed_count(0x0000000300000000), 0); // not found
+        
+        // Cleanup
+        std::fs::remove_file(temp_path).ok();
+    }
+
+    #[test]
+    fn test_rkyv_empty_index() {
+        // Test with empty index
+        let index = Index {
+            offsets: vec![],
+            seeds: vec![],
+            genome_size: 0,
+            total_seed_occurrences: 0,
+            seed_counts: vec![],
+            ref_seqs: vec![],
+            ref_names: vec![],
+        };
+
+        let temp_path = std::env::temp_dir().join("test_empty_index.rkyv");
+        index.save_rkyv(&temp_path).unwrap();
+        
+        let loaded = RkyvIndex::from_path(&temp_path).unwrap();
+        assert_eq!(loaded.offsets().len(), 0);
+        assert_eq!(loaded.seeds().len(), 0);
+        assert_eq!(loaded.genome_size(), 0);
+        assert_eq!(loaded.ref_count(), 0);
+        
+        std::fs::remove_file(temp_path).ok();
+    }
 }

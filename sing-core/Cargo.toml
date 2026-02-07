@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0"
 bytemuck = "1.16"
 memmap2 = "0.9"
+rkyv = { version = "0.8", default-features = false, features = ["std", "alloc"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = "0.2"
