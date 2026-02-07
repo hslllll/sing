@@ -534,9 +534,14 @@ class PerformanceTracker {
         this.lastUpdate = Date.now();
         this.processedReads = 0;
         this.processedBytes = 0;
-        this.peakMemory = 0;
         this.readsPerSecond = 0;
         this.mbPerSecond = 0;
+        // Self-tracked memory: accumulate known allocation sizes
+        this.allocatedBytes = 0;
+        this.peakAllocatedBytes = 0;
+        // Chrome performance.memory (if supported)
+        this._hasMemoryAPI = typeof performance !== 'undefined' && !!performance.memory;
+        this.peakHeap = 0;
     }
     
     update(reads, bytes) {
@@ -553,16 +558,34 @@ class PerformanceTracker {
         
         this.lastUpdate = now;
         
-        // Track memory if available
-        if (performance.memory) {
-            this.peakMemory = Math.max(this.peakMemory, performance.memory.usedJSHeapSize);
+        if (this._hasMemoryAPI) {
+            this.peakHeap = Math.max(this.peakHeap, performance.memory.usedJSHeapSize);
         }
+    }
+    
+    // Call when large allocations are created/released
+    trackAlloc(bytes) {
+        this.allocatedBytes += bytes;
+        this.peakAllocatedBytes = Math.max(this.peakAllocatedBytes, this.allocatedBytes);
+    }
+    trackFree(bytes) {
+        this.allocatedBytes = Math.max(0, this.allocatedBytes - bytes);
     }
     
     getStats() {
         const elapsed = (Date.now() - this.startTime) / 1000;
         const avgReadsPerSec = elapsed > 0 ? Math.round(this.processedReads / elapsed) : 0;
         const avgMbPerSec = elapsed > 0 ? (this.processedBytes / elapsed / (1024 * 1024)).toFixed(2) : 0;
+        
+        let currentMemoryMB, peakMemoryMB;
+        if (this._hasMemoryAPI) {
+            currentMemoryMB = (performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(1);
+            peakMemoryMB = (this.peakHeap / (1024 * 1024)).toFixed(1);
+        } else {
+            // Fallback: report tracked buffer sizes
+            currentMemoryMB = (this.allocatedBytes / (1024 * 1024)).toFixed(1);
+            peakMemoryMB = (this.peakAllocatedBytes / (1024 * 1024)).toFixed(1);
+        }
         
         return {
             elapsed: elapsed.toFixed(1),
@@ -572,8 +595,9 @@ class PerformanceTracker {
             avgMbPerSec,
             currentReadsPerSec: this.readsPerSecond,
             currentMbPerSec: this.mbPerSecond,
-            peakMemoryMB: (this.peakMemory / (1024 * 1024)).toFixed(2),
-            currentMemoryMB: performance.memory ? (performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(2) : 'N/A'
+            peakMemoryMB,
+            currentMemoryMB,
+            memorySource: this._hasMemoryAPI ? 'heap' : 'tracked'
         };
     }
 }
@@ -611,11 +635,12 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
     const workers = Array.from({ length: concurrency }, () => new WorkerClient());
     await Promise.all(workers.map(w => w.init()));
 
-    const runStats = { mapped: 0, mappedBases: 0, genomeSize: 0 };
+    const runStats = { mapped: 0, mappedBases: 0, genomeSize: 0, total: 0 };
     const finalTotalReads = totalReads * (read2File ? 2 : 1);
     
     const mappedMaskSize = Math.ceil((finalTotalReads || 1) / 8);
     const globalMappedMask = new Uint8Array(mappedMaskSize);
+    perfTracker.trackAlloc(mappedMaskSize);
     
     const bamParts = [];
     let processedReads = 0, processedBytes = 0;
@@ -642,12 +667,16 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
     try {
         await streamReference(referenceFile, refChunkSize, async (refChunk, refId) => {
             logger(`RefChunk ${refId}: ${(refChunk.length/1e6).toFixed(2)} MB`);
+            perfTracker.trackAlloc(refChunk.byteLength);
             
             await workers[0].processRef(refChunk, refId);
             if (workers.length > 1) {
                 const { indexData } = await workers[0].exportIndex();
+                perfTracker.trackAlloc(indexData.byteLength);
                 await Promise.all(workers.slice(1).map(w => w.importIndex(indexData)));
+                perfTracker.trackFree(indexData.byteLength);
             }
+            perfTracker.trackFree(refChunk.byteLength);
             
             const activePromises = new Set();
             const chunkParts = []; 
@@ -659,6 +688,7 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
                 const { bam, stats, mappedMask } = result;
                 runStats.mapped += stats.mapped; 
                 runStats.mappedBases += stats.mappedBases;
+                if (refId === 0) runStats.total += stats.total;
                 passGenomeSize = Math.max(passGenomeSize, stats.genomeSize);
                 
                 const startBit = chunkStartReadIdx;
@@ -711,10 +741,18 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
                     }
                 }
                 
+                // Capture byte sizes BEFORE transfer (buffers get detached)
+                const r1Bytes = r1.byteLength;
+                const r2Bytes = r2 ? r2.byteLength : 0;
+                const chunkBytes = r1Bytes + r2Bytes;
+                perfTracker.trackAlloc(chunkBytes);
+                
                 const p = w.mapChunk(r1, r2, outputFormat, sortOutput, writeHead, chunkFilterMask)
                     .then(res => {
+                        perfTracker.trackFree(chunkBytes);
                         handleResult(res, cId, thisChunkStartIdx);
-                        const msg = updateProgress(nReads, r1.byteLength + (r2?r2.byteLength:0));
+                        perfTracker.trackAlloc(res.bam.byteLength);
+                        const msg = updateProgress(nReads, r1Bytes + r2Bytes);
                         logger(msg);
                         if(onProgress) onProgress(((processedReads / totalProgressWork)*100).toFixed(1));
                     });
@@ -753,7 +791,7 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
         return { 
             blob: new Blob(bamParts, { type: 'application/octet-stream' }), 
             stats: { 
-                total: finalTotalReads, 
+                total: runStats.total || finalTotalReads, 
                 mapped: runStats.mapped, 
                 mappedBases: runStats.mappedBases, 
                 genomeSize: runStats.genomeSize, 
