@@ -140,11 +140,64 @@
             white-space: pre-wrap;
             font-weight: 600;
         }
+        #device-info {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 1rem 1.25rem;
+            border-radius: 10px;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            line-height: 1.6;
+        }
+        #device-info strong {
+            font-weight: 700;
+        }
+        #performance-metrics {
+            display: none;
+            margin-top: 1rem;
+            padding: 1rem;
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            border-radius: 10px;
+            font-family: ui-monospace, monospace;
+            font-size: 0.875rem;
+            line-height: 1.8;
+        }
+        #performance-metrics .metric-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.25rem;
+        }
+        #performance-metrics .metric-label {
+            opacity: 0.9;
+        }
+        #performance-metrics .metric-value {
+            font-weight: 700;
+        }
+        /* Mobile responsive */
+        @media (max-width: 768px) {
+            body { padding: 0.75rem; }
+            h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
+            .privacy-notice { font-size: 0.8rem; margin-bottom: 1rem; max-width: 100%; }
+            .container { padding: 1rem; max-width: 100%; }
+            #device-info { font-size: 0.75rem; padding: 0.75rem; }
+            #performance-metrics { font-size: 0.75rem; }
+            .stats-box { font-size: 1rem; padding: 0.75rem; }
+            button { padding: 1rem; font-size: 1.1rem; -webkit-tap-highlight-color: transparent; }
+            input[type="file"] { font-size: 0.85rem; padding: 0.75rem; }
+            .inline-group { gap: 0.5rem; }
+            .form-group { margin-bottom: 1rem; }
+            label { font-size: 0.9rem; }
+            footer { font-size: 0.75rem; }
+        }
     </style>
 </head>
 <body>
     <h1>SingB: Browser-based Genomic Read Mapping Tool</h1>
     <p class="privacy-notice">Please be aware that, because WebAssembly is used for this process, your data will not be uploaded to an external server. The mapping algorithm will only operate locally.</p>
+    
+    <div id="device-info" style="max-width: 1800px; width: 100%;"></div>
+    
     <div class="container">
         <div class="form-group">
             <label>Input Mode</label>
@@ -193,6 +246,25 @@
             <div id="progress-bar" style="width: 0%; height: 100%; background-color: var(--primary); transition: width 0.3s ease;"></div>
         </div>
         
+        <div id="performance-metrics">
+            <div class="metric-row">
+                <span class="metric-label">⚡ Throughput:</span>
+                <span class="metric-value" id="metric-throughput">-- reads/s</span>
+            </div>
+            <div class="metric-row">
+                <span class="metric-label">💾 Memory:</span>
+                <span class="metric-value" id="metric-memory">-- MB</span>
+            </div>
+            <div class="metric-row">
+                <span class="metric-label">📊 Data Rate:</span>
+                <span class="metric-value" id="metric-datarate">-- MB/s</span>
+            </div>
+            <div class="metric-row">
+                <span class="metric-label">📈 Peak Memory:</span>
+                <span class="metric-value" id="metric-peak">-- MB</span>
+            </div>
+        </div>
+        
         <div id="status"></div>
 
         <div id="results-area" style="display:none; margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
@@ -227,11 +299,27 @@
         }
 
         let partitionedWorkflow = null;
+        let detectDevice = null;
         const engineReady = (async () => {
             try {
                 log('Loading mapper engine...');
                 const mod = await import('./index.js');
                 partitionedWorkflow = mod.partitionedWorkflow;
+                detectDevice = mod.detectDevice;
+                
+                // Display device info
+                if (detectDevice) {
+                    const device = detectDevice();
+                    const deviceInfoDiv = document.getElementById('device-info');
+                    deviceInfoDiv.innerHTML = `
+                        <strong>📱 Device Profile:</strong> ${device.profile} | 
+                        <strong>💻 Memory:</strong> ${device.memory}GB | 
+                        <strong>🔧 CPU Cores:</strong> ${device.cores} | 
+                        <strong>⚙️ Optimized Workers:</strong> ${device.recommendedWorkers} | 
+                        <strong>📦 Chunk Size:</strong> ${(device.recommendedChunkSize / (1024 * 1024)).toFixed(0)}MB
+                    `;
+                }
+                
                 log('Mapper engine loaded.');
                 return true;
             } catch (err) {
@@ -305,7 +393,7 @@
                 log(`Sorting: ${sortOutput ? 'Enabled' : 'Disabled'}`);
                 
                 let effectiveFormat = outputFormat;
-                let effectiveChunkSize = 4 * 1024 * 1024;
+                let effectiveChunkSize = undefined; // let workflow auto-detect based on device
 
                 if (outputFormat === 'bam') {
                     const totalSize = readsFile.size + (reads2File ? reads2File.size : 0);
@@ -314,8 +402,6 @@
                     if (totalSize < BAM_LIMIT) {
                         effectiveChunkSize = totalSize + 1024;
                         log(`Small input detected. Using single-pass for valid BAM generation.`);
-                    } else {
-                        log(`Large input detected. Proceeding with chunked BAM merge; ensure downstream tools accept merged BGZF blocks.`);
                     }
                 }
 
@@ -323,12 +409,34 @@
 
                 const progressContainer = document.getElementById('progress-container');
                 const progressBar = document.getElementById('progress-bar');
+                const perfMetrics = document.getElementById('performance-metrics');
                 progressContainer.style.display = 'block';
                 progressBar.style.width = '0%';
+                perfMetrics.style.display = 'block';
 
-                 const result = await partitionedWorkflow(refFile, readsFile, reads2File, sortOutput, effectiveFormat, effectiveChunkSize, log, (percent) => {
-                     progressBar.style.width = percent + '%';
-                });
+                 const result = await partitionedWorkflow(
+                     refFile, 
+                     readsFile, 
+                     reads2File, 
+                     sortOutput, 
+                     effectiveFormat, 
+                     effectiveChunkSize, 
+                     log, 
+                     (percent) => {
+                         progressBar.style.width = percent + '%';
+                     },
+                     (metrics) => {
+                         // Update real-time performance metrics
+                         document.getElementById('metric-throughput').textContent = 
+                             `${metrics.currentReadsPerSec.toLocaleString()} reads/s (avg: ${metrics.avgReadsPerSec.toLocaleString()})`;
+                         document.getElementById('metric-memory').textContent = 
+                             `${metrics.currentMemoryMB} MB`;
+                         document.getElementById('metric-datarate').textContent = 
+                             `${metrics.currentMbPerSec} MB/s (avg: ${metrics.avgMbPerSec})`;
+                         document.getElementById('metric-peak').textContent = 
+                             `${metrics.peakMemoryMB} MB`;
+                     }
+                );
                 
                  currentResultBlob = result.blob;
                  const stats = result.stats || {};

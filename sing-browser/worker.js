@@ -10,7 +10,7 @@ self.onmessage = async (e) => {
         switch (type) {
             case 'INIT':
                 
-                await init(new URL(`./pkg/sing_browser_bg.wasm?t=${Date.now()}`, import.meta.url));
+                await init(new URL('./pkg/sing_browser_bg.wasm', import.meta.url));
                 engine = new SingWebEngine();
                 result = { success: true };
                 break;
@@ -32,7 +32,7 @@ self.onmessage = async (e) => {
             case 'MAP_CHUNK':
                 if (!engine) throw new Error("Engine not initialized");
                 const { r1, r2, format, sort, writeHeader, filterMask } = payload;
-                const mappingResult = engine.run_mapping_chunk(0, r1, r2, format, sort, writeHeader, filterMask);
+                const mappingResult = engine.run_mapping_chunk(r1, r2, format, sort, writeHeader, filterMask);
 
                 const bamBytes = mappingResult.bam_data;
                 const mappedMask = mappingResult.mapped_mask;

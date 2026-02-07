@@ -1,5 +1,5 @@
-import init, { SingWebEngine } from './pkg/sing_browser.js';
-
+// Export device detection for external use
+export { detectDevice };
 
 class WorkerClient {
     constructor() {
@@ -53,6 +53,35 @@ class WorkerClient {
     terminate() { this.worker.terminate(); }
 }
 
+
+// Amortized O(1) append buffer — eliminates O(n²) copy-on-append
+class GrowableBuffer {
+    constructor(initialCapacity = 256 * 1024) {
+        this._buf = new Uint8Array(initialCapacity);
+        this.length = 0;
+    }
+    _ensureCapacity(needed) {
+        if (needed <= this._buf.length) return;
+        let cap = this._buf.length;
+        while (cap < needed) cap *= 2;
+        const nb = new Uint8Array(cap);
+        if (this.length > 0) nb.set(this._buf.subarray(0, this.length));
+        this._buf = nb;
+    }
+    append(data) {
+        this._ensureCapacity(this.length + data.length);
+        this._buf.set(data, this.length);
+        this.length += data.length;
+    }
+    consume(n) {
+        const out = this._buf.slice(0, n);
+        const rem = this.length - n;
+        if (rem > 0) this._buf.copyWithin(0, n, this.length);
+        this.length = rem;
+        return out;
+    }
+    view() { return this._buf.subarray(0, this.length); }
+}
 
 
 function getFileStream(file) {
@@ -201,8 +230,8 @@ async function streamReadsPaired(file1, file2, chunkSize, onChunk) {
   const reader1 = getFileStream(file1).getReader();
   const reader2 = getFileStream(file2).getReader();
   
-  let buf1 = new Uint8Array(0);
-  let buf2 = new Uint8Array(0);
+  const gbuf1 = new GrowableBuffer(chunkSize + 256 * 1024);
+  const gbuf2 = new GrowableBuffer(chunkSize + 256 * 1024);
   
   let chunkId = 0;
   
@@ -210,46 +239,31 @@ async function streamReadsPaired(file1, file2, chunkSize, onChunk) {
     
     const [r1, r2] = await Promise.all([reader1.read(), reader2.read()]);
     
-    
-    if (r1.value) {
-        const next = new Uint8Array(buf1.length + r1.value.length);
-        next.set(buf1);
-        next.set(r1.value, buf1.length);
-        buf1 = next;
-    }
-    if (r2.value) {
-        const next = new Uint8Array(buf2.length + r2.value.length);
-        next.set(buf2);
-        next.set(r2.value, buf2.length);
-        buf2 = next;
-    }
+    if (r1.value) gbuf1.append(r1.value);
+    if (r2.value) gbuf2.append(r2.value);
 
     const done1 = r1.done;
     const done2 = r2.done;
     
     
-    if (buf1.length >= chunkSize || buf2.length >= chunkSize || (done1 && done2)) {
+    if (gbuf1.length >= chunkSize || gbuf2.length >= chunkSize || (done1 && done2)) {
         
-        
-        
-        
-        let split1 = findSplitIndex(buf1, false, chunkSize);
-        if (split1 === -1 && buf1.length > chunkSize * 4) {
-            
-            split1 = findSplitIndex(buf1, false, Infinity);
+        let split1 = findSplitIndex(gbuf1.view(), false, chunkSize);
+        if (split1 === -1 && gbuf1.length > chunkSize * 4) {
+            split1 = findSplitIndex(gbuf1.view(), false, Infinity);
         }
         
         if (split1 > 0) {
-            
+            const view1 = gbuf1.view();
             let records = 0;
-            for(let i=0; i<split1; i++) if (buf1[i]===10) records++;
+            for(let i=0; i<split1; i++) if (view1[i]===10) records++;
             records = records / 4;
-            
             
             let split2 = -1;
             let currentRecLines = 0;
-            for(let i=0; i<buf2.length; i++) {
-                if (buf2[i]===10) {
+            const view2 = gbuf2.view();
+            for(let i=0; i<view2.length; i++) {
+                if (view2[i]===10) {
                     currentRecLines++;
                     if (currentRecLines === records * 4) {
                         split2 = i + 1;
@@ -258,40 +272,30 @@ async function streamReadsPaired(file1, file2, chunkSize, onChunk) {
                 }
             }
             
-            
             if (split2 === -1 && !done2) {
                 if (done1 && r1.value === undefined) { 
-                    
-                    
                      if (r2.done) break; 
                      continue;
                 }
-                
                 continue; 
             }
             
+            const limit2 = (split2 !== -1) ? split2 : gbuf2.length;
             
-            const limit2 = (split2 !== -1) ? split2 : buf2.length;
-            
-            const chunk1 = buf1.slice(0, split1);
-            const chunk2 = buf2.slice(0, limit2);
+            const chunk1 = gbuf1.consume(split1);
+            const chunk2 = gbuf2.consume(limit2);
             
             await onChunk(chunk1, chunk2, chunkId, records);
             chunkId++;
             
-            buf1 = buf1.slice(split1);
-            buf2 = buf2.slice(limit2);
-            
-            
-            if (done1 && done2 && buf1.length === 0 && buf2.length === 0) break;
+            if (done1 && done2 && gbuf1.length === 0 && gbuf2.length === 0) break;
             
         } else {
-             
              if (done1 && done2) {
-                 const rec1 = recordsInFastq(buf1);
-                 const rec2 = recordsInFastq(buf2);
+                 const rec1 = recordsInFastq(gbuf1.view());
+                 const rec2 = recordsInFastq(gbuf2.view());
                  if (rec1 > 0 && rec1 === rec2) {
-                     await onChunk(buf1, buf2, chunkId, rec1);
+                     await onChunk(gbuf1.consume(gbuf1.length), gbuf2.consume(gbuf2.length), chunkId, rec1);
                      chunkId++;
                  }
                  break; 
@@ -305,44 +309,39 @@ async function streamReadsPaired(file1, file2, chunkSize, onChunk) {
 
 async function streamReadsSingle(file, chunkSize, onChunk) {
   const reader = getFileStream(file).getReader();
-  let buffer = new Uint8Array(0);
+  const gbuf = new GrowableBuffer(chunkSize + 256 * 1024);
   let chunkId = 0;
 
   while(true) {
       const {value, done} = await reader.read();
-      if (value) {
-          const next = new Uint8Array(buffer.length + value.length);
-          next.set(buffer);
-          next.set(value, buffer.length);
-          buffer = next;
-      }
+      if (value) gbuf.append(value);
       
-      if (buffer.length >= chunkSize || done) {
-          let split = findSplitIndex(buffer, false, chunkSize);
-          if (split === -1 && buffer.length > chunkSize * 4) {
-              split = findSplitIndex(buffer, false, Infinity);
+      if (gbuf.length >= chunkSize || done) {
+          let split = findSplitIndex(gbuf.view(), false, chunkSize);
+          if (split === -1 && gbuf.length > chunkSize * 4) {
+              split = findSplitIndex(gbuf.view(), false, Infinity);
           }
           if (split > 0) {
+              const view = gbuf.view();
               let records = 0;
-              for (let i = 0; i < split; i++) if (buffer[i] === 10) records++;
+              for (let i = 0; i < split; i++) if (view[i] === 10) records++;
               records = records / 4;
 
-              const chunk = buffer.slice(0, split);
+              const chunk = gbuf.consume(split);
               await onChunk(chunk, chunkId, records);
               chunkId++;
-              buffer = buffer.slice(split);
           }
-          if (done && buffer.length === 0) break;
+          if (done && gbuf.length === 0) break;
           
-          if (done && split === -1 && buffer.length > 0) {
-              const recs = recordsInFastq(buffer);
+          if (done && split === -1 && gbuf.length > 0) {
+              const recs = recordsInFastq(gbuf.view());
               if (recs > 0) {
-                  await onChunk(buffer, chunkId, recs);
+                  await onChunk(gbuf.consume(gbuf.length), chunkId, recs);
               }
               break;
           }
       }
-      if (done && buffer.length === 0) break;
+      if (done && gbuf.length === 0) break;
   }
 }
 
@@ -499,26 +498,115 @@ async function streamReference(file, chunkSize, onChunk) {
 const READ_CHUNK_SIZE = 100 * 1024 * 1024;
 
 
-export async function partitionedWorkflow(referenceFile, read1File, read2File, sortOutput = false, outputFormat = 'bam', chunkSize = READ_CHUNK_SIZE, logger = console.log, onProgress = null) {
+// Device detection and optimization
+function detectDevice() {
+    const mobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    const memory = navigator.deviceMemory || 8; // GB, fallback to 8
+    const cores = navigator.hardwareConcurrency || 4;
+    
+    let profile = 'desktop';
+    let recommendedChunkSize = 100 * 1024 * 1024; // 100MB
+    let recommendedWorkers = cores;
+    
+    if (mobile) {
+        if (memory <= 2) {
+            profile = 'mobile-low';
+            recommendedChunkSize = 10 * 1024 * 1024; // 10MB
+            recommendedWorkers = Math.max(1, Math.floor(cores / 2));
+        } else if (memory <= 4) {
+            profile = 'mobile-mid';
+            recommendedChunkSize = 25 * 1024 * 1024; // 25MB
+            recommendedWorkers = Math.max(2, Math.floor(cores * 0.75));
+        } else {
+            profile = 'mobile-high';
+            recommendedChunkSize = 50 * 1024 * 1024; // 50MB
+            recommendedWorkers = cores;
+        }
+    }
+    
+    return { mobile, memory, cores, profile, recommendedChunkSize, recommendedWorkers };
+}
+
+// Performance metrics tracker
+class PerformanceTracker {
+    constructor() {
+        this.startTime = Date.now();
+        this.lastUpdate = Date.now();
+        this.processedReads = 0;
+        this.processedBytes = 0;
+        this.peakMemory = 0;
+        this.readsPerSecond = 0;
+        this.mbPerSecond = 0;
+    }
+    
+    update(reads, bytes) {
+        this.processedReads += reads;
+        this.processedBytes += bytes;
+        
+        const now = Date.now();
+        const elapsed = (now - this.lastUpdate) / 1000;
+        
+        if (elapsed > 0) {
+            this.readsPerSecond = Math.round(reads / elapsed);
+            this.mbPerSecond = (bytes / elapsed / (1024 * 1024)).toFixed(2);
+        }
+        
+        this.lastUpdate = now;
+        
+        // Track memory if available
+        if (performance.memory) {
+            this.peakMemory = Math.max(this.peakMemory, performance.memory.usedJSHeapSize);
+        }
+    }
+    
+    getStats() {
+        const elapsed = (Date.now() - this.startTime) / 1000;
+        const avgReadsPerSec = elapsed > 0 ? Math.round(this.processedReads / elapsed) : 0;
+        const avgMbPerSec = elapsed > 0 ? (this.processedBytes / elapsed / (1024 * 1024)).toFixed(2) : 0;
+        
+        return {
+            elapsed: elapsed.toFixed(1),
+            processedReads: this.processedReads,
+            processedMB: (this.processedBytes / (1024 * 1024)).toFixed(2),
+            avgReadsPerSec,
+            avgMbPerSec,
+            currentReadsPerSec: this.readsPerSecond,
+            currentMbPerSec: this.mbPerSecond,
+            peakMemoryMB: (this.peakMemory / (1024 * 1024)).toFixed(2),
+            currentMemoryMB: performance.memory ? (performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(2) : 'N/A'
+        };
+    }
+}
+
+
+export async function partitionedWorkflow(referenceFile, read1File, read2File, sortOutput = false, outputFormat = 'bam', chunkSize = READ_CHUNK_SIZE, logger = console.log, onProgress = null, onMetrics = null) {
     const abortCtrl = new AbortController();
     let totalReads = 0;
     const formatTime = ms => !isFinite(ms) || ms < 0 ? "--:--" : `${Math.floor(ms / 60000)}:${(Math.floor(ms / 1000) % 60).toString().padStart(2, '0')}`;
 
-    try {
-        logger("Counting reads...");
-        const keyHandler = e => { if (e.key === 'Escape') { abortCtrl.abort(); logger('Count skipped.'); } };
-        window.addEventListener('keydown', keyHandler);
-        
-        const r1Count = await countReads(read1File, abortCtrl.signal).catch(() => 0);
-        let r2Count = r1Count;
-        if (read2File) r2Count = await countReads(read2File, abortCtrl.signal).catch(() => 0);
-        
-        window.removeEventListener('keydown', keyHandler);
-        totalReads = Math.min(r1Count, r2Count || r1Count);
-        logger(`Approx reads: ${totalReads}`);
-    } catch(e) { logger("Count failed."); }
+    // Detect device and optimize settings
+    const device = detectDevice();
+    logger(`Device: ${device.profile} | Memory: ${device.memory}GB | Cores: ${device.cores}`);
+    
+    // Auto-adjust chunk size if default is being used
+    if (chunkSize === READ_CHUNK_SIZE && device.mobile) {
+        chunkSize = device.recommendedChunkSize;
+        logger(`Auto-adjusted chunk size to ${(chunkSize / (1024 * 1024)).toFixed(0)}MB for mobile`);
+    }
+    
+    // Initialize performance tracker
+    const perfTracker = new PerformanceTracker();
 
-    const concurrency = navigator.hardwareConcurrency || 4;
+    // Quick file-size estimate — avoids reading entire files before alignment
+    const estimateReads = (f) => {
+        const eff = f.name.endsWith('.gz') ? f.size * 3.5 : f.size;
+        return Math.floor(eff / 400); // ~400 bytes per FASTQ record
+    };
+    totalReads = estimateReads(read1File);
+    if (read2File) totalReads = Math.min(totalReads, estimateReads(read2File));
+    logger(`Estimated reads: ~${totalReads.toLocaleString()}`);
+
+    const concurrency = device.mobile ? device.recommendedWorkers : (navigator.hardwareConcurrency || 4);
     logger(`Initializing protocol with ${concurrency} workers...`);
     const workers = Array.from({ length: concurrency }, () => new WorkerClient());
     await Promise.all(workers.map(w => w.init()));
@@ -532,15 +620,23 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
     const bamParts = [];
     let processedReads = 0, processedBytes = 0;
     const startTime = Date.now();
-    const refChunkSize = 1 * 1024 * 1024;
+    const refChunkSize = 50 * 1024 * 1024;
     const estimatedRefChunks = Math.max(1, Math.ceil(referenceFile.size / refChunkSize));
     const totalProgressWork = Math.max(finalTotalReads, 1) * estimatedRefChunks;
 
     const updateProgress = (newReads, newBytes) => {
         processedReads += newReads;
         processedBytes += newBytes;
+        
+        perfTracker.update(newReads, newBytes);
+        const stats = perfTracker.getStats();
+        
+        if (onMetrics) {
+            onMetrics(stats);
+        }
+        
         const elapsed = Date.now() - startTime;
-        return `Elapsed: ${formatTime(elapsed)}`; 
+        return `Elapsed: ${formatTime(elapsed)} | ${stats.currentReadsPerSec.toLocaleString()} reads/s | ${stats.currentMbPerSec} MB/s | Mem: ${stats.currentMemoryMB} MB`; 
     };
 
     try {
@@ -619,6 +715,7 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
                     .then(res => {
                         handleResult(res, cId, thisChunkStartIdx);
                         const msg = updateProgress(nReads, r1.byteLength + (r2?r2.byteLength:0));
+                        logger(msg);
                         if(onProgress) onProgress(((processedReads / totalProgressWork)*100).toFixed(1));
                     });
                 
@@ -644,8 +741,14 @@ export async function partitionedWorkflow(referenceFile, read1File, read2File, s
         }
 
         const totalTime = Date.now() - startTime;
+        const finalStats = perfTracker.getStats();
         logger(`Done in ${formatTime(totalTime)}.`);
+        logger(`Performance: ${finalStats.avgReadsPerSec.toLocaleString()} avg reads/s | ${finalStats.avgMbPerSec} avg MB/s`);
+        logger(`Memory: Peak ${finalStats.peakMemoryMB} MB | Current ${finalStats.currentMemoryMB} MB`);
+        logger(`Processed: ${finalStats.processedReads.toLocaleString()} reads | ${finalStats.processedMB} MB`);
+        
         if (onProgress) onProgress(100);
+        if (onMetrics) onMetrics(finalStats);
 
         return { 
             blob: new Blob(bamParts, { type: 'application/octet-stream' }), 

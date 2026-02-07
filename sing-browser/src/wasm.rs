@@ -76,14 +76,14 @@ impl SingWebEngine {
     #[wasm_bindgen]
     pub fn run_mapping_chunk(
         &mut self,
-        ref_index_ptr: *const Index,
         read1_chunk: &[u8],
         read2_chunk: Option<Box<[u8]>>,
         output_format: String,
         sort_output: bool,
         write_header: bool,
+        filter_mask: Option<Box<[u8]>>,
     ) -> Result<MappingResult, JsValue> {
-        let idx = resolve_index(ref_index_ptr, self.index.as_ref()).map_err(to_js)?;
+        let idx = self.index.as_ref().ok_or_else(|| JsValue::from_str("reference chunk not loaded"))?;
         let header = header_from_index(idx, sort_output).map_err(to_js)?;
         let format = OutputFormat::parse(&output_format).map_err(to_js)?;
 
@@ -99,57 +99,93 @@ impl SingWebEngine {
         let chunk_start_mapped = self.mapped_reads;
         let chunk_start_bases = self.mapped_bases;
 
+        // Per-read mapped tracking (fixes incorrect sequential mask bug)
+        let mut read_mapped: Vec<bool> = Vec::with_capacity(reads1.len() * 2);
+        // Reusable buffers to avoid per-read allocations
+        let mut sam_buf: Vec<u8> = Vec::with_capacity(1024);
+        let mut reusable_rec = sam::Record::default();
+
         if let Some(read2) = read2_chunk {
             let reads2 = parse_reads_chunk(&read2).map_err(to_js)?;
             if reads1.len() != reads2.len() {
                 return Err(JsValue::from_str("paired-end inputs have mismatched read counts"));
             }
 
-            for ((name1, seq1, qual1), (name2, seq2, qual2)) in reads1.into_iter().zip(reads2.into_iter()) {
+            for (pair_idx, ((name1, seq1, qual1), (name2, seq2, qual2))) in reads1.into_iter().zip(reads2.into_iter()).enumerate() {
+                let r1_idx = pair_idx * 2;
+                let r2_idx = r1_idx + 1;
+                self.total_reads += 2;
+
+                // Skip pair if both reads already mapped in a previous ref-chunk pass
+                let r1_skip = is_read_filtered(&filter_mask, r1_idx);
+                let r2_skip = is_read_filtered(&filter_mask, r2_idx);
+                if r1_skip && r2_skip {
+                    read_mapped.push(false);
+                    read_mapped.push(false);
+                    continue;
+                }
+
                 let res1_candidates = align(&seq1, idx, &mut self.state, &mut self.rev_buf);
                 let res2_candidates = align(&seq2, idx, &mut self.state, &mut self.rev_buf);
                 let res1 = res1_candidates.first().cloned();
                 let res2 = res2_candidates.first().cloned();
 
-                self.total_reads += 2;
-                if res1.is_some() { self.mapped_reads += 1; self.mapped_bases += seq1.len(); }
-                if res2.is_some() { self.mapped_reads += 1; self.mapped_bases += seq2.len(); }
+                let r1_new = !r1_skip && res1.is_some();
+                let r2_new = !r2_skip && res2.is_some();
+                if r1_new { self.mapped_reads += 1; self.mapped_bases += seq1.len(); }
+                if r2_new { self.mapped_reads += 1; self.mapped_bases += seq2.len(); }
+                read_mapped.push(r1_new);
+                read_mapped.push(r2_new);
 
-                let sam1 = sam_record(&name1, &seq1, &qual1, &res1, Some(&res2), true, idx).map_err(to_js)?;
-                let sam2 = sam_record(&name2, &seq2, &qual2, &res2, Some(&res1), false, idx).map_err(to_js)?;
-
-                strategy.write(&sam1).map_err(to_js)?;
-                strategy.write(&sam2).map_err(to_js)?;
+                if !r1_skip {
+                    sam_buf.clear();
+                    format_single_sam(&mut sam_buf, &name1, &seq1, &qual1, &res1, Some(&res2), true, idx);
+                    let mut rdr = sam::io::Reader::new(Cursor::new(&sam_buf[..]));
+                    rdr.read_record(&mut reusable_rec).map_err(to_js)?;
+                    strategy.write(&reusable_rec).map_err(to_js)?;
+                }
+                if !r2_skip {
+                    sam_buf.clear();
+                    format_single_sam(&mut sam_buf, &name2, &seq2, &qual2, &res2, Some(&res1), false, idx);
+                    let mut rdr = sam::io::Reader::new(Cursor::new(&sam_buf[..]));
+                    rdr.read_record(&mut reusable_rec).map_err(to_js)?;
+                    strategy.write(&reusable_rec).map_err(to_js)?;
+                }
             }
         } else {
-            for (name, seq, qual) in reads1 {
+            for (read_idx, (name, seq, qual)) in reads1.into_iter().enumerate() {
+                self.total_reads += 1;
+
+                if is_read_filtered(&filter_mask, read_idx) {
+                    read_mapped.push(false);
+                    continue;
+                }
+
                 let res_candidates = align(&seq, idx, &mut self.state, &mut self.rev_buf);
                 let res = res_candidates.first().cloned();
-                self.total_reads += 1;
-                if res.is_some() { self.mapped_reads += 1; self.mapped_bases += seq.len(); }
+                let mapped = res.is_some();
+                if mapped { self.mapped_reads += 1; self.mapped_bases += seq.len(); }
+                read_mapped.push(mapped);
 
-                let sam_rec = sam_record(&name, &seq, &qual, &res, None, true, idx).map_err(to_js)?;
-                strategy.write(&sam_rec).map_err(to_js)?;
+                sam_buf.clear();
+                format_single_sam(&mut sam_buf, &name, &seq, &qual, &res, None, true, idx);
+                let mut rdr = sam::io::Reader::new(Cursor::new(&sam_buf[..]));
+                rdr.read_record(&mut reusable_rec).map_err(to_js)?;
+                strategy.write(&reusable_rec).map_err(to_js)?;
             }
         }
 
         let MappingResultInternal { bam_data } = strategy.finalize().map_err(to_js)?;
         
-        // Create a mapped_mask - 1 byte per read, indicating if it was mapped
         let chunk_total_reads = self.total_reads - chunk_start_total;
         let chunk_mapped_reads = self.mapped_reads - chunk_start_mapped;
         let chunk_mapped_bases = self.mapped_bases - chunk_start_bases;
         
-        let mask_bytes = (chunk_total_reads + 7) / 8;
+        // Build correct per-read mapped_mask from tracked booleans
+        let mask_bytes = (read_mapped.len() + 7) / 8;
         let mut mapped_mask = vec![0u8; mask_bytes];
-        
-        // Mark the reads that were mapped in this chunk
-        for i in 0..chunk_mapped_reads {
-            let byte_idx = i / 8;
-            let bit_idx = i % 8;
-            if byte_idx < mapped_mask.len() {
-                mapped_mask[byte_idx] |= 1 << bit_idx;
-            }
+        for (i, &m) in read_mapped.iter().enumerate() {
+            if m { mapped_mask[i / 8] |= 1 << (i % 8); }
         }
         
         Ok(MappingResult {
@@ -192,7 +228,7 @@ impl SingWebEngine {
 
     #[wasm_bindgen]
     pub fn map_reads_chunk(&mut self, reads_chunk: &[u8]) -> Result<MappingResult, JsValue> {
-        self.run_mapping_chunk(std::ptr::null(), reads_chunk, None, "bam".to_string(), false, true)
+        self.run_mapping_chunk(reads_chunk, None, "bam".to_string(), false, true, None)
     }
 }
 
@@ -366,11 +402,15 @@ fn get_smart_reader<'a>(data: &'a [u8]) -> Box<dyn BufRead + Send + 'a> {
     }
 }
 
-fn resolve_index<'a>(ptr: *const Index, fallback: Option<&'a Index>) -> Result<&'a Index> {
-    if !ptr.is_null() {
-        return unsafe { ptr.as_ref().ok_or_else(|| anyhow!("reference pointer was null")) };
+/// Check if a read at `read_idx` is already mapped (set in filter_mask).
+fn is_read_filtered(filter_mask: &Option<Box<[u8]>>, read_idx: usize) -> bool {
+    if let Some(mask) = filter_mask {
+        let byte_idx = read_idx / 8;
+        let bit_idx = read_idx % 8;
+        byte_idx < mask.len() && (mask[byte_idx] & (1 << bit_idx)) != 0
+    } else {
+        false
     }
-    fallback.ok_or_else(|| anyhow!("reference chunk not loaded"))
 }
 
 #[derive(Clone, Copy)]
