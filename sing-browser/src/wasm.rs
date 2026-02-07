@@ -284,36 +284,6 @@ fn header_from_index(idx: &Index, sorted: bool) -> Result<sam::Header> {
     Ok(header_txt.parse()?)
 }
 
-fn sam_record(
-    name: &str,
-    seq: &[u8],
-    qual: &[u8],
-    res: &Option<AlignmentResult>,
-    mate: Option<&Option<AlignmentResult>>,
-    is_first: bool,
-    idx: &Index,
-) -> Result<sam::Record> {
-    let sam_line_str = sam_line(name, seq, qual, res, mate, is_first, idx);
-    let mut reader = sam::io::Reader::new(Cursor::new(sam_line_str.as_bytes()));
-    let mut sam_record = sam::Record::default();
-    reader.read_record(&mut sam_record)?;
-    Ok(sam_record)
-}
-
-fn sam_line(
-    name: &str,
-    seq: &[u8],
-    qual: &[u8],
-    res: &Option<AlignmentResult>,
-    mate: Option<&Option<AlignmentResult>>,
-    is_first: bool,
-    idx: &Index,
-) -> String {
-    let mut out = Vec::new();
-    format_single_sam(&mut out, name, seq, qual, res, mate, is_first, idx);
-    String::from_utf8(out).unwrap_or_default()
-}
-
 fn format_single_sam(
     out: &mut Vec<u8>,
     name: &str,
